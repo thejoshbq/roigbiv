@@ -130,12 +130,18 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     if stat_path.exists():
         return False
 
+    stage_dir = output_dir / "_stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
     try:
-        ops = _build_ops(tif_path.parent, fs, tau, anatomical_only, do_registration, cfg)
+        ops = _build_ops(stage_dir, fs, tau, anatomical_only, do_registration, cfg)
         ops["save_path0"] = str(output_dir / stem)
-        ops["tiff_list"] = [tif_path.name]
+        ops["tiff_list"] = [str(tif_path)]
         run_s2p(ops)
     finally:
+        try:
+            stage_dir.rmdir()
+        except OSError:
+            pass
         data_bin = output_dir / stem / "suite2p" / "plane0" / "data.bin"
         if data_bin.exists():
             data_bin.unlink()
