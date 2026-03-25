@@ -31,7 +31,7 @@ def _build_ops(input_dir, fs: float, tau: float = 1.0,
     config dict. CLI-supplied ``fs``, ``tau``, ``anatomical_only``, and
     ``do_registration`` always take precedence over config values.
     """
-    from suite2p import default_ops
+    from suite2p.default_ops import default_ops
 
     ops = default_ops()
     s2p_cfg = (cfg or {}).get("suite2p", {})
