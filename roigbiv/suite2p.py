@@ -16,9 +16,6 @@ Motion correction: controlled by ``do_registration``. Set False (default) for
 pre-corrected (*_mc.tif) stacks. The parameter is scaffolded so it can be
 toggled per-dataset without changing any other code.
 """
-import os
-import shutil
-import tempfile
 import time
 from pathlib import Path
 
@@ -133,17 +130,12 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     if stat_path.exists():
         return False
 
-    tmp_base = tempfile.mkdtemp()
-    named_dir = Path(tmp_base) / stem
-    named_dir.mkdir()
-    os.symlink(tif_path.resolve(), named_dir / tif_path.name)
-
     try:
-        ops = _build_ops(named_dir, fs, tau, anatomical_only, do_registration, cfg)
+        ops = _build_ops(tif_path.parent, fs, tau, anatomical_only, do_registration, cfg)
         ops["save_path0"] = str(output_dir / stem)
+        ops["tiff_list"] = [tif_path.name]
         run_s2p(ops)
     finally:
-        shutil.rmtree(tmp_base, ignore_errors=True)
         data_bin = output_dir / stem / "suite2p" / "plane0" / "data.bin"
         if data_bin.exists():
             data_bin.unlink()
