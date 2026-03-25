@@ -123,7 +123,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     -------
     bool — True if processed, False if skipped (already done).
     """
-    from suite2p import run_s2p
+    from suite2p.run_s2p import run_s2p
 
     tif_path = Path(tif_path)
     output_dir = Path(output_dir)
