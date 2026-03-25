@@ -8,6 +8,7 @@ Provides:
   extract_projections() — pull meanImg + Vcorr from Suite2p ops.npy
   download_model()      — fetch model checkpoint from URL with caching
 """
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -44,7 +45,12 @@ def discover_tifs(root) -> list:
     archive_suffixes = (".tar.gz", ".tgz", ".tar.bz2", ".tar", ".zip")
     for archive in sorted(root.rglob("*")):
         if any(archive.name.lower().endswith(s) for s in archive_suffixes):
-            dest = archive.parent / archive.name.split(".")[0]
+            stem = archive.name
+            for _sfx in (".tar.gz", ".tar.bz2", ".tgz", ".tar", ".zip"):
+                if stem.lower().endswith(_sfx):
+                    stem = stem[: -len(_sfx)]
+                    break
+            dest = archive.parent / stem
             if not dest.exists():
                 try:
                     extract_archive(archive, dest)
@@ -89,7 +95,10 @@ def extract_archive(archive_path, extract_to=None) -> Path:
     name = archive_path.name.lower()
     if name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
         with tarfile.open(archive_path) as tf:
-            tf.extractall(extract_to)
+            if sys.version_info >= (3, 12):
+                tf.extractall(extract_to, filter="data")
+            else:
+                tf.extractall(extract_to)
     elif name.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(extract_to)
@@ -117,16 +126,22 @@ def validate_tif(path) -> tuple:
     """
     path = Path(path)
     try:
-        data = tifffile.imread(str(path))
+        with tifffile.TiffFile(str(path)) as tif:
+            series = tif.series
+            if not series:
+                raise ValueError("TIF contains no image series")
+            shape = series[0].shape
+    except ValueError:
+        raise
     except Exception as exc:
         raise ValueError(f"{path.name}: cannot read TIF — {exc}") from exc
 
-    if data.ndim != 3:
+    if len(shape) != 3:
         raise ValueError(
-            f"{path.name}: expected 3D array (frames × H × W), got shape {data.shape}. "
+            f"{path.name}: expected 3D array (frames × H × W), got shape {shape}. "
             f"Ensure this is a multi-frame TIF stack, not a single image."
         )
-    return path.stem.replace("_mc", ""), data.shape
+    return path.stem.replace("_mc", ""), shape
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +241,11 @@ def download_model(url: str, cache_path) -> Path:
             print(f"\r  {pct:3d}%", end="", flush=True)
             _progress_state["last_pct"] = pct
 
-    urlretrieve(url, str(cache_path), reporthook=_reporthook)
+    try:
+        urlretrieve(url, str(cache_path), reporthook=_reporthook)
+    except Exception:
+        if cache_path.exists():
+            cache_path.unlink()
+        raise
     print(f"\nModel saved: {cache_path}  ({cache_path.stat().st_size / 1e6:.1f} MB)")
     return cache_path

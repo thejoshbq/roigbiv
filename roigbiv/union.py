@@ -91,6 +91,7 @@ def build_union(activity_dir, anatomy_dir, projections_dir, out_dir,
                     suitable for writing to scored_rois_summary.csv.
     """
     from cellpose import models
+    import torch
     from roigbiv.match import match_and_tier, build_consensus_mask
 
     activity_dir = Path(activity_dir)
@@ -100,7 +101,10 @@ def build_union(activity_dir, anatomy_dir, projections_dir, out_dir,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     channels = [1, 2] if use_vcorr else [0, 0]
-    model = models.CellposeModel(gpu=True, pretrained_model=str(model_path))
+    _use_gpu = torch.cuda.is_available()
+    if not _use_gpu:
+        print("WARNING: No GPU detected. Cellpose will run on CPU and may be very slow.")
+    model = models.CellposeModel(gpu=_use_gpu, pretrained_model=str(model_path))
 
     activity_fovs = {d.name for d in activity_dir.iterdir() if d.is_dir()}
     anatomy_fovs  = {d.name for d in anatomy_dir.iterdir()  if d.is_dir()}
