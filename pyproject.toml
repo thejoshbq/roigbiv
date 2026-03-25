@@ -25,6 +25,7 @@ dependencies = [
 # avoid dependency pin conflicts.
 
 [project.optional-dependencies]
+app = ["streamlit"]
 dev = ["build", "pytest"]
 
 [tool.setuptools.packages.find]

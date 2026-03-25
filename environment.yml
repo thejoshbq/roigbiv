@@ -1,0 +1,24 @@
+name: roigbiv
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch::pytorch>=2.0
+  - pytorch::pytorch-cuda=12.8
+  - numpy>=2.0
+  - scipy
+  - pandas
+  - tifffile
+  - scikit-image
+  - matplotlib
+  - pyyaml
+  - pip
+  - pip:
+    - suite2p
+    - "cellpose<4.0.0"
+    - streamlit
+    - ipywidgets
+    - -e .
