@@ -1,0 +1,140 @@
+# ── ROI G. Biv — Combined Pipeline Configuration ─────────────────────────────
+# All tunable parameters for the Suite2p + Cellpose consensus pipeline.
+# Override individual values with CLI flags; this file provides defaults.
+
+cellpose:
+  # Path to the deployed Cellpose model (relative to project root)
+  model_path: models/deployed/current_model
+
+  # Expected cell diameter in pixels (must match training config)
+  diameter: 30
+
+  # Channel config: [cytoplasm, nucleus]. [0, 0] = grayscale single-channel
+  channels: [0, 0]
+
+  # Flow field error threshold — higher = more permissive mask acceptance
+  flow_threshold: 0.4
+
+  # Cell probability threshold — 0.0 keeps all candidates for consensus filtering
+  cellprob_threshold: 0.0
+
+  # Intensity normalization before inference
+  normalize: true
+
+suite2p:
+  # ── Data ──
+  # 0 = activity-based detection (temporal correlation, default for this pass)
+  # 1 = anatomy-based detection  (mean-image morphology; safe with Cellpose 4.x)
+  # 2 = Cellpose-backed           NOT USED (imports Cellpose internally)
+  # Activity and anatomy passes are run as separate invocations; both outputs
+  # are combined in union ROI building. This config applies to the activity pass.
+  anatomical_only: 0
+
+  # Number of imaging planes (single-plane for this dataset)
+  nplanes: 1
+
+  # Number of channels (single-channel GCaMP)
+  nchannels: 1
+
+  # Which channel contains functional signal (1-indexed)
+  functional_chan: 1
+
+  # GCaMP6s decay time constant in seconds
+  tau: 1.0
+
+  # Acquisition frame rate in Hz (uniform across all FOVs)
+  fs: 30.0
+
+  # ── Registration ──
+  # 0 = skip registration. All stacks are pre-motion-corrected (*_mc.tif)
+  do_registration: 0
+
+  # Number of frames for reference image computation
+  nimg_init: 300
+
+  # Frames per GPU batch during registration (reduced for 15 GB RAM constraint)
+  batch_size: 250
+
+  # Gaussian smoothing of reference image (sigma in pixels)
+  smooth_sigma: 1.15
+
+  # Maximum shift as fraction of frame size
+  maxregshift: 0.1
+
+  # Enable non-rigid (piecewise) registration
+  nonrigid: true
+
+  # Block size in pixels for non-rigid registration
+  block_size: [128, 128]
+
+  # ── Detection ──
+  # Spatial scale: 0 = auto-detect from data. Cell diameter ~30 px → scale ~2
+  spatial_scale: 0
+
+  # Detection sensitivity multiplier. 1.0 = default. Lower = more permissive
+  threshold_scaling: 1.0
+
+  # Max iterations for ROI detection refinement
+  max_iterations: 20
+
+  # Require detected ROIs to be spatially connected
+  connected: true
+
+  # Number of frames binned for the detection reference image
+  nbinned: 5000
+
+  # Non-overlapping footprints simplify consensus mask rasterization
+  allow_overlap: false
+
+  # ── Classification ──
+  # Pre-classification threshold: 0.0 = keep all candidates (consensus handles filtering)
+  preclassify: 0.0
+
+  # ── Neuropil ──
+  # High-pass filter cutoff for neuropil subtraction
+  high_pass: 100
+
+  # Inner exclusion radius around ROI for neuropil annulus (pixels)
+  inner_neuropil_radius: 2
+
+  # Minimum pixels in neuropil annulus
+  min_neuropil_pixels: 350
+
+  # ── Spike deconvolution ──
+  # Enable OASIS spike deconvolution
+  spikedetect: true
+
+consensus:
+  # Minimum spatial IoU to consider a Suite2p–Cellpose ROI pair as matched
+  # 0.3 is conservative for irregular Suite2p footprints vs smooth Cellpose contours
+  # Literature range: 0.3–0.5 (Giovannucci et al., CaImAn)
+  iou_threshold: 0.3
+
+  # Minimum Suite2p iscell probability to include an ROI as a candidate
+  # 0.5 is permissive — borderline cells enter consensus adjudication
+  s2p_min_iscell_prob: 0.5
+
+  # Tier definitions (for reference; logic is in match_rois.py)
+  #   GOLD:   both Suite2p and Cellpose agree (IoU >= iou_threshold)
+  #   SILVER: Cellpose-only (no Suite2p match or IoU < threshold)
+  #   BRONZE: Suite2p-only (no Cellpose match or IoU < threshold)
+
+  # Which tiers to include in the default output mask for downstream analysis
+  default_tiers: [gold, silver]
+
+paths:
+  # All paths relative to project root (~/Otis-Lab/Projects/roigbiv)
+  raw_dir: data/raw
+  annotated_dir: data/annotated
+  masks_dir: data/masks
+  s2p_output: suite2p_workspace/output
+  inference_output: inference/output
+  consensus_output: inference/consensus
+  traces_output: inference/traces
+
+hardware:
+  # Use GPU for Suite2p and Cellpose
+  gpu: true
+
+  # RAM headroom: leave 3 GB free from 15 GB total
+  max_ram_gb: 12

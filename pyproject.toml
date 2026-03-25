@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "roigbiv"
+version = "0.1.0"
+description = "Consensus cell detection pipeline for two-photon calcium imaging (Suite2p + Cellpose)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["neuroscience", "calcium imaging", "cell detection", "Suite2p", "Cellpose"]
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "tifffile",
+    "scikit-image",
+    "matplotlib",
+    "ipywidgets",
+    "pyyaml",
+]
+# suite2p and cellpose are NOT listed here — they must be installed with specific
+# ordering in the notebook (suite2p first, then cellpose==4.0.9 --upgrade) to
+# avoid dependency pin conflicts.
+
+[project.optional-dependencies]
+dev = ["build", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["roigbiv*"]
+
+[tool.setuptools.package-data]
+roigbiv = ["py.typed"]
