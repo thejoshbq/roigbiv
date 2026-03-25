@@ -86,7 +86,7 @@ def _run_one_fov(src, fs, tau, cfg, do_registration, extract_vcorr,
         if s2p_out:
             ops['save_path0'] = str(s2p_out / stem)
         ops['do_registration'] = 1 if do_registration else 0
-        output_ops = run_s2p(ops=ops)
+        output_ops = run_s2p(ops)
         n_rois = output_ops.get('nROIs', '?')
         print(f'  {stem}: {n_rois} ROIs')
         if extract_vcorr and 'Vcorr' in output_ops:
@@ -198,7 +198,7 @@ def main():
     print(f'  Registration:  {"ON" if ops["do_registration"] else "OFF (pre-corrected)"}')
     print(f'  Output:        {s2p_out}')
 
-    output_ops = run_s2p(ops=ops)
+    output_ops = run_s2p(ops)
 
     n_rois = output_ops.get('nROIs', '?')
     print(f'Suite2p complete. {n_rois} ROIs detected.')

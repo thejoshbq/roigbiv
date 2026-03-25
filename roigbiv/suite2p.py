@@ -141,7 +141,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     try:
         ops = _build_ops(named_dir, fs, tau, anatomical_only, do_registration, cfg)
         ops["save_path0"] = str(output_dir / stem)
-        run_s2p(ops=ops)
+        run_s2p(ops)
     finally:
         shutil.rmtree(tmp_base, ignore_errors=True)
         data_bin = output_dir / stem / "suite2p" / "plane0" / "data.bin"
