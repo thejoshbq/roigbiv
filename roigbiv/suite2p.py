@@ -141,7 +141,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
         shutil.copy2(str(tif_path), str(local_tif))
         ops = _build_ops(stage_dir, fs, tau, anatomical_only, do_registration, cfg)
         ops["save_path0"] = str(output_dir / stem)
-        run_s2p(ops)
+        ops["tiff_list"] = [str(local_tif)]
+        run_s2p(ops=ops)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:
