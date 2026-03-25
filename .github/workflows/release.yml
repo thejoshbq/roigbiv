@@ -24,7 +24,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install build tools
-        run: pip install build
+        run: pip install --upgrade pip build setuptools wheel
 
       - name: Build wheel and source distribution
         run: python -m build
