@@ -5,14 +5,14 @@ Launch with:  streamlit run app.py
 Access from LAN:  streamlit run app.py --server.address 0.0.0.0
 """
 import io
+import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import tifffile
 import torch
 
 # ── Project root & defaults ──────────────────────────────────────────────────
@@ -74,7 +74,7 @@ def main():
                  use_vcorr, do_registration, tiers, model_path)
 
     with tab_results:
-        _results_tab(output_dir)
+        _results_tab(output_dir, tiers)
 
 
 # ── Run tab ───────────────────────────────────────────────────────────────────
@@ -192,9 +192,38 @@ def _run_tab(tif_dir, output_dir, fs, tau, diameter, iou_threshold,
         st.info("No ROIs processed (all FOVs may have been skipped).")
 
 
+# ── Napari launcher ───────────────────────────────────────────────────────────
+
+def _launch_napari(stem: str, results_dir: str, projections_dir: str,
+                   outline_tiers: list[str] | None = None):
+    """Launch Napari viewer for a single FOV in a subprocess."""
+    try:
+        import napari  # noqa: F401 — pre-flight check
+    except ImportError:
+        st.error(
+            "Napari is not installed. Install it with:\n\n"
+            "```\npip install 'napari[all]'\n```"
+        )
+        return
+
+    cmd = [
+        sys.executable, "-m", "roigbiv.napari_viewer",
+        "--stem", stem,
+        "--results-dir", results_dir,
+        "--projections-dir", projections_dir,
+    ]
+    if outline_tiers:
+        cmd.extend(["--outline-tiers"] + [t.upper() for t in outline_tiers])
+    try:
+        subprocess.Popen(cmd)
+        st.success(f"Napari is opening for **{stem}**. Close Napari to return here.")
+    except Exception as e:
+        st.error(f"Failed to launch Napari: {e}")
+
+
 # ── Results tab ───────────────────────────────────────────────────────────────
 
-def _results_tab(output_dir):
+def _results_tab(output_dir, tiers):
     if not output_dir:
         st.info("Enter an output directory in the sidebar.")
         return
@@ -231,61 +260,11 @@ def _results_tab(output_dir):
     # FOV viewer
     st.subheader("FOV Viewer")
     selected_stem = st.selectbox("Select FOV", stems)
-    selected_tiers = st.multiselect("Show tiers", ["GOLD", "SILVER", "BRONZE"],
-                                    default=["GOLD", "SILVER"], key="view_tiers")
-    min_prob = st.slider("Min Cellpose probability", -6.0, 6.0, 0.0, 0.1)
-
-    mask_path = results_dir / f"{selected_stem}_all_s2p_masks.tif"
-    mask = tifffile.imread(str(mask_path))
-
-    # Look for mean projection
     projections_dir = Path(output_dir) / "projections"
-    mean_path = None
-    for candidate in [
-        projections_dir / f"{selected_stem}_mean.tif",
-        projections_dir / f"{selected_stem}_mc_mean.tif",
-    ]:
-        if candidate.exists():
-            mean_path = candidate
-            break
 
-    import matplotlib.pyplot as plt
-    from scipy.ndimage import binary_dilation
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    if mean_path:
-        bg = tifffile.imread(str(mean_path)).astype(np.float32)
-        p1, p99 = np.percentile(bg, [1, 99])
-        bg = np.clip((bg - p1) / max(p99 - p1, 1e-6), 0, 1)
-        ax.imshow(bg, cmap="gray", interpolation="none")
-    else:
-        ax.imshow(np.zeros(mask.shape, dtype=np.float32), cmap="gray")
-
-    tier_colors = {"GOLD": "#FFD700", "SILVER": "#00BFFF", "BRONZE": "#FF6347"}
-    n_shown = 0
-
-    if df is not None:
-        fov_df = df[df["fov"] == selected_stem]
-        for _, row in fov_df.iterrows():
-            tier = str(row["tier"]).upper()
-            if tier not in selected_tiers:
-                continue
-            if row.get("cellpose_mean_prob", 0.0) < min_prob:
-                continue
-            roi = mask == int(row["roi_id"])
-            boundary = binary_dilation(roi, iterations=1) & ~roi
-            ys, xs = np.where(boundary)
-            if len(ys) > 0:
-                ax.scatter(xs, ys, c=tier_colors.get(tier, "white"),
-                           s=0.4, alpha=0.85, marker=".", linewidths=0)
-                n_shown += 1
-
-    ax.set_title(f"{selected_stem} — {n_shown} ROIs shown")
-    ax.axis("off")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    if st.button(f"Open '{selected_stem}' in Napari", type="primary"):
+        _launch_napari(selected_stem, str(results_dir), str(projections_dir),
+                       outline_tiers=tiers)
 
     # Download all results as ZIP
     st.subheader("Download Results")

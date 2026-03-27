@@ -21,4 +21,5 @@ dependencies:
     - "cellpose<4.0.0"
     - streamlit
     - ipywidgets
+    - "napari[all]>=0.4.19"
     - -e .

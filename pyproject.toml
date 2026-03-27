@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 app = ["streamlit"]
+viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
 
 [tool.setuptools.packages.find]
