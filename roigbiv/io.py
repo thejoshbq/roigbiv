@@ -148,20 +148,22 @@ def validate_tif(path) -> tuple:
 # Projection extraction
 # ---------------------------------------------------------------------------
 
-def extract_projections(s2p_activity_dir, out_dir) -> int:
+def extract_projections(s2p_activity_dir, out_dir, max_proj_dir=None) -> int:
     """
-    Extract mean image and Vcorr temporal correlation map from Suite2p output.
+    Extract mean, Vcorr, and max projections from Suite2p output.
 
     Reads ``ops.npy`` from every FOV in *s2p_activity_dir* and writes:
-      ``{out_dir}/{stem}_mean.tif``  — float32 time-averaged projection
-      ``{out_dir}/{stem}_vcorr.tif`` — float32 Vcorr map (if available)
+      ``{out_dir}/{stem}_mean.tif``      — float32 time-averaged projection
+      ``{out_dir}/{stem}_vcorr.tif``     — float32 Vcorr map (if available)
+      ``{max_proj_dir}/{stem}_max.tif``  — float32 max projection (if available)
 
-    These files are required by ``build_union_batch``.
+    If *max_proj_dir* is None, max projections are written to *out_dir*.
 
     Parameters
     ----------
-    s2p_activity_dir : path-like — Suite2p activity-pass output directory
-    out_dir          : path-like — where to write TIF projections
+    s2p_activity_dir : path-like — Suite2p output directory
+    out_dir          : path-like — where to write mean/Vcorr TIF projections
+    max_proj_dir     : path-like or None — where to write max projections
 
     Returns
     -------
@@ -170,6 +172,12 @@ def extract_projections(s2p_activity_dir, out_dir) -> int:
     s2p_activity_dir = Path(s2p_activity_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if max_proj_dir is not None:
+        max_proj_dir = Path(max_proj_dir)
+        max_proj_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        max_proj_dir = out_dir
 
     fov_dirs = sorted(d for d in s2p_activity_dir.iterdir() if d.is_dir())
     n = 0
@@ -193,11 +201,16 @@ def extract_projections(s2p_activity_dir, out_dir) -> int:
             tifffile.imwrite(str(out_dir / f"{stem}_vcorr.tif"), vcorr)
             parts.append("vcorr")
 
+        if "max_proj" in ops:
+            max_proj = ops["max_proj"].astype(np.float32)
+            tifffile.imwrite(str(max_proj_dir / f"{stem}_max.tif"), max_proj)
+            parts.append("max")
+
         if parts:
             n += 1
             print(f"  {stem}: saved {', '.join(parts)}")
         else:
-            print(f"  {stem}: WARNING — no meanImg or Vcorr in ops.npy")
+            print(f"  {stem}: WARNING — no meanImg, Vcorr, or max_proj in ops.npy")
 
     print(f"\nExtracted projections for {n} FOVs → {out_dir}")
     return n

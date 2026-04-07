@@ -6,20 +6,23 @@ cellpose:
   # Path to the deployed Cellpose model (relative to project root)
   model_path: models/deployed/current_model
 
-  # Expected cell diameter in pixels (must match training config)
-  diameter: 30
+  # Expected cell diameter in pixels (GRIN lens neurons ~12 px)
+  diameter: 12
 
-  # Channel config: [cytoplasm, nucleus]. [0, 0] = grayscale single-channel
-  channels: [0, 0]
+  # Channel config: [1, 2] = dual-channel [mean, Vcorr]; [0, 0] = grayscale
+  channels: [1, 2]
 
-  # Flow field error threshold — higher = more permissive mask acceptance
-  flow_threshold: 0.4
+  # Flow field error threshold — 0.6 is more permissive for GRIN aberrated boundaries
+  flow_threshold: 0.6
 
-  # Cell probability threshold — 0.0 keeps all candidates for consensus filtering
-  cellprob_threshold: 0.0
+  # Cell probability threshold — -2.0 accepts dimmer, less certain cells (GRIN low SNR)
+  cellprob_threshold: -2.0
 
-  # Intensity normalization before inference
-  normalize: true
+  # Tile normalization compensates for GRIN vignetting (block size in pixels)
+  tile_norm_blocksize: 128
+
+  # Optional Cellpose3 image restoration before segmentation
+  denoise: false
 
 suite2p:
   # ── Data ──
@@ -46,14 +49,14 @@ suite2p:
   fs: 30.0
 
   # ── Registration ──
-  # 0 = skip registration. All stacks are pre-motion-corrected (*_mc.tif)
-  do_registration: 0
+  # Auto-detect: _mc filenames → OFF, else ON. This is the fallback default.
+  do_registration: 1
 
   # Number of frames for reference image computation
   nimg_init: 300
 
-  # Frames per GPU batch during registration (reduced for 15 GB RAM constraint)
-  batch_size: 250
+  # Frames per GPU batch during registration (RTX 4060 8GB safe limit at 512×512)
+  batch_size: 500
 
   # Gaussian smoothing of reference image (sigma in pixels)
   smooth_sigma: 1.15
@@ -71,8 +74,8 @@ suite2p:
   # Spatial scale: 0 = auto-detect from data. Cell diameter ~30 px → scale ~2
   spatial_scale: 0
 
-  # Detection sensitivity multiplier. 1.0 = default. Lower = more permissive
-  threshold_scaling: 1.0
+  # Detection sensitivity multiplier. Lower = more permissive (0.5 for GRIN lens)
+  threshold_scaling: 0.5
 
   # Max iterations for ROI detection refinement
   max_iterations: 20
@@ -104,6 +107,9 @@ suite2p:
   # Enable OASIS spike deconvolution
   spikedetect: true
 
+  # Keep data.bin after processing (needed by Branch C and trace extraction)
+  delete_bin: false
+
 consensus:
   # Minimum spatial IoU to consider a Suite2p–Cellpose ROI pair as matched
   # 0.3 is conservative for irregular Suite2p footprints vs smooth Cellpose contours
@@ -122,15 +128,90 @@ consensus:
   # Which tiers to include in the default output mask for downstream analysis
   default_tiers: [gold, silver]
 
+tonic:
+  # ── Bandpass filtering (Step 6) ──
+  # Neuronal band: isolates GCaMP6s calcium transient fluctuations
+  band_lo: 0.05
+  band_hi: 2.0
+
+  # Butterworth filter order
+  filter_order: 3
+
+  # ── SVD compression ──
+  # Number of SVD components for temporal compression
+  n_components: 500
+
+  # Frames per chunk when streaming data.bin (controls peak RAM)
+  chunk_frames: 500
+
+  # ── Local correlation (Step 7) ──
+  # Neighborhood radius in pixels (~soma radius)
+  soma_radius: 8
+
+  # Minimum Pearson correlation to count as correlated
+  corr_threshold: 0.25  # was 0.15
+
+  # ── Size filtering ──
+  # Min/max ROI area in pixels (reject noise clusters and neuropil patches)
+  min_roi_pixels: 80
+  max_roi_pixels: 350  # was 300
+
+  # ── Morphological filtering ──
+  # Minimum solidity (area / convex-hull area); rejects spindly/concave neuropil fragments
+  min_solidity: 0.6
+  # Maximum eccentricity of equivalent ellipse; rejects elongated axon/process fragments
+  max_eccentricity: 0.85
+
+  # ── Astrocyte band (Phase 2 extension) ──
+  astrocyte_band_lo: 0.01
+  astrocyte_band_hi: 0.3
+
+merge:
+  # Minimum IoU to declare a match between any two branches
+  iou_threshold: 0.3
+  # Minimum Suite2p iscell probability to include Branch B ROIs
+  s2p_min_prob: 0.0
+  # Discard Branch C-only ROIs whose centroid is below the FOV 25th-percentile intensity
+  require_spatial_support: true
+
+traces:
+  # Neuropil surround parameters
+  inner_radius: 2
+  min_neuropil_pixels: 350
+  # Baseline estimation for dF/F
+  baseline_window_seconds: 60.0
+  baseline_percentile: 10.0
+  # Tonic neurons get wider baseline window (multiplier)
+  tonic_baseline_multiplier: 2.0
+  # Streaming chunk size (controls peak RAM; 200 frames ~ 100 MB for 512x512)
+  chunk_frames: 200
+  # Spike deconvolution (OASIS via Suite2p)
+  do_deconvolve: true
+
+classify:
+  # Stage A: cell/not-cell thresholds
+  snr_min: 2.0
+  area_min: 30
+  area_max: 500
+  compact_min: 0.15
+  # Stage B: activity-type thresholds
+  skew_phasic: 1.5
+  cv_tonic: 0.3
+  min_transients_sparse: 5
+
 paths:
   # All paths relative to project root (~/Otis-Lab/Projects/roigbiv)
   raw_dir: data/raw
   annotated_dir: data/annotated
   masks_dir: data/masks
+  max_projections_dir: data/max_projections
   s2p_output: suite2p_workspace/output
   inference_output: inference/output
-  consensus_output: inference/consensus
+  tonic_output: inference/tonic
+  merged_output: inference/merged
   traces_output: inference/traces
+  classified_output: inference/classified
+  consensus_output: inference/consensus
 
 hardware:
   # Use GPU for Suite2p and Cellpose

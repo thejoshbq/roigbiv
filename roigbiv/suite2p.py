@@ -149,9 +149,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
             (output_dir / "_stage").rmdir()
         except OSError:
             pass
-        data_bin = output_dir / stem / "suite2p" / "plane0" / "data.bin"
-        if data_bin.exists():
-            data_bin.unlink()
+        # data.bin is intentionally kept — Branch C and trace extraction need it
 
     return True
 

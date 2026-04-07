@@ -33,6 +33,10 @@ def main():
     ap.add_argument('--no_vcorr', action='store_true')
     ap.add_argument('--data_dir', default=None)
     ap.add_argument('--masks_dir', default=None)
+    ap.add_argument('--extra_data_dir', nargs='+', default=None,
+                    help='Additional data directories (space-separated)')
+    ap.add_argument('--extra_masks_dir', nargs='+', default=None,
+                    help='Additional masks directories (must match --extra_data_dir)')
     args = ap.parse_args()
 
     use_vcorr = args.use_vcorr and not args.no_vcorr
@@ -57,9 +61,18 @@ def main():
     data_dir  = Path(args.data_dir)  if args.data_dir  else DATA_DIR
     masks_dir = Path(args.masks_dir) if args.masks_dir else MASKS_DIR
 
+    # Build extra_dirs list
+    extra_dirs = None
+    if args.extra_data_dir and args.extra_masks_dir:
+        if len(args.extra_data_dir) != len(args.extra_masks_dir):
+            log.error('--extra_data_dir and --extra_masks_dir must have same number of entries')
+            return
+        extra_dirs = [(Path(d), Path(m))
+                      for d, m in zip(args.extra_data_dir, args.extra_masks_dir)]
+
     # Load dataset with same split as training
     images, masks_list = load_dataset(data_dir, masks_dir, seed=args.seed,
-                                      use_vcorr=use_vcorr)
+                                      use_vcorr=use_vcorr, extra_dirs=extra_dirs)
     n_val = max(1, int(len(images) * args.val_frac))
     val_imgs, val_masks = images[:n_val], masks_list[:n_val]
     log.info(f'Val set: {len(val_imgs)} images (val_frac={args.val_frac}, seed={args.seed})')
