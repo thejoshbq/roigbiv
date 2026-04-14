@@ -1,5 +1,5 @@
 """
-ROI G. Biv — Streamlit web interface for the three-branch ROI detection pipeline.
+ROIGBIV — Streamlit web interface for the three-branch ROI detection pipeline.
 
 Launch with:  streamlit run app.py
 Access from LAN:  streamlit run app.py --server.address 0.0.0.0
@@ -203,8 +203,8 @@ def _discover_stems(cellpose_dir: Path, s2p_dir: Path, tonic_dir: Path) -> list[
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="ROI G. Biv", layout="wide")
-    st.title("ROI G. Biv")
+    st.set_page_config(page_title="ROIGBIV", layout="wide")
+    st.title("ROIGBIV")
     st.caption("Three-branch ROI detection for two-photon calcium imaging")
 
     cfg = _load_config()
@@ -248,6 +248,29 @@ def main():
         do_registration = st.checkbox(
             "Run motion correction", value=False,
             help="Enable if TIFs are NOT pre-corrected (_mc suffix)")
+
+        # Branch B: Suite2p
+        with st.expander("Suite2p Detection (Branch B)"):
+            spatial_scale = st.selectbox(
+                "Spatial scale",
+                options=[0, 1, 2, 3, 4],
+                index=s2p_cfg.get("spatial_scale", 0),
+                format_func=lambda x: {
+                    0: "0 — auto-detect",
+                    1: "1 — ~6 px diameter",
+                    2: "2 — ~12 px diameter",
+                    3: "3 — ~24 px diameter",
+                    4: "4 — ~48 px diameter",
+                }[x],
+                help="Sets the cell-size scale Suite2p searches for. Values >0 prevent "
+                     "detection of clusters smaller than the selected diameter.",
+            )
+            threshold_scaling = st.number_input(
+                "Detection threshold scaling",
+                value=float(s2p_cfg.get("threshold_scaling", 1.0)),
+                min_value=0.1, max_value=5.0, step=0.1,
+                help="Higher = fewer, more prominent ROIs; lower = more permissive detection",
+            )
 
         # Branch A: Cellpose
         with st.expander("Cellpose (Branch A)"):
@@ -341,6 +364,8 @@ def main():
             tif_dir=tif_dir, output_dir=output_dir, fs=fs, tau=tau,
             do_registration=do_registration, model_path=model_path,
             cfg=cfg,
+            # Suite2p params
+            spatial_scale=spatial_scale, threshold_scaling=threshold_scaling,
             # Cellpose params
             diameter=diameter, flow_threshold=flow_threshold,
             cellprob_threshold=cellprob_threshold,
@@ -366,9 +391,9 @@ def main():
 
 def _instructions_tab():
     st.markdown("""
-## What is ROI G. Biv?
+## What is ROIGBIV?
 
-ROI G. Biv is a three-branch consensus pipeline for detecting regions of interest
+ROIGBIV is a three-branch consensus pipeline for detecting regions of interest
 (ROIs) in two-photon calcium imaging data acquired through GRIN lenses. It combines
 three independent detection methods, merges their results, extracts fluorescence
 traces, and classifies each ROI by quality and activity type.
@@ -447,6 +472,7 @@ ROI with QC features, cell/not-cell status, and activity type label.
 # ── Run tab ──────────────────────────────────────────────────────────────────
 
 def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
+             spatial_scale, threshold_scaling,
              diameter, flow_threshold, cellprob_threshold, tile_norm_blocksize,
              use_vcorr, denoise, n_components, soma_radius, corr_threshold,
              tonic_min_size, tonic_max_size, tonic_min_solidity, tonic_max_eccentricity,
@@ -508,6 +534,7 @@ def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
             tif_files, output_dir=str(s2p_dir),
             fs=fs, tau=tau, anatomical_only=0,
             do_registration=do_registration, cfg=cfg,
+            spatial_scale=spatial_scale, threshold_scaling=threshold_scaling,
         )
         elapsed = time.time() - t0
         status.update(label=f"Stage 1: Suite2p ({elapsed:.0f}s)", state="complete")
@@ -717,18 +744,16 @@ def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
 
 def _launch_napari(
     out_path: Path, stem: str,
-    load_mean: bool, load_a: bool, load_b: bool, load_c: bool,
-    load_tiers: bool, load_types: bool,
+    load_a: bool, load_b: bool, load_c: bool,
+    load_outlines: bool, load_labels: bool,
 ) -> None:
     """Generate a self-contained Napari viewer script and launch it as a subprocess."""
     import subprocess
     import tempfile
 
-    proj_dir = out_path / "projections"
     cp_dir = out_path / "cellpose"
     tonic_dir = out_path / "tonic"
     merged_dir = out_path / "merged"
-    classified_dir = out_path / "classified"
     s2p_plane = out_path / "suite2p" / stem / "suite2p" / "plane0"
 
     L = [
@@ -738,35 +763,29 @@ def _launch_napari(
         "import numpy as np",
         "import pandas as pd",
         "import tifffile",
-        "from napari.utils.colormaps import DirectLabelColormap",
         "",
-        "def _hex_rgba(h, a=1.0):",
-        "    h = h.lstrip('#')",
-        "    return np.array([int(h[i:i+2], 16)/255 for i in (0,2,4)]+[a], dtype=np.float32)",
-        "",
-        f"viewer = napari.Viewer(title='ROI G. Biv \u2014 {stem}')",
+        f"viewer = napari.Viewer(title='ROIGBIV \u2014 {stem}')",
         "",
     ]
 
-    # Mean projection
-    if load_mean:
-        p = proj_dir / f"{stem}_mean.tif"
-        if p.exists():
-            L.append(
-                f"viewer.add_image(tifffile.imread(r'{p}').astype('float32'),"
-                f" name='Mean Projection', colormap='gray')"
-            )
+    # Mean projection (always-on background)
+    mean_p = out_path / "projections" / f"{stem}_mean.tif"
+    if mean_p.exists():
+        L.append(
+            f"viewer.add_image(tifffile.imread(r'{mean_p}').astype('float32'),"
+            f" name='Mean Projection', colormap='gray')"
+        )
 
-    # Branch A — Cellpose
+    # Cellpose
     if load_a:
         p = cp_dir / f"{stem}_masks.tif"
         if p.exists():
             L.append(
                 f"viewer.add_labels(tifffile.imread(r'{p}'),"
-                f" name='Branch A (Cellpose)', opacity=0.5)"
+                f" name='Cellpose', opacity=0.5)"
             )
 
-    # Branch B — Suite2p (reconstruct from stat.npy)
+    # Suite2p (reconstruct from stat.npy)
     if load_b:
         stat_p = s2p_plane / "stat.npy"
         ops_p = s2p_plane / "ops.npy"
@@ -776,72 +795,77 @@ def _launch_napari(
                 f"_stat = np.load(r'{stat_p}', allow_pickle=True)",
                 f"_ops = np.load(r'{ops_p}', allow_pickle=True).item()",
                 "viewer.add_labels(stat_to_mask(_stat, _ops['Ly'], _ops['Lx']),"
-                " name='Branch B (Suite2p)', opacity=0.5)",
+                " name='Suite2p', opacity=0.5)",
             ]
 
-    # Branch C — Tonic
+    # Tonic
     if load_c:
         p = tonic_dir / f"{stem}_tonic_masks.tif"
         if p.exists():
             L.append(
                 f"viewer.add_labels(tifffile.imread(r'{p}'),"
-                f" name='Branch C (Tonic)', opacity=0.5)"
+                f" name='Tonic', opacity=0.5)"
             )
 
-    # Merged mask (shared by tier + activity type layers)
+    # Merged mask (shared by outline + label layers)
     merged_p = merged_dir / f"{stem}_merged_masks.tif"
     rec_p = merged_dir / f"{stem}_merge_records.csv"
-    cls_p = classified_dir / f"{stem}_classification.csv"
 
-    need_merged = (
-        (load_tiers and merged_p.exists() and rec_p.exists()) or
-        (load_types and merged_p.exists() and cls_p.exists())
-    )
+    need_merged = (load_outlines or load_labels) and merged_p.exists()
     if need_merged:
         L.append(f"_merged = tifffile.imread(r'{merged_p}')")
 
-    # Merged — Tiers
-    if load_tiers and merged_p.exists() and rec_p.exists():
+    # Merged ROI Outlines
+    if load_outlines and merged_p.exists():
         L += [
-            f"_rec = pd.read_csv(r'{rec_p}')",
-            "_tier_id = {'ABC': 1, 'AB': 2, 'AC': 3, 'BC': 4, 'A': 5, 'B': 6, 'C': 7}",
-            "_tier_mask = np.zeros_like(_merged)",
-            "for _, _row in _rec.iterrows():",
-            "    _tier_mask[_merged == int(_row['roi_id'])] ="
-            " _tier_id.get(str(_row.get('tier', 'A')).upper(), 0)",
-            "_tier_cmap = DirectLabelColormap(color_dict={",
-            "    None: np.zeros(4, dtype=np.float32), 0: np.zeros(4, dtype=np.float32),",
-            "    1: _hex_rgba('#FFD700'), 2: _hex_rgba('#9b59b6'), 3: _hex_rgba('#1abc9c'),",
-            "    4: _hex_rgba('#e67e22'), 5: _hex_rgba('#3498db'),",
-            "    6: _hex_rgba('#2ecc71'), 7: _hex_rgba('#e74c3c'),",
-            "})",
-            "viewer.add_labels(_tier_mask, name='Merged \u2014 Tiers',"
-            " colormap=_tier_cmap, opacity=0.6)",
+            "_outline_layer = viewer.add_labels(_merged.copy(),"
+            " name='Merged ROI Outlines', opacity=0.9)",
+            "_outline_layer.contour = 2",
         ]
 
-    # Merged — Activity Types
-    if load_types and merged_p.exists() and cls_p.exists():
+    # ROI Labels (numeric IDs at centroids)
+    if load_labels and merged_p.exists() and rec_p.exists():
         L += [
-            f"_cls = pd.read_csv(r'{cls_p}')",
-            "if 'roi_id' not in _cls.columns: _cls = _cls.reset_index()",
-            "_type_id = {'phasic': 1, 'tonic': 2, 'sparse': 3, 'ambiguous': 4, 'rejected': 5}",
-            "_act_mask = np.zeros_like(_merged)",
-            "for _, _row in _cls.iterrows():",
-            "    _act_mask[_merged == int(_row['roi_id'])] ="
-            " _type_id.get(str(_row.get('activity_type', 'rejected')), 5)",
-            "_act_cmap = DirectLabelColormap(color_dict={",
-            "    None: np.zeros(4, dtype=np.float32), 0: np.zeros(4, dtype=np.float32),",
-            "    1: _hex_rgba('#e74c3c'), 2: _hex_rgba('#3498db'), 3: _hex_rgba('#2ecc71'),",
-            "    4: _hex_rgba('#f39c12'), 5: _hex_rgba('#aaaaaa'),",
-            "})",
-            "viewer.add_labels(_act_mask, name='Merged \u2014 Activity Types',"
-            " colormap=_act_cmap, opacity=0.6)",
+            f"_rec = pd.read_csv(r'{rec_p}')",
+            "if len(_rec) > 0:",
+            "    _coords = _rec[['centroid_y', 'centroid_x']].values",
+            "    _ids = _rec['roi_id'].astype(str).tolist()",
+            "    _text = {'string': _ids, 'size': 10, 'color': 'white'}",
+            "    viewer.add_points(_coords, name='ROI Labels',"
+            "     text=_text, size=1, face_color='transparent',"
+            "     border_color='transparent', visible=True)",
         ]
 
     L += ["", "napari.run()"]
 
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write("\n".join(L))
+        tmp_path = f.name
+
+    subprocess.Popen([sys.executable, tmp_path])
+
+
+def _launch_curator(out_path: Path, stem: str) -> None:
+    """Generate a self-contained ROI curator script and launch it as a subprocess."""
+    import subprocess
+    import tempfile
+
+    merged_dir = out_path / "merged"
+    proj_dir = out_path / "projections"
+
+    script = "\n".join([
+        "import sys",
+        f"sys.path.insert(0, r'{PROJECT_ROOT}')",
+        "from roigbiv.curator import open_curator",
+        f"open_curator(",
+        f"    stem=r'{stem}',",
+        f"    merged_dir=r'{merged_dir}',",
+        f"    projections_dir=r'{proj_dir}',",
+        ")",
+    ])
+
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write(script)
         tmp_path = f.name
 
     subprocess.Popen([sys.executable, tmp_path])
@@ -863,27 +887,37 @@ def _viz_section(out_path: Path) -> None:
         stem = st.selectbox("FOV", stems, key="viz_fov")
 
     st.caption("Select layers to load:")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
-        load_mean  = st.checkbox("Mean Projection",         value=True, key="viz_mean")
-        load_a     = st.checkbox("Branch A (Cellpose)",     value=True, key="viz_a")
+        load_a        = st.checkbox("Cellpose",             value=True, key="viz_a")
+        load_b        = st.checkbox("Suite2p",              value=True, key="viz_b")
+        load_c        = st.checkbox("Tonic",                value=True, key="viz_c")
     with c2:
-        load_b     = st.checkbox("Branch B (Suite2p)",      value=True, key="viz_b")
-        load_c     = st.checkbox("Branch C (Tonic)",        value=True, key="viz_c")
-    with c3:
-        load_tiers = st.checkbox("Merged \u2014 Tiers",          value=True, key="viz_tiers")
-        load_types = st.checkbox("Merged \u2014 Activity Types",  value=True, key="viz_types")
+        load_outlines = st.checkbox("Merged ROI Outlines",  value=True, key="viz_outlines")
+        load_labels   = st.checkbox("ROI Labels",           value=True, key="viz_labels")
 
-    if st.button("Open in Napari", type="primary", key="viz_open"):
-        try:
-            _launch_napari(
-                out_path=out_path, stem=stem,
-                load_mean=load_mean, load_a=load_a, load_b=load_b, load_c=load_c,
-                load_tiers=load_tiers, load_types=load_types,
-            )
-            st.success("Napari launched \u2014 check for a new window.")
-        except Exception as e:
-            st.error(f"Failed to launch Napari: {e}")
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("Open in Napari", type="primary", key="viz_open"):
+            try:
+                _launch_napari(
+                    out_path=out_path, stem=stem,
+                    load_a=load_a, load_b=load_b, load_c=load_c,
+                    load_outlines=load_outlines, load_labels=load_labels,
+                )
+                st.success("Napari launched \u2014 check for a new window.")
+            except Exception as e:
+                st.error(f"Failed to launch Napari: {e}")
+    with btn_col2:
+        if st.button("Curate ROIs", type="secondary", key="viz_curate"):
+            try:
+                _launch_curator(out_path=out_path, stem=stem)
+                st.success(
+                    "Curator launched \u2014 check for a new window. "
+                    "Re-run Stages 6\u20137 after saving curated masks."
+                )
+            except Exception as e:
+                st.error(f"Failed to launch curator: {e}")
 
 
 # ── Results tab ──────────────────────────────────────────────────────────────
@@ -922,14 +956,6 @@ def _results_tab(output_dir):
         type_counts = df.loc[df["is_cell"], "activity_type"].value_counts()
         st.dataframe(
             type_counts.rename("count").to_frame(), use_container_width=True)
-
-    # ── Merge tier breakdown ──────────────────────────────────────────
-    if merge_csv.exists():
-        merge_df = pd.read_csv(str(merge_csv))
-        st.subheader("Merge Tier Breakdown")
-        tier_counts = merge_df["tier"].value_counts().sort_index()
-        st.dataframe(
-            tier_counts.rename("count").to_frame(), use_container_width=True)
 
     # ── Per-FOV detail ────────────────────────────────────────────────
     if cls_csv.exists():

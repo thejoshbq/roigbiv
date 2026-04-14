@@ -23,7 +23,8 @@ from pathlib import Path
 
 def _build_ops(input_dir, fs: float, tau: float = 1.0,
                anatomical_only: int = 0, do_registration: bool = False,
-               cfg: dict = None) -> dict:
+               cfg: dict = None, spatial_scale: int = None,
+               threshold_scaling: float = None) -> dict:
     """
     Construct a Suite2p ops dict, merging values from an optional pipeline
     config dict. CLI-supplied ``fs``, ``tau``, ``anatomical_only``, and
@@ -54,8 +55,8 @@ def _build_ops(input_dir, fs: float, tau: float = 1.0,
         "block_size":       s2p_cfg.get("block_size", [128, 128]),
 
         # ── Detection ─────────────────────────────────────────────────────
-        "spatial_scale":    s2p_cfg.get("spatial_scale", 0),
-        "threshold_scaling": s2p_cfg.get("threshold_scaling", 1.0),
+        "spatial_scale":    spatial_scale if spatial_scale is not None else s2p_cfg.get("spatial_scale", 0),
+        "threshold_scaling": threshold_scaling if threshold_scaling is not None else s2p_cfg.get("threshold_scaling", 1.0),
         "max_iterations":   s2p_cfg.get("max_iterations", 20),
         "connected":        s2p_cfg.get("connected", True),
         "nbinned":          s2p_cfg.get("nbinned", 5000),
@@ -83,7 +84,9 @@ def _build_ops(input_dir, fs: float, tau: float = 1.0,
 
 def run_suite2p_fov(tif_path, output_dir, fs: float,
                     anatomical_only: int = 0, tau: float = 1.0,
-                    do_registration: bool = False, cfg: dict = None) -> bool:
+                    do_registration: bool = False, cfg: dict = None,
+                    spatial_scale: int = None,
+                    threshold_scaling: float = None) -> bool:
     """
     Run Suite2p on a single TIF file.
 
@@ -139,7 +142,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     try:
         print("staging... ", end="", flush=True)
         shutil.copy2(str(tif_path), str(local_tif))
-        ops = _build_ops(stage_dir, fs, tau, anatomical_only, do_registration, cfg)
+        ops = _build_ops(stage_dir, fs, tau, anatomical_only, do_registration, cfg,
+                         spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
         ops["tiff_list"] = [str(local_tif)]
         run_s2p(ops=ops)
@@ -156,7 +160,9 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
 
 def run_suite2p_batch(tif_files, output_dir, fs: float,
                       anatomical_only: int = 0, tau: float = 1.0,
-                      do_registration: bool = False, cfg: dict = None) -> None:
+                      do_registration: bool = False, cfg: dict = None,
+                      spatial_scale: int = None,
+                      threshold_scaling: float = None) -> None:
     """
     Run Suite2p on each TIF in *tif_files* sequentially.
 
@@ -190,7 +196,8 @@ def run_suite2p_batch(tif_files, output_dir, fs: float,
         t0 = time.time()
         try:
             processed = run_suite2p_fov(
-                tif, output_dir, fs, anatomical_only, tau, do_registration, cfg
+                tif, output_dir, fs, anatomical_only, tau, do_registration, cfg,
+                spatial_scale=spatial_scale, threshold_scaling=threshold_scaling,
             )
             elapsed = time.time() - t0
             if processed:

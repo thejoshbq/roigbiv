@@ -24,6 +24,7 @@ from roigbiv.classify import (
 )
 from roigbiv.union import build_union_batch
 from roigbiv.viz import create_colab_viewer
+from roigbiv.curator import open_curator
 
 __all__ = [
     # I/O
@@ -54,6 +55,8 @@ __all__ = [
     "compute_qc_features",
     "classify_cell_nocell",
     "classify_activity_type",
+    # Curation
+    "open_curator",
     # Legacy
     "build_union_batch",
     "create_colab_viewer",
