@@ -1,0 +1,1363 @@
+{
+  "n_reproduced": 101,
+  "n_saved": 101,
+  "rows": [
+    {
+      "label_id": 1,
+      "reproduced_area": 282,
+      "reproduced_centroid_yx": [
+        32.787234042553195,
+        129.89007092198582
+      ],
+      "saved_area": 282,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.3748914003372192,
+      "soma_surround_contrast": 1.2388946912065217
+    },
+    {
+      "label_id": 2,
+      "reproduced_area": 442,
+      "reproduced_centroid_yx": [
+        64.15610859728507,
+        277.6877828054299
+      ],
+      "saved_area": 442,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+92.000"
+      ],
+      "cellpose_prob": 0.16090917587280273,
+      "soma_surround_contrast": 1.2033345318380733
+    },
+    {
+      "label_id": 3,
+      "reproduced_area": 178,
+      "reproduced_centroid_yx": [
+        73.97752808988764,
+        40.92134831460674
+      ],
+      "saved_area": 178,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.28122010827064514,
+      "soma_surround_contrast": 0.5964296689692381
+    },
+    {
+      "label_id": 4,
+      "reproduced_area": 304,
+      "reproduced_centroid_yx": [
+        74.03289473684211,
+        140.8421052631579
+      ],
+      "saved_area": 304,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.097364068031311,
+      "soma_surround_contrast": 0.8712970719628093
+    },
+    {
+      "label_id": 5,
+      "reproduced_area": 282,
+      "reproduced_centroid_yx": [
+        77.54255319148936,
+        354.0354609929078
+      ],
+      "saved_area": 282,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.5421847105026245,
+      "soma_surround_contrast": 0.6108586475775861
+    },
+    {
+      "label_id": 6,
+      "reproduced_area": 256,
+      "reproduced_centroid_yx": [
+        77.046875,
+        404.68359375
+      ],
+      "saved_area": 256,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.4646376371383667,
+      "soma_surround_contrast": 0.5251879500955098
+    },
+    {
+      "label_id": 7,
+      "reproduced_area": 298,
+      "reproduced_centroid_yx": [
+        78.66107382550335,
+        256.3422818791946
+      ],
+      "saved_area": 298,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.2594248652458191,
+      "soma_surround_contrast": 0.4324031192669041
+    },
+    {
+      "label_id": 8,
+      "reproduced_area": 327,
+      "reproduced_centroid_yx": [
+        84.34862385321101,
+        198.42201834862385
+      ],
+      "saved_area": 327,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.6120790243148804,
+      "soma_surround_contrast": 1.0074353623889005
+    },
+    {
+      "label_id": 9,
+      "reproduced_area": 316,
+      "reproduced_centroid_yx": [
+        83.80696202531645,
+        102.8006329113924
+      ],
+      "saved_area": 316,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.34849682450294495,
+      "soma_surround_contrast": 0.3078844267775813
+    },
+    {
+      "label_id": 10,
+      "reproduced_area": 177,
+      "reproduced_centroid_yx": [
+        89.55367231638418,
+        45.44632768361582
+      ],
+      "saved_area": 177,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.171249508857727,
+      "soma_surround_contrast": 1.0217003368510829
+    },
+    {
+      "label_id": 11,
+      "reproduced_area": 298,
+      "reproduced_centroid_yx": [
+        95.79530201342281,
+        326.6006711409396
+      ],
+      "saved_area": 298,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.1720249652862549,
+      "soma_surround_contrast": 0.9421503234278431
+    },
+    {
+      "label_id": 12,
+      "reproduced_area": 273,
+      "reproduced_centroid_yx": [
+        100.73626373626374,
+        359.8827838827839
+      ],
+      "saved_area": 273,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.4976058900356293,
+      "soma_surround_contrast": 0.22497000826786723
+    },
+    {
+      "label_id": 13,
+      "reproduced_area": 297,
+      "reproduced_centroid_yx": [
+        103.33333333333333,
+        162.1851851851852
+      ],
+      "saved_area": 297,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.6952853798866272,
+      "soma_surround_contrast": 0.7345830510428971
+    },
+    {
+      "label_id": 14,
+      "reproduced_area": 254,
+      "reproduced_centroid_yx": [
+        104.59055118110236,
+        284.18110236220474
+      ],
+      "saved_area": 254,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.7790889143943787,
+      "soma_surround_contrast": 0.645204209400206
+    },
+    {
+      "label_id": 15,
+      "reproduced_area": 237,
+      "reproduced_centroid_yx": [
+        105.19831223628692,
+        200.85654008438817
+      ],
+      "saved_area": 237,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.1820712089538574,
+      "soma_surround_contrast": 0.5566206070529913
+    },
+    {
+      "label_id": 16,
+      "reproduced_area": 255,
+      "reproduced_centroid_yx": [
+        110.41568627450981,
+        388.52941176470586
+      ],
+      "saved_area": 255,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.25020575523376465,
+      "soma_surround_contrast": 0.6259645949325491
+    },
+    {
+      "label_id": 17,
+      "reproduced_area": 241,
+      "reproduced_centroid_yx": [
+        114.94190871369294,
+        15.601659751037344
+      ],
+      "saved_area": 241,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.3446662425994873,
+      "soma_surround_contrast": 1.3445819293377994
+    },
+    {
+      "label_id": 18,
+      "reproduced_area": 312,
+      "reproduced_centroid_yx": [
+        118.24358974358974,
+        64.8301282051282
+      ],
+      "saved_area": 312,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.7345382571220398,
+      "soma_surround_contrast": 0.2693541361709605
+    },
+    {
+      "label_id": 19,
+      "reproduced_area": 194,
+      "reproduced_centroid_yx": [
+        116.35051546391753,
+        373.7886597938144
+      ],
+      "saved_area": 194,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.8903247117996216,
+      "soma_surround_contrast": 0.7426398202557374
+    },
+    {
+      "label_id": 20,
+      "reproduced_area": 317,
+      "reproduced_centroid_yx": [
+        122.48895899053628,
+        283.9621451104101
+      ],
+      "saved_area": 317,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.14571833610534668,
+      "soma_surround_contrast": 0.4718565945687164
+    },
+    {
+      "label_id": 21,
+      "reproduced_area": 298,
+      "reproduced_centroid_yx": [
+        126.71476510067114,
+        248.69127516778522
+      ],
+      "saved_area": 298,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.1593945026397705,
+      "soma_surround_contrast": 1.2699489270518416
+    },
+    {
+      "label_id": 22,
+      "reproduced_area": 349,
+      "reproduced_centroid_yx": [
+        132.567335243553,
+        219.3753581661891
+      ],
+      "saved_area": 349,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.7717195749282837,
+      "soma_surround_contrast": 1.4782776863306712
+    },
+    {
+      "label_id": 23,
+      "reproduced_area": 154,
+      "reproduced_centroid_yx": [
+        127.59740259740259,
+        417.1623376623377
+      ],
+      "saved_area": 154,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.5803448557853699,
+      "soma_surround_contrast": 0.5997648607168586
+    },
+    {
+      "label_id": 24,
+      "reproduced_area": 336,
+      "reproduced_centroid_yx": [
+        142.70238095238096,
+        152.64583333333334
+      ],
+      "saved_area": 336,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.8907240629196167,
+      "soma_surround_contrast": 1.1582298966689482
+    },
+    {
+      "label_id": 25,
+      "reproduced_area": 291,
+      "reproduced_centroid_yx": [
+        145.84536082474227,
+        434.92439862542955
+      ],
+      "saved_area": 291,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.6676747798919678,
+      "soma_surround_contrast": 0.5829721035768098
+    },
+    {
+      "label_id": 26,
+      "reproduced_area": 199,
+      "reproduced_centroid_yx": [
+        146.7537688442211,
+        24.8643216080402
+      ],
+      "saved_area": 199,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.15877193212509155,
+      "soma_surround_contrast": 0.297596866743485
+    },
+    {
+      "label_id": 27,
+      "reproduced_area": 260,
+      "reproduced_centroid_yx": [
+        150.97692307692307,
+        181.18846153846152
+      ],
+      "saved_area": 260,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.6799451112747192,
+      "soma_surround_contrast": 0.5697224563428476
+    },
+    {
+      "label_id": 28,
+      "reproduced_area": 168,
+      "reproduced_centroid_yx": [
+        151.29761904761904,
+        339.76785714285717
+      ],
+      "saved_area": 168,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.6086682677268982,
+      "soma_surround_contrast": 0.2920047405334726
+    },
+    {
+      "label_id": 29,
+      "reproduced_area": 327,
+      "reproduced_centroid_yx": [
+        157.62996941896026,
+        301.4434250764526
+      ],
+      "saved_area": 327,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.0344269275665283,
+      "soma_surround_contrast": 1.693149015897172
+    },
+    {
+      "label_id": 30,
+      "reproduced_area": 363,
+      "reproduced_centroid_yx": [
+        158.46280991735537,
+        274.06060606060606
+      ],
+      "saved_area": 363,
+      "gate_outcome": "flag",
+      "gate_reasons": [
+        "area_high:+13.000"
+      ],
+      "cellpose_prob": 1.8635140657424927,
+      "soma_surround_contrast": 1.6877083709975647
+    },
+    {
+      "label_id": 31,
+      "reproduced_area": 262,
+      "reproduced_centroid_yx": [
+        157.01526717557252,
+        136.59923664122138
+      ],
+      "saved_area": 262,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.9785687327384949,
+      "soma_surround_contrast": 1.0097580664751928
+    },
+    {
+      "label_id": 32,
+      "reproduced_area": 313,
+      "reproduced_centroid_yx": [
+        158.2779552715655,
+        357.41533546325877
+      ],
+      "saved_area": 313,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.5161348581314087,
+      "soma_surround_contrast": 1.312352117984237
+    },
+    {
+      "label_id": 33,
+      "reproduced_area": 234,
+      "reproduced_centroid_yx": [
+        162.5,
+        478.27777777777777
+      ],
+      "saved_area": 234,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.7451353073120117,
+      "soma_surround_contrast": 0.9288381402549606
+    },
+    {
+      "label_id": 34,
+      "reproduced_area": 249,
+      "reproduced_centroid_yx": [
+        165.69076305220884,
+        260.1285140562249
+      ],
+      "saved_area": 249,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.46461451053619385,
+      "soma_surround_contrast": 1.0815002346826306
+    },
+    {
+      "label_id": 35,
+      "reproduced_area": 258,
+      "reproduced_centroid_yx": [
+        168.46899224806202,
+        238.02325581395348
+      ],
+      "saved_area": 258,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.6319494247436523,
+      "soma_surround_contrast": 1.572547502607499
+    },
+    {
+      "label_id": 36,
+      "reproduced_area": 236,
+      "reproduced_centroid_yx": [
+        170.9364406779661,
+        415.3135593220339
+      ],
+      "saved_area": 236,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.21364915370941162,
+      "soma_surround_contrast": 0.3198356777216451
+    },
+    {
+      "label_id": 37,
+      "reproduced_area": 445,
+      "reproduced_centroid_yx": [
+        178.97078651685393,
+        389.4067415730337
+      ],
+      "saved_area": 445,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+95.000"
+      ],
+      "cellpose_prob": 1.0498331785202026,
+      "soma_surround_contrast": 1.5233058245632387
+    },
+    {
+      "label_id": 38,
+      "reproduced_area": 182,
+      "reproduced_centroid_yx": [
+        177.12637362637363,
+        304.04395604395603
+      ],
+      "saved_area": 182,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.6077339053153992,
+      "soma_surround_contrast": 1.3648230363164724
+    },
+    {
+      "label_id": 39,
+      "reproduced_area": 227,
+      "reproduced_centroid_yx": [
+        178.21145374449338,
+        64.49779735682819
+      ],
+      "saved_area": 227,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.3767868280410767,
+      "soma_surround_contrast": 0.6672454256416095
+    },
+    {
+      "label_id": 40,
+      "reproduced_area": 421,
+      "reproduced_centroid_yx": [
+        191.75296912114015,
+        183.07125890736341
+      ],
+      "saved_area": 421,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+71.000"
+      ],
+      "cellpose_prob": 1.7708635330200195,
+      "soma_surround_contrast": 1.590345022739446
+    },
+    {
+      "label_id": 41,
+      "reproduced_area": 314,
+      "reproduced_centroid_yx": [
+        193.70063694267515,
+        221.4203821656051
+      ],
+      "saved_area": 314,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.7028155326843262,
+      "soma_surround_contrast": 1.8739676615533176
+    },
+    {
+      "label_id": 42,
+      "reproduced_area": 431,
+      "reproduced_centroid_yx": [
+        196.5475638051044,
+        308.8631090487239
+      ],
+      "saved_area": 431,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+81.000"
+      ],
+      "cellpose_prob": 0.5919315218925476,
+      "soma_surround_contrast": 1.271164211459502
+    },
+    {
+      "label_id": 43,
+      "reproduced_area": 309,
+      "reproduced_centroid_yx": [
+        198.09708737864077,
+        15.071197411003237
+      ],
+      "saved_area": 309,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.502199649810791,
+      "soma_surround_contrast": 1.0610157698711447
+    },
+    {
+      "label_id": 44,
+      "reproduced_area": 267,
+      "reproduced_centroid_yx": [
+        199.9438202247191,
+        82.92883895131087
+      ],
+      "saved_area": 267,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.2970075309276581,
+      "soma_surround_contrast": 0.20506678010417206
+    },
+    {
+      "label_id": 45,
+      "reproduced_area": 358,
+      "reproduced_centroid_yx": [
+        207.10893854748602,
+        404.85474860335194
+      ],
+      "saved_area": 358,
+      "gate_outcome": "flag",
+      "gate_reasons": [
+        "area_high:+8.000"
+      ],
+      "cellpose_prob": 0.8880383372306824,
+      "soma_surround_contrast": 1.0227631524017067
+    },
+    {
+      "label_id": 46,
+      "reproduced_area": 388,
+      "reproduced_centroid_yx": [
+        205.68041237113403,
+        163.0180412371134
+      ],
+      "saved_area": 388,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+38.000"
+      ],
+      "cellpose_prob": 0.711611807346344,
+      "soma_surround_contrast": 1.1340259914108
+    },
+    {
+      "label_id": 47,
+      "reproduced_area": 251,
+      "reproduced_centroid_yx": [
+        207.10358565737053,
+        466.66932270916334
+      ],
+      "saved_area": 251,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.9819172024726868,
+      "soma_surround_contrast": 1.2624757297740414
+    },
+    {
+      "label_id": 48,
+      "reproduced_area": 208,
+      "reproduced_centroid_yx": [
+        207.1875,
+        383.6394230769231
+      ],
+      "saved_area": 208,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.4738332033157349,
+      "soma_surround_contrast": 0.8164464075349966
+    },
+    {
+      "label_id": 49,
+      "reproduced_area": 356,
+      "reproduced_centroid_yx": [
+        214.55337078651687,
+        235.79494382022472
+      ],
+      "saved_area": 356,
+      "gate_outcome": "flag",
+      "gate_reasons": [
+        "area_high:+6.000"
+      ],
+      "cellpose_prob": 2.2003042697906494,
+      "soma_surround_contrast": 2.2144004198421174
+    },
+    {
+      "label_id": 50,
+      "reproduced_area": 351,
+      "reproduced_centroid_yx": [
+        217.69230769230768,
+        319.5811965811966
+      ],
+      "saved_area": 351,
+      "gate_outcome": "flag",
+      "gate_reasons": [
+        "area_high:+1.000"
+      ],
+      "cellpose_prob": 0.6447455883026123,
+      "soma_surround_contrast": 0.7173939593677203
+    },
+    {
+      "label_id": 51,
+      "reproduced_area": 324,
+      "reproduced_centroid_yx": [
+        228.62962962962962,
+        140.59259259259258
+      ],
+      "saved_area": 324,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.0918797254562378,
+      "soma_surround_contrast": 1.0292468316773347
+    },
+    {
+      "label_id": 52,
+      "reproduced_area": 233,
+      "reproduced_centroid_yx": [
+        231.96995708154506,
+        341.1030042918455
+      ],
+      "saved_area": 233,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.5814364552497864,
+      "soma_surround_contrast": 0.9097603266821727
+    },
+    {
+      "label_id": 53,
+      "reproduced_area": 166,
+      "reproduced_centroid_yx": [
+        236.9156626506024,
+        79.1867469879518
+      ],
+      "saved_area": 166,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.32789134979248047,
+      "soma_surround_contrast": 0.4981322456188916
+    },
+    {
+      "label_id": 54,
+      "reproduced_area": 245,
+      "reproduced_centroid_yx": [
+        239.33469387755102,
+        480.38367346938776
+      ],
+      "saved_area": 245,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.6036290526390076,
+      "soma_surround_contrast": 0.47319599732795325
+    },
+    {
+      "label_id": 55,
+      "reproduced_area": 324,
+      "reproduced_centroid_yx": [
+        240.4814814814815,
+        377.5833333333333
+      ],
+      "saved_area": 324,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.4077389240264893,
+      "soma_surround_contrast": 0.9223485650902524
+    },
+    {
+      "label_id": 56,
+      "reproduced_area": 317,
+      "reproduced_centroid_yx": [
+        244.09463722397476,
+        348.6687697160883
+      ],
+      "saved_area": 317,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.8474005460739136,
+      "soma_surround_contrast": 1.5096003588275735
+    },
+    {
+      "label_id": 57,
+      "reproduced_area": 399,
+      "reproduced_centroid_yx": [
+        254.33333333333334,
+        108.72932330827068
+      ],
+      "saved_area": 399,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+49.000"
+      ],
+      "cellpose_prob": 3.1971323490142822,
+      "soma_surround_contrast": 4.8527130774993985
+    },
+    {
+      "label_id": 58,
+      "reproduced_area": 254,
+      "reproduced_centroid_yx": [
+        253.0748031496063,
+        228.06299212598427
+      ],
+      "saved_area": 254,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.3705540895462036,
+      "soma_surround_contrast": 1.2976149575225997
+    },
+    {
+      "label_id": 59,
+      "reproduced_area": 503,
+      "reproduced_centroid_yx": [
+        265.4572564612326,
+        285.09542743538765
+      ],
+      "saved_area": 503,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+153.000"
+      ],
+      "cellpose_prob": 1.9365350008010864,
+      "soma_surround_contrast": 2.201731481678209
+    },
+    {
+      "label_id": 60,
+      "reproduced_area": 255,
+      "reproduced_centroid_yx": [
+        261.7176470588235,
+        377.4156862745098
+      ],
+      "saved_area": 255,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.23922541737556458,
+      "soma_surround_contrast": 0.48288581197951774
+    },
+    {
+      "label_id": 61,
+      "reproduced_area": 236,
+      "reproduced_centroid_yx": [
+        261.93220338983053,
+        331.1271186440678
+      ],
+      "saved_area": 236,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.7218934297561646,
+      "soma_surround_contrast": 0.6457918062210021
+    },
+    {
+      "label_id": 62,
+      "reproduced_area": 388,
+      "reproduced_centroid_yx": [
+        266.2319587628866,
+        187.67268041237114
+      ],
+      "saved_area": 388,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+38.000"
+      ],
+      "cellpose_prob": 2.0311026573181152,
+      "soma_surround_contrast": 1.2750284644316017
+    },
+    {
+      "label_id": 63,
+      "reproduced_area": 483,
+      "reproduced_centroid_yx": [
+        270.3581780538302,
+        133.11387163561076
+      ],
+      "saved_area": 483,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+133.000"
+      ],
+      "cellpose_prob": 0.9358268976211548,
+      "soma_surround_contrast": 1.8468129345830775
+    },
+    {
+      "label_id": 64,
+      "reproduced_area": 168,
+      "reproduced_centroid_yx": [
+        269.2857142857143,
+        454.89285714285717
+      ],
+      "saved_area": 168,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.8663910627365112,
+      "soma_surround_contrast": 0.3687877721778429
+    },
+    {
+      "label_id": 65,
+      "reproduced_area": 315,
+      "reproduced_centroid_yx": [
+        284.968253968254,
+        342.66031746031746
+      ],
+      "saved_area": 315,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.5764396786689758,
+      "soma_surround_contrast": 0.35503749838379184
+    },
+    {
+      "label_id": 66,
+      "reproduced_area": 395,
+      "reproduced_centroid_yx": [
+        289.30886075949365,
+        83.5493670886076
+      ],
+      "saved_area": 395,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+45.000"
+      ],
+      "cellpose_prob": 2.048076868057251,
+      "soma_surround_contrast": 3.837368866019244
+    },
+    {
+      "label_id": 67,
+      "reproduced_area": 170,
+      "reproduced_centroid_yx": [
+        285.34705882352944,
+        370.8588235294118
+      ],
+      "saved_area": 170,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.40595850348472595,
+      "soma_surround_contrast": 0.2821600979883581
+    },
+    {
+      "label_id": 68,
+      "reproduced_area": 476,
+      "reproduced_centroid_yx": [
+        293.8970588235294,
+        227.27941176470588
+      ],
+      "saved_area": 476,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+126.000"
+      ],
+      "cellpose_prob": 2.3575661182403564,
+      "soma_surround_contrast": 3.8116169949417653
+    },
+    {
+      "label_id": 69,
+      "reproduced_area": 267,
+      "reproduced_centroid_yx": [
+        292.07865168539325,
+        410.07865168539325
+      ],
+      "saved_area": 267,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.1943594068288803,
+      "soma_surround_contrast": 0.3578966932620316
+    },
+    {
+      "label_id": 70,
+      "reproduced_area": 129,
+      "reproduced_centroid_yx": [
+        299.14728682170545,
+        318.27906976744185
+      ],
+      "saved_area": 129,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.6985825896263123,
+      "soma_surround_contrast": 0.48800010016051887
+    },
+    {
+      "label_id": 71,
+      "reproduced_area": 448,
+      "reproduced_centroid_yx": [
+        310.7142857142857,
+        127.88616071428571
+      ],
+      "saved_area": 448,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+98.000"
+      ],
+      "cellpose_prob": 1.8101749420166016,
+      "soma_surround_contrast": 1.8585611816163266
+    },
+    {
+      "label_id": 72,
+      "reproduced_area": 199,
+      "reproduced_centroid_yx": [
+        308.2361809045226,
+        426.42713567839195
+      ],
+      "saved_area": 199,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.7801605463027954,
+      "soma_surround_contrast": 0.3465246398357127
+    },
+    {
+      "label_id": 73,
+      "reproduced_area": 156,
+      "reproduced_centroid_yx": [
+        310.87820512820514,
+        372.53846153846155
+      ],
+      "saved_area": 156,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.40087535977363586,
+      "soma_surround_contrast": 0.5658646614544316
+    },
+    {
+      "label_id": 74,
+      "reproduced_area": 258,
+      "reproduced_centroid_yx": [
+        316.1589147286822,
+        312.49612403100775
+      ],
+      "saved_area": 258,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.0799007415771484,
+      "soma_surround_contrast": 1.2143946718390195
+    },
+    {
+      "label_id": 75,
+      "reproduced_area": 220,
+      "reproduced_centroid_yx": [
+        319.7681818181818,
+        219.1
+      ],
+      "saved_area": 220,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.2149908542633057,
+      "soma_surround_contrast": 1.7455941520802118
+    },
+    {
+      "label_id": 76,
+      "reproduced_area": 240,
+      "reproduced_centroid_yx": [
+        325.0833333333333,
+        66.20416666666667
+      ],
+      "saved_area": 240,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.514491319656372,
+      "soma_surround_contrast": 2.8945012471098215
+    },
+    {
+      "label_id": 77,
+      "reproduced_area": 242,
+      "reproduced_centroid_yx": [
+        333.3057851239669,
+        374.4669421487603
+      ],
+      "saved_area": 242,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.584316074848175,
+      "soma_surround_contrast": 0.6869613202416589
+    },
+    {
+      "label_id": 78,
+      "reproduced_area": 346,
+      "reproduced_centroid_yx": [
+        338.1820809248555,
+        76.5606936416185
+      ],
+      "saved_area": 346,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.6973153352737427,
+      "soma_surround_contrast": 4.064589267962483
+    },
+    {
+      "label_id": 79,
+      "reproduced_area": 344,
+      "reproduced_centroid_yx": [
+        336.47093023255815,
+        344.4331395348837
+      ],
+      "saved_area": 344,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.32627198100090027,
+      "soma_surround_contrast": 0.31554910434019
+    },
+    {
+      "label_id": 80,
+      "reproduced_area": 254,
+      "reproduced_centroid_yx": [
+        340.6377952755906,
+        117.10236220472441
+      ],
+      "saved_area": 254,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.2477766275405884,
+      "soma_surround_contrast": 0.9527120037127351
+    },
+    {
+      "label_id": 81,
+      "reproduced_area": 247,
+      "reproduced_centroid_yx": [
+        345.2914979757085,
+        249.1012145748988
+      ],
+      "saved_area": 247,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.5886586904525757,
+      "soma_surround_contrast": 0.9183413091456293
+    },
+    {
+      "label_id": 82,
+      "reproduced_area": 353,
+      "reproduced_centroid_yx": [
+        358.5807365439093,
+        304.09915014164307
+      ],
+      "saved_area": 353,
+      "gate_outcome": "flag",
+      "gate_reasons": [
+        "area_high:+3.000"
+      ],
+      "cellpose_prob": 0.6944401860237122,
+      "soma_surround_contrast": 1.284304216144155
+    },
+    {
+      "label_id": 83,
+      "reproduced_area": 133,
+      "reproduced_centroid_yx": [
+        355.796992481203,
+        260.8496240601504
+      ],
+      "saved_area": 133,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.6715755462646484,
+      "soma_surround_contrast": 0.5176841655806211
+    },
+    {
+      "label_id": 84,
+      "reproduced_area": 274,
+      "reproduced_centroid_yx": [
+        360.7846715328467,
+        404.36131386861314
+      ],
+      "saved_area": 274,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.3580753803253174,
+      "soma_surround_contrast": 0.7318649498698505
+    },
+    {
+      "label_id": 85,
+      "reproduced_area": 275,
+      "reproduced_centroid_yx": [
+        361.3781818181818,
+        326.50545454545454
+      ],
+      "saved_area": 275,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.9333664178848267,
+      "soma_surround_contrast": 1.161787196545586
+    },
+    {
+      "label_id": 86,
+      "reproduced_area": 377,
+      "reproduced_centroid_yx": [
+        365.7161803713528,
+        286.3129973474801
+      ],
+      "saved_area": 377,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+27.000"
+      ],
+      "cellpose_prob": 1.657139778137207,
+      "soma_surround_contrast": 1.9075680488635731
+    },
+    {
+      "label_id": 87,
+      "reproduced_area": 272,
+      "reproduced_centroid_yx": [
+        368.4779411764706,
+        189.9889705882353
+      ],
+      "saved_area": 272,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.6893267631530762,
+      "soma_surround_contrast": 0.7999040826745464
+    },
+    {
+      "label_id": 88,
+      "reproduced_area": 161,
+      "reproduced_centroid_yx": [
+        366.85093167701865,
+        65.42857142857143
+      ],
+      "saved_area": 161,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": -0.6299037933349609,
+      "soma_surround_contrast": 0.32819481323222166
+    },
+    {
+      "label_id": 89,
+      "reproduced_area": 173,
+      "reproduced_centroid_yx": [
+        377.04624277456645,
+        462.94797687861274
+      ],
+      "saved_area": 173,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.21307528018951416,
+      "soma_surround_contrast": 1.0823283806903201
+    },
+    {
+      "label_id": 90,
+      "reproduced_area": 332,
+      "reproduced_centroid_yx": [
+        381.37048192771084,
+        212.2289156626506
+      ],
+      "saved_area": 332,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.876867413520813,
+      "soma_surround_contrast": 1.0837254718774791
+    },
+    {
+      "label_id": 91,
+      "reproduced_area": 331,
+      "reproduced_centroid_yx": [
+        385.238670694864,
+        353.16616314199393
+      ],
+      "saved_area": 331,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.1726131439208984,
+      "soma_surround_contrast": 0.9595422970259246
+    },
+    {
+      "label_id": 92,
+      "reproduced_area": 173,
+      "reproduced_centroid_yx": [
+        395.2369942196532,
+        374.21387283236993
+      ],
+      "saved_area": 173,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 0.01274330448359251,
+      "soma_surround_contrast": 0.2773134636449292
+    },
+    {
+      "label_id": 93,
+      "reproduced_area": 484,
+      "reproduced_centroid_yx": [
+        408.400826446281,
+        217.5495867768595
+      ],
+      "saved_area": 484,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+134.000"
+      ],
+      "cellpose_prob": 0.3912118077278137,
+      "soma_surround_contrast": 0.5583144869975339
+    },
+    {
+      "label_id": 94,
+      "reproduced_area": 387,
+      "reproduced_centroid_yx": [
+        412.2170542635659,
+        400.1886304909561
+      ],
+      "saved_area": 387,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+37.000"
+      ],
+      "cellpose_prob": 0.9504154920578003,
+      "soma_surround_contrast": 0.5297172618802275
+    },
+    {
+      "label_id": 95,
+      "reproduced_area": 415,
+      "reproduced_centroid_yx": [
+        411.73253012048195,
+        352.33012048192774
+      ],
+      "saved_area": 415,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+65.000"
+      ],
+      "cellpose_prob": -0.22017690539360046,
+      "soma_surround_contrast": 0.31123237003972254
+    },
+    {
+      "label_id": 96,
+      "reproduced_area": 342,
+      "reproduced_centroid_yx": [
+        412.07602339181284,
+        130.89473684210526
+      ],
+      "saved_area": 342,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 2.4727730751037598,
+      "soma_surround_contrast": 3.309626931568125
+    },
+    {
+      "label_id": 97,
+      "reproduced_area": 305,
+      "reproduced_centroid_yx": [
+        436.05573770491804,
+        55.17704918032787
+      ],
+      "saved_area": 305,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.8835949897766113,
+      "soma_surround_contrast": 3.4369231519684558
+    },
+    {
+      "label_id": 98,
+      "reproduced_area": 329,
+      "reproduced_centroid_yx": [
+        444.7629179331307,
+        276.2158054711246
+      ],
+      "saved_area": 329,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.252996563911438,
+      "soma_surround_contrast": 1.4489719416308335
+    },
+    {
+      "label_id": 99,
+      "reproduced_area": 426,
+      "reproduced_centroid_yx": [
+        454.42957746478874,
+        298.4178403755869
+      ],
+      "saved_area": 426,
+      "gate_outcome": "reject",
+      "gate_reasons": [
+        "area_high:+76.000"
+      ],
+      "cellpose_prob": 0.8908017873764038,
+      "soma_surround_contrast": 0.6442193872553018
+    },
+    {
+      "label_id": 100,
+      "reproduced_area": 282,
+      "reproduced_centroid_yx": [
+        458.3085106382979,
+        372.36170212765956
+      ],
+      "saved_area": 282,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.0428271293640137,
+      "soma_surround_contrast": 0.6913944195551677
+    },
+    {
+      "label_id": 101,
+      "reproduced_area": 331,
+      "reproduced_centroid_yx": [
+        474.48036253776434,
+        392.595166163142
+      ],
+      "saved_area": 331,
+      "gate_outcome": "accept",
+      "gate_reasons": [],
+      "cellpose_prob": 1.1220307350158691,
+      "soma_surround_contrast": 0.6086615187261538
+    }
+  ]
+}
