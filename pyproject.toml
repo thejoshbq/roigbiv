@@ -29,6 +29,10 @@ app = ["streamlit"]
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
 
+[project.scripts]
+roigbiv-pipeline = "roigbiv.pipeline.run:main"
+roigbiv-cli = "roigbiv.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["roigbiv*"]

@@ -40,3 +40,21 @@ No model changes, no preprocessing changes, no other parameter changes. Deployed
 2. **Auto-diameter recall opportunity.** Experiment 2.B(d) (diameter=None) found 30 additional cells beyond the 101-candidate set on the same FOV. This is a *different* recall opportunity (cells Cellpose misses at fixed diameter, vs. cells Cellpose finds but Gate 1 rejects). Worth investigating separately as a config toggle.
 
 3. **Training data / model selection.** run014 AP@0.5=0.68 vs run015_epoch_0280 AP@0.5=0.61. Overall AP@0.5:0.95 improved in the new model, but recall at IoU≥0.5 went down. When HITL-curated ground truth grows, re-evaluate whether an earlier run015 epoch (closer to run014's regime) produces better production AP@0.5.
+
+## Followup validation (2026-04-16)
+
+After the initial fix, the user raised a concern based on a side-by-side of four reference images (`/home/thejoshbq/Pictures/{mean_projection,manually_drawn_rois,fine-tuned_cellpose_model_rois,pipeline_rois}.png`) — `pipeline_rois.png` showed bright pyramidal cells dramatically attenuated in the pipeline's input, hypothesizing L+S absorption was hiding them from Cellpose. Details and artifacts in `diagnostics/regression/followup/`.
+
+Verification on the same FOV with the post-fix code:
+
+| Metric | Value |
+|---|---:|
+| Current pipeline (`mean_M`+`vcorr_S`, denoise ON, channels=(1,2), `max_area=600`) | 101 accepts / 0 rejects |
+| Reference (fine-tuned on `mean_M`, denoise OFF, channels=(0,0)) | 94 cells |
+| Matched pairs (min_iou=0.3) | 93 / 94 = 98.9 % recall of reference |
+| Reference cells unmatched | 1 (dim borderline merged with neighbor) |
+| Pipeline-only cells | 8 (visible somas the single-channel reference missed) |
+
+Conclusion: `pipeline_rois.png` reflected a pre-fix / pre-multi-stage pipeline state. On the post-fix code, Cellpose is already fed `mean_M` (raw registered mean, not `mean_S` — see `roigbiv/pipeline/run.py:230–236`), so L+S absorption cannot affect Stage 1. The current pipeline strictly dominates the reference on this FOV. No additional remediation needed.
+
+Residual open questions (unchanged from above): multi-FOV validation on `/mnt/external/ROIGBIV-DATA/` and optional L+S diagnostics (visualize `L`, k-sweep, Vcorr-on-L) to confirm Stages 2–4 aren't harmed by absorption even though Stage 1 is safe.

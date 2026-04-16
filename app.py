@@ -1,11 +1,19 @@
 """
-ROIGBIV — Streamlit web interface for the three-branch ROI detection pipeline.
+ROIGBIV — Streamlit interface for the sequential four-stage pipeline.
 
 Launch with:  streamlit run app.py
-Access from LAN:  streamlit run app.py --server.address 0.0.0.0
+LAN access:   streamlit run app.py --server.address 0.0.0.0
 """
+import contextlib
+import errno
 import io
+import json
+import queue
+import shutil
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -13,191 +21,219 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import tifffile
 import torch
-import yaml
 
-# ── Project root & defaults ──────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "deployed" / "current_model"
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "pipeline.yaml"
 
 
-def _load_config():
-    if DEFAULT_CONFIG.exists():
-        with open(DEFAULT_CONFIG) as f:
-            return yaml.safe_load(f)
-    return {}
+PHASE_MARKERS = (
+    "Foundation:", "Stage 1:", "Source subtraction:",
+    "Stage 2:", "Stage 3:", "Stage 4:",
+    "Trace extraction", "Overlap correction",
+    "Computing unified QC features",
+)
 
 
-# ── Branch A helper: Cellpose inference ──────────────────────────────────────
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-def _run_cellpose_branch(
-    projections_dir: Path,
-    out_dir: Path,
-    model_path: str,
-    diameter: float,
-    flow_threshold: float,
-    cellprob_threshold: float,
-    tile_norm_blocksize: int,
-    use_vcorr: bool,
-    denoise: bool,
-    status_writer=None,
-) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Run Cellpose on mean projections. Returns (results, errors)."""
-    from cellpose import models
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+class _QueueStreamer(io.TextIOBase):
+    """stdout/stderr shim: pushes each completed line onto a queue and
+    tees to the original terminal. Safe to call from a worker thread
+    because it never touches Streamlit widgets."""
 
-    # Load model
-    has_denoise = False
-    if denoise:
+    def __init__(self, q: "queue.Queue[str]"):
+        self._q = q
+        self._buf = io.StringIO()
+        self._line = ""
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buf.write(s)
         try:
-            from cellpose import denoise as cp_denoise
-            model = cp_denoise.CellposeDenoiseModel(
-                gpu=torch.cuda.is_available(),
-                pretrained_model=str(model_path),
-                restore_type="denoise_cyto3",
-            )
-            has_denoise = True
+            sys.__stdout__.write(s)
+            sys.__stdout__.flush()
         except Exception:
-            model = models.CellposeModel(
-                gpu=torch.cuda.is_available(), pretrained_model=str(model_path))
-    else:
-        model = models.CellposeModel(
-            gpu=torch.cuda.is_available(), pretrained_model=str(model_path))
+            pass
+        self._line += s
+        while "\n" in self._line:
+            line, self._line = self._line.split("\n", 1)
+            line = line.rstrip("\r")
+            if line.strip():
+                self._q.put(line)
+        return len(s)
 
-    channels = [1, 2] if use_vcorr else [0, 0]
-    normalize = ({"tile_norm_blocksize": tile_norm_blocksize}
-                 if tile_norm_blocksize > 0 else True)
+    def flush(self) -> None:
+        pass
 
-    mean_files = sorted(projections_dir.glob("*_mean.tif"))
-    results, errors = [], []
+    def getvalue(self) -> str:
+        return self._buf.getvalue()
 
-    for i, tif in enumerate(mean_files):
-        stem = tif.stem.replace("_mean", "")
-        mask_path = out_dir / f"{stem}_masks.tif"
 
-        if mask_path.exists():
-            n = int(tifffile.imread(str(mask_path)).max())
-            results.append({"stem": stem, "n_rois": n, "skipped": True})
-            if status_writer:
-                status_writer.write(f"  {stem}: skipped ({n} ROIs)")
-            continue
+def _run_pipeline_worker(tif, cfg, log_q, result):
+    """Run the pipeline with stdout/stderr captured into `log_q`.
+    Store result or exception in the shared `result` dict. Performs no
+    Streamlit calls — all UI updates happen on the main thread."""
+    from roigbiv.pipeline.run import run_pipeline
 
+    streamer = _QueueStreamer(log_q)
+    try:
+        with contextlib.redirect_stdout(streamer), contextlib.redirect_stderr(streamer):
+            result["fov"] = run_pipeline(tif, cfg)
+    except BaseException as exc:
+        result["exc"] = exc
+    finally:
+        result["tail"] = streamer.getvalue().splitlines()[-30:]
+
+
+def _run_parallel_batch(
+    *,
+    valid_3d,
+    out_path,
+    fs,
+    tau,
+    k_background,
+    model_path,
+    n_workers,
+    progress,
+    errors,
+    fov_summaries,
+):
+    """Run multiple FOVs concurrently via the subprocess-pool batch runner.
+
+    Each FOV gets its own `st.status` container (created up-front). Logs
+    flow from worker processes through a shared multiprocessing queue;
+    the main thread drains them into the matching container, while a side
+    thread blocks on `batch.run_batch`. Progress + summary + error lists
+    are populated in-place so the surrounding render path stays identical
+    to the sequential case.
+    """
+    from roigbiv.pipeline.types import PipelineConfig
+    from roigbiv.pipeline import batch as _batch
+
+    n_valid = len(valid_3d)
+    stems = [tif.stem.replace("_mc", "") for tif, _ in valid_3d]
+    label_prefixes = [f"[{i+1}/{n_valid}] {stems[i]}" for i in range(n_valid)]
+
+    # Build per-FOV configs + status containers up front so the UI renders
+    # all FOVs as "running" from the first paint.
+    cfgs: list = []
+    statuses: list = []
+    start_times: list = []
+    for i, (_tif, _shape) in enumerate(valid_3d):
+        cfgs.append(PipelineConfig(
+            fs=float(fs),
+            tau=float(tau),
+            k_background=int(k_background),
+            cellpose_model=str(model_path),
+            output_dir=out_path / stems[i],
+            no_viewer=True,
+            batch_n_workers=int(n_workers),
+        ))
+        statuses.append(st.status(label_prefixes[i], expanded=True))
+        start_times.append(time.time())
+
+    jobs = [(tif, cfg) for (tif, _shape), cfg in zip(valid_3d, cfgs)]
+
+    # Main-thread-local queue of (fov_index, line) tuples — drained here
+    # because only the main thread may touch Streamlit widgets safely.
+    main_log_q: "queue.Queue[tuple[int, str]]" = queue.Queue()
+    completions: dict = {}
+    completions_lock = threading.Lock()
+    phases: dict = {}
+
+    def _log_cb(idx, line):
+        main_log_q.put((idx, line))
+
+    def _complete_cb(idx, fov, exc):
+        with completions_lock:
+            completions[idx] = ("err", exc) if exc is not None else ("ok", fov)
+
+    batch_done = threading.Event()
+
+    def _run_batch():
         try:
-            img = tifffile.imread(str(tif)).astype(np.float32)
-            if use_vcorr:
-                vcorr_path = projections_dir / f"{stem}_vcorr.tif"
-                if vcorr_path.exists():
-                    vcorr = tifffile.imread(str(vcorr_path)).astype(np.float32)
-                    img = np.stack([img, vcorr], axis=-1)
+            _batch.run_batch(jobs, int(n_workers), _log_cb, _complete_cb)
+        finally:
+            batch_done.set()
+
+    runner = threading.Thread(target=_run_batch, daemon=True)
+    runner.start()
+
+    finalized: set = set()
+    while not (batch_done.is_set() and main_log_q.empty() and len(finalized) == n_valid):
+        # Drain any buffered log lines into their matching status container.
+        while True:
+            try:
+                idx, line = main_log_q.get_nowait()
+            except queue.Empty:
+                break
+            statuses[idx].write(line)
+            stripped = line.lstrip()
+            for marker in PHASE_MARKERS:
+                if stripped.startswith(marker):
+                    phases[idx] = marker.rstrip(":")
+                    break
+
+        # Tick elapsed labels for FOVs still running.
+        now = time.time()
+        for idx in range(n_valid):
+            if idx in finalized:
+                continue
+            elapsed_str = _fmt_elapsed(now - start_times[idx])
+            bits = [label_prefixes[idx], elapsed_str]
+            if phases.get(idx):
+                bits.append(phases[idx])
+            statuses[idx].update(label=" — ".join(bits))
+
+        # Finalize FOVs the workers have reported completion for.
+        with completions_lock:
+            new_done = [idx for idx in completions if idx not in finalized]
+        for idx in new_done:
+            kind, payload = completions[idx]
+            elapsed = time.time() - start_times[idx]
+            if kind == "err":
+                exc = payload
+                if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC:
+                    msg = (f"Disk full while writing to {cfgs[idx].output_dir}. "
+                           f"Free space and retry.")
+                elif isinstance(exc, OSError):
+                    msg = f"OSError: {exc}"
                 else:
-                    img = np.stack([img, np.zeros_like(img)], axis=-1)
-
-            eval_kw = dict(
-                diameter=diameter, channels=channels,
-                flow_threshold=flow_threshold,
-                cellprob_threshold=cellprob_threshold,
-                normalize=normalize,
-            )
-            if has_denoise:
-                masks, flows, styles, _ = model.eval(img, **eval_kw)
+                    msg = f"ERROR: {exc}"
+                statuses[idx].write(msg)
+                errors.append((stems[idx], msg))
+                statuses[idx].update(
+                    label=f"{label_prefixes[idx]} — FAILED after {_fmt_elapsed(elapsed)}",
+                    state="error",
+                )
             else:
-                masks, flows, styles = model.eval(img, **eval_kw)
-
-            tifffile.imwrite(str(mask_path), masks.astype(np.uint16))
-            n = int(masks.max())
-            results.append({"stem": stem, "n_rois": n, "skipped": False})
-            if status_writer:
-                status_writer.write(f"  [{i+1}/{len(mean_files)}] {stem}: {n} ROIs")
-        except Exception as e:
-            errors.append((stem, str(e)))
-            if status_writer:
-                status_writer.write(f"  {stem}: ERROR — {e}")
-
-    return results, errors
-
-
-# ── Branch C helper: Tonic detection ─────────────────────────────────────────
-
-def _run_tonic_branch(
-    s2p_dir: Path,
-    out_dir: Path,
-    fs: float,
-    n_components: int = 500,
-    soma_radius: int = 8,
-    corr_threshold: float = 0.25,   # was 0.15
-    min_size: int = 80,
-    max_size: int = 350,             # was 300
-    min_solidity: float = 0.6,
-    max_eccentricity: float = 0.85,
-    status_writer=None,
-) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Run tonic detection on all FOVs with data.bin. Returns (results, errors)."""
-    from roigbiv.tonic import run_tonic_detection
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Discover FOVs
-    fovs = []
-    if s2p_dir.exists():
-        for fov_dir in sorted(d for d in s2p_dir.iterdir() if d.is_dir()):
-            plane = fov_dir / "suite2p" / "plane0"
-            bp, op = plane / "data.bin", plane / "ops.npy"
-            if bp.exists() and op.exists():
-                fovs.append({"stem": fov_dir.name, "bin_path": bp, "ops_path": op})
-
-    results, errors = [], []
-
-    for i, fov in enumerate(fovs):
-        stem = fov["stem"]
-        mask_path = out_dir / f"{stem}_tonic_masks.tif"
-
-        if mask_path.exists():
-            n = int(tifffile.imread(str(mask_path)).max())
-            results.append({"stem": stem, "n_rois": n, "skipped": True})
-            if status_writer:
-                status_writer.write(f"  {stem}: skipped ({n} ROIs)")
-            continue
-
-        try:
-            masks, corr_map, info = run_tonic_detection(
-                bin_path=fov["bin_path"], ops_path=fov["ops_path"], fs=fs,
-                n_components=n_components, soma_radius=soma_radius,
-                corr_threshold=corr_threshold, min_size=min_size, max_size=max_size,
-                min_solidity=min_solidity, max_eccentricity=max_eccentricity,
+                fov = payload
+                fov_summaries.append({
+                    "stem": stems[idx],
+                    "n_rois": len(fov.rois),
+                    "elapsed_s": elapsed,
+                })
+                statuses[idx].update(
+                    label=f"{label_prefixes[idx]} — {len(fov.rois)} ROIs "
+                          f"({_fmt_elapsed(elapsed)})",
+                    state="complete",
+                )
+            finalized.add(idx)
+            progress.progress(
+                len(finalized) / n_valid,
+                text=f"Processed {len(finalized)}/{n_valid} FOVs",
             )
-            tifffile.imwrite(str(mask_path), masks)
-            tifffile.imwrite(str(out_dir / f"{stem}_corr_map.tif"), corr_map)
-            n = info["n_rois"]
-            results.append({"stem": stem, "n_rois": n, "skipped": False})
-            if status_writer:
-                status_writer.write(f"  [{i+1}/{len(fovs)}] {stem}: {n} tonic ROIs")
-        except Exception as e:
-            errors.append((stem, str(e)))
-            if status_writer:
-                status_writer.write(f"  {stem}: ERROR — {e}")
 
-    return results, errors
+        time.sleep(0.5)
 
-
-# ── Stem discovery ───────────────────────────────────────────────────────────
-
-def _discover_stems(cellpose_dir: Path, s2p_dir: Path, tonic_dir: Path) -> list[str]:
-    """Find all FOV stems across the three branch output directories."""
-    stems = set()
-    if cellpose_dir.exists():
-        for p in cellpose_dir.glob("*_masks.tif"):
-            stems.add(p.stem.replace("_masks", ""))
-    if s2p_dir.exists():
-        for d in s2p_dir.iterdir():
-            if d.is_dir() and (d / "suite2p" / "plane0" / "stat.npy").exists():
-                stems.add(d.name)
-    if tonic_dir.exists():
-        for p in tonic_dir.glob("*_tonic_masks.tif"):
-            stems.add(p.stem.replace("_tonic_masks", ""))
-    return sorted(stems)
+    runner.join(timeout=5.0)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -205,23 +241,15 @@ def _discover_stems(cellpose_dir: Path, s2p_dir: Path, tonic_dir: Path) -> list[
 def main():
     st.set_page_config(page_title="ROIGBIV", layout="wide")
     st.title("ROIGBIV")
-    st.caption("Three-branch ROI detection for two-photon calcium imaging")
+    st.caption("Sequential subtractive ROI detection for two-photon calcium imaging")
 
-    cfg = _load_config()
-    cp_cfg = cfg.get("cellpose", {})
-    tc_cfg = cfg.get("tonic", {})
-    mg_cfg = cfg.get("merge", {})
-    cl_cfg = cfg.get("classify", {})
-    tr_cfg = cfg.get("traces", {})
-    s2p_cfg = cfg.get("suite2p", {})
-
-    # ── GPU status ────────────────────────────────────────────────────────
+    # GPU status
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         st.success(f"GPU: {gpu_name} ({vram:.1f} GB)")
     else:
-        st.warning("No GPU detected — Cellpose and Suite2p will run on CPU (slower).")
+        st.warning("No GPU detected — Cellpose will run on CPU (slower).")
 
     # ── Sidebar ───────────────────────────────────────────────────────────
     with st.sidebar:
@@ -229,128 +257,36 @@ def main():
 
         tif_dir = st.text_input(
             "TIF directory",
-            placeholder="/path/to/your/tif/stacks",
-            help="Directory containing pre-motion-corrected TIF stacks",
+            placeholder="/path/to/tif/stacks",
+            help="Directory with pre-motion-corrected `*_mc.tif` stacks "
+                 "(searched recursively).",
         )
         output_dir = st.text_input(
             "Output directory",
             placeholder="/path/to/output",
-            help="Where all pipeline outputs will be saved",
+            help="Root directory. One subdirectory per FOV will be created.",
         )
 
         st.divider()
         fs = st.number_input("Frame rate (Hz)", value=30.0, min_value=1.0, step=1.0)
         tau = st.number_input(
-            "GCaMP tau (s)", value=float(s2p_cfg.get("tau", 1.0)),
-            min_value=0.1, step=0.1,
+            "GCaMP tau (s)", value=1.0, min_value=0.1, step=0.1,
             help="GCaMP6s=1.0, GCaMP6f=0.4, GCaMP7f=0.7")
-        model_path = st.text_input("Model checkpoint", value=str(DEFAULT_MODEL))
-        do_registration = st.checkbox(
-            "Run motion correction", value=False,
-            help="Enable if TIFs are NOT pre-corrected (_mc suffix)")
+        model_path = st.text_input(
+            "Cellpose model", value=str(DEFAULT_MODEL),
+            help="Path to the fine-tuned Cellpose checkpoint used in Stage 1.")
 
-        # Branch B: Suite2p
-        with st.expander("Suite2p Detection (Branch B)"):
-            spatial_scale = st.selectbox(
-                "Spatial scale",
-                options=[0, 1, 2, 3, 4],
-                index=s2p_cfg.get("spatial_scale", 0),
-                format_func=lambda x: {
-                    0: "0 — auto-detect",
-                    1: "1 — ~6 px diameter",
-                    2: "2 — ~12 px diameter",
-                    3: "3 — ~24 px diameter",
-                    4: "4 — ~48 px diameter",
-                }[x],
-                help="Sets the cell-size scale Suite2p searches for. Values >0 prevent "
-                     "detection of clusters smaller than the selected diameter.",
-            )
-            threshold_scaling = st.number_input(
-                "Detection threshold scaling",
-                value=float(s2p_cfg.get("threshold_scaling", 1.0)),
-                min_value=0.1, max_value=5.0, step=0.1,
-                help="Higher = fewer, more prominent ROIs; lower = more permissive detection",
-            )
-
-        # Branch A: Cellpose
-        with st.expander("Cellpose (Branch A)"):
-            diameter = st.number_input(
-                "Cell diameter (px)", value=int(cp_cfg.get("diameter", 12)),
-                min_value=5, step=1)
-            flow_threshold = st.number_input(
-                "Flow threshold", value=float(cp_cfg.get("flow_threshold", 0.6)),
-                min_value=0.0, max_value=2.0, step=0.1,
-                help="Higher = more permissive boundaries")
-            cellprob_threshold = st.number_input(
-                "Cell probability threshold",
-                value=float(cp_cfg.get("cellprob_threshold", -2.0)),
-                min_value=-6.0, max_value=6.0, step=0.5,
-                help="Lower = accepts dimmer cells")
-            tile_norm_blocksize = st.number_input(
-                "Tile norm block size", value=int(cp_cfg.get("tile_norm_blocksize", 128)),
-                min_value=0, step=32,
-                help="Compensates GRIN vignetting (0 = standard normalization)")
-            use_vcorr = st.checkbox(
-                "Use Vcorr channel", value=True,
-                help="Stack Vcorr as 2nd Cellpose input channel")
-            denoise = st.checkbox(
-                "Cellpose3 denoising", value=bool(cp_cfg.get("denoise", False)),
-                help="Apply image restoration before segmentation")
-
-        # Branch C: Tonic
-        with st.expander("Tonic Detection (Branch C)"):
-            tonic_band = st.selectbox(
-                "Frequency band", ["neuronal", "astrocyte"],
-                help="neuronal: 0.05-2.0 Hz, astrocyte: 0.01-0.3 Hz")
-            corr_threshold = st.number_input(
-                "Correlation threshold", value=float(tc_cfg.get("corr_threshold", 0.25)),
-                min_value=0.0, max_value=1.0, step=0.05)
-            tonic_min_size = st.number_input(
-                "Min ROI size (px)", value=int(tc_cfg.get("min_roi_pixels", 80)),
-                min_value=10, step=10)
-            tonic_max_size = st.number_input(
-                "Max ROI size (px)", value=int(tc_cfg.get("max_roi_pixels", 350)),
-                min_value=50, step=50)
-            tonic_min_solidity = st.number_input(
-                "Min solidity", value=float(tc_cfg.get("min_solidity", 0.6)),
-                min_value=0.0, max_value=1.0, step=0.05,
-                help="Minimum area/convex-hull ratio; rejects spindly neuropil fragments")
-            tonic_max_eccentricity = st.number_input(
-                "Max eccentricity", value=float(tc_cfg.get("max_eccentricity", 0.85)),
-                min_value=0.0, max_value=1.0, step=0.05,
-                help="Maximum eccentricity of equivalent ellipse; rejects elongated fragments")
-            n_components = st.number_input(
-                "SVD components", value=int(tc_cfg.get("n_components", 500)),
-                min_value=50, step=50)
-            soma_radius = st.number_input(
-                "Soma radius (px)", value=int(tc_cfg.get("soma_radius", 8)),
-                min_value=2, step=1)
-
-        # Merge & Classification
-        with st.expander("Merge & Classification"):
-            iou_threshold = st.slider(
-                "IoU threshold", 0.1, 0.8,
-                float(mg_cfg.get("iou_threshold", 0.3)), 0.05,
-                help="Minimum spatial overlap to match ROIs across branches")
-            snr_min = st.number_input(
-                "Min SNR", value=float(cl_cfg.get("snr_min", 2.0)),
-                min_value=0.0, step=0.5,
-                help="Minimum signal-to-noise for cell acceptance")
-            area_min = st.number_input(
-                "Min area (px)", value=int(cl_cfg.get("area_min", 30)),
-                min_value=5, step=5)
-            area_max = st.number_input(
-                "Max area (px)", value=int(cl_cfg.get("area_max", 500)),
-                min_value=50, step=50)
-            compact_min = st.number_input(
-                "Min compactness", value=float(cl_cfg.get("compact_min", 0.15)),
-                min_value=0.0, max_value=1.0, step=0.05,
-                help="Circularity threshold (0-1)")
-            require_spatial_support = st.checkbox(
-                "Require spatial support for Branch C-only ROIs",
-                value=bool(mg_cfg.get("require_spatial_support", True)),
-                help="Discard C-only ROIs whose centroid falls below the FOV 25th-percentile "
-                     "intensity in the mean projection (rejects dark-region neuropil artifacts)")
+        with st.expander("Advanced"):
+            k_background = st.number_input(
+                "k_background (L+S separation)", value=30, min_value=1, step=1,
+                help="Top-k SVD components reconstructed as the background L. "
+                     "Higher = more of the slow/structured signal absorbed into L.")
+            batch_n_workers = st.number_input(
+                "Parallel FOVs (max 2)", value=1, min_value=1, max_value=2, step=1,
+                help="Process multiple FOVs concurrently. GPU phases (Cellpose, "
+                     "Suite2p, Stage 3 FFT, subtraction) serialize across workers; "
+                     "CPU phases (Foundation, Stage 4 bandpass, traces) overlap. "
+                     "Requires ≥ 2 FOVs queued; GPU VRAM caps parallelism at 2.")
 
     # ── Tabs ──────────────────────────────────────────────────────────────
     tab_instr, tab_run, tab_results = st.tabs(
@@ -361,26 +297,10 @@ def main():
 
     with tab_run:
         _run_tab(
-            tif_dir=tif_dir, output_dir=output_dir, fs=fs, tau=tau,
-            do_registration=do_registration, model_path=model_path,
-            cfg=cfg,
-            # Suite2p params
-            spatial_scale=spatial_scale, threshold_scaling=threshold_scaling,
-            # Cellpose params
-            diameter=diameter, flow_threshold=flow_threshold,
-            cellprob_threshold=cellprob_threshold,
-            tile_norm_blocksize=tile_norm_blocksize,
-            use_vcorr=use_vcorr, denoise=denoise,
-            # Tonic params
-            n_components=n_components, soma_radius=soma_radius,
-            corr_threshold=corr_threshold,
-            tonic_min_size=tonic_min_size, tonic_max_size=tonic_max_size,
-            tonic_min_solidity=tonic_min_solidity,
-            tonic_max_eccentricity=tonic_max_eccentricity,
-            # Merge/classify params
-            iou_threshold=iou_threshold, snr_min=snr_min,
-            area_min=area_min, area_max=area_max, compact_min=compact_min,
-            require_spatial_support=require_spatial_support,
+            tif_dir=tif_dir, output_dir=output_dir,
+            fs=fs, tau=tau, k_background=int(k_background),
+            model_path=model_path,
+            batch_n_workers=int(batch_n_workers),
         )
 
     with tab_results:
@@ -393,10 +313,11 @@ def _instructions_tab():
     st.markdown("""
 ## What is ROIGBIV?
 
-ROIGBIV is a three-branch consensus pipeline for detecting regions of interest
-(ROIs) in two-photon calcium imaging data acquired through GRIN lenses. It combines
-three independent detection methods, merges their results, extracts fluorescence
-traces, and classifies each ROI by quality and activity type.
+ROIGBIV is a sequential subtractive ROI detection pipeline for two-photon
+calcium imaging. It runs four complementary detection stages with a
+validation gate between each, then produces traces (F, dF/F, spikes),
+activity-type classifications, and a prioritized human-in-the-loop (HITL)
+review queue.
 
 ---
 
@@ -404,86 +325,66 @@ traces, and classifies each ROI by quality and activity type.
 
 | What | Format | Notes |
 |------|--------|-------|
-| **TIF stacks** | Multi-frame TIFF (frames x height x width) | One file per field of view (FOV). Pre-motion-corrected files should have `_mc` in the filename (registration will be skipped automatically). |
-| **Model checkpoint** | Cellpose model file | A fine-tuned Cellpose model for your tissue type. The default model is pre-loaded if one has been deployed. |
+| **TIF stacks** | Multi-frame TIFF (T × H × W) | One per FOV. Pre-motion-corrected files should end in `_mc.tif` (registration auto-skipped). |
+| **Cellpose model** | Cellpose checkpoint | The fine-tuned model used in Stage 1. Uses the deployed default if available. |
 
-All TIF files must be acquired at the **same frame rate**. Place them in a single
-directory (subdirectories are searched recursively).
+All TIFs must share a frame rate. Place them in one directory
+(searched recursively).
 
 ---
 
-## Pipeline Overview (7 Stages)
+## Pipeline Overview
 
-| Stage | What it does |
+| Phase | What it does |
 |-------|-------------|
-| **1. Suite2p** | Runs Suite2p on each TIF stack to detect ROI candidates (Branch B) and produce a registered movie (data.bin) for downstream steps. |
-| **2. Projections** | Extracts mean and Vcorr (temporal correlation) projection images from Suite2p output. These serve as input for Cellpose. |
-| **3. Cellpose** | Runs the trained Cellpose model on mean+Vcorr projections to segment cell bodies (Branch A). |
-| **4. Tonic Detection** | Detects tonically active neurons via bandpass filtering and local correlation in SVD space (Branch C). These are low-variance neurons missed by Suite2p and Cellpose. |
-| **5. Three-Way Merge** | Matches ROIs across all three branches using pairwise IoU and assigns confidence tiers (ABC, AB, AC, BC, A, B, C) based on which branches agree. |
-| **6. Trace Extraction** | Extracts raw fluorescence (F), neuropil (Fneu), corrected dF/F, and deconvolved spikes for every merged ROI from the registered movie. |
-| **7. Classification** | Computes QC features (SNR, area, compactness), rejects non-cells, and labels activity types: phasic, tonic, sparse, or ambiguous. |
+| **Foundation** | Motion correction (or re-use), SVD-based L+S decomposition (background vs signal), summary images (mean/max/std/Vcorr on S, nuclear-shadow DoG). |
+| **Stage 1 — Cellpose** | Spatial morphology detection on denoised S. Gate 1 validates area / solidity / eccentricity / nuclear-shadow / soma-surround contrast. |
+| **Stage 2 — Suite2p** | Temporal re-detection on residual S₁ to recover activity-only neurons missed by Cellpose. Gate 2 cross-validates via IoU + temporal correlation. |
+| **Stage 3 — Template sweep** | Custom FFT template matching on S₂ for sparse-firing neurons. Gate 3 validates waveform R², rise/decay, anti-correlation. |
+| **Stage 4 — Tonic search** | Multi-scale bandpass + correlation contrast on S₃ for tonic / slow-modulation neurons. Gate 4 validates corr-contrast, motion correlation, intensity. All survivors are flagged for HITL. |
+| **Post** | Trace extraction, overlap correction, QC features, activity-type classification, dF/F, deconvolution, HITL review queue. |
 
 ---
 
 ## How to Use
 
-1. Enter the **TIF directory** and **output directory** in the sidebar
-2. Set the **frame rate** to match your acquisition
-3. Adjust parameters in the sidebar expanders if needed (defaults work for GRIN lens data)
-4. Switch to the **Run Pipeline** tab and click **Run Pipeline**
-5. After completion, switch to the **View Results** tab to explore the output
-
-The pipeline is **resumable** — if interrupted, click Run Pipeline again and
-completed stages will be skipped automatically.
-
----
-
-## Key Parameters
-
-| Parameter | Default | When to change |
-|-----------|---------|----------------|
-| Frame rate | 30 Hz | Must match your acquisition rate |
-| GCaMP tau | 1.0 s | GCaMP6f: 0.4, GCaMP7f: 0.7, GCaMP8: 0.3 |
-| Cell diameter | 12 px | Adjust for your optics/magnification |
-| Motion correction | OFF | Enable if TIFs are NOT pre-corrected |
-| IoU threshold | 0.3 | Higher = stricter cross-branch matching |
-| Min SNR | 2.0 | Lower = keep dimmer cells |
+1. Enter the **TIF directory** and **output directory** in the sidebar.
+2. Set the **frame rate** and **tau** for your indicator.
+3. Switch to **Run Pipeline** and click **Run Pipeline**.
+4. When it finishes, use **View Results** to inspect per-FOV outputs and
+   open layers in napari.
+5. For manual curation, open `{output_dir}/{stem}/hitl_staging/` in the
+   Cellpose GUI — it contains mean image + `_seg.tif` mask pairs ready
+   for review.
 
 ---
 
-## Output Files
+## Output Layout (per FOV)
 
-| Directory | Contents |
-|-----------|----------|
-| `suite2p/` | Suite2p output per FOV (stat.npy, ops.npy, data.bin) |
-| `projections/` | Mean and Vcorr projection images |
-| `cellpose/` | Branch A: uint16 labeled ROI masks |
-| `tonic/` | Branch C: tonic ROI masks and correlation maps |
-| `merged/` | Merged masks, per-ROI records CSVs, merge_summary.csv |
-| `traces/` | F, Fneu, dF/F, spikes, alpha arrays per FOV (.npy) |
-| `classified/` | Per-FOV classification CSVs and classification_summary.csv |
-
-The final output — `classified/classification_summary.csv` — contains one row per
-ROI with QC features, cell/not-cell status, and activity type label.
+```
+output_dir/{stem}/
+  summary/              mean_M, mean_S, mean_L, max_S, std_S, vcorr_S, dog_map
+  stage1/ … stage4/     per-stage masks + reports + diagnostics
+  suite2p/plane0/       motion-corrected movie + Suite2p ops
+  merged_masks.tif      uint16 labels — row K of trace arrays = label_id K
+  F.npy, Fneu.npy, F_corrected.npy, dFF.npy, spks.npy
+  F_bandpass.npy + F_bandpass_index.npy   (tonic ROIs only)
+  roi_metadata.json     per-ROI dict: gate_outcome, activity_type, features…
+  pipeline_log.json     shape, k_background, stage_counts, timings, warnings
+  review_queue.json     prioritized HITL review list
+  hitl/                 per-ROI evidence (Stage 3 single-event, Stage 4 tonic)
+  hitl_staging/         Cellpose-GUI layout: images/{stem}.tif + masks/{stem}_seg.tif
+```
 """)
 
 
 # ── Run tab ──────────────────────────────────────────────────────────────────
 
-def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
-             spatial_scale, threshold_scaling,
-             diameter, flow_threshold, cellprob_threshold, tile_norm_blocksize,
-             use_vcorr, denoise, n_components, soma_radius, corr_threshold,
-             tonic_min_size, tonic_max_size, tonic_min_solidity, tonic_max_eccentricity,
-             iou_threshold, snr_min, area_min, area_max, compact_min,
-             require_spatial_support):
-
+def _run_tab(*, tif_dir, output_dir, fs, tau, k_background, model_path,
+             batch_n_workers=1):
     if not tif_dir or not output_dir:
         st.info("Enter a TIF directory and output directory in the sidebar to begin.")
         return
-
-    tr_cfg = cfg.get("traces", {})
 
     tif_path = Path(tif_dir)
     out_path = Path(output_dir)
@@ -492,7 +393,6 @@ def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
         st.error(f"TIF directory not found: {tif_path}")
         return
 
-    # Discover TIFs
     from roigbiv.io import discover_tifs, validate_tif
 
     tif_files = discover_tifs(tif_path)
@@ -500,368 +400,240 @@ def _run_tab(*, tif_dir, output_dir, fs, tau, do_registration, model_path, cfg,
         st.error(f"No TIF files found under {tif_path}")
         return
 
-    st.subheader(f"Found {len(tif_files)} TIF file(s)")
-    with st.expander("File details", expanded=False):
-        for tif in tif_files:
-            try:
-                stem, shape = validate_tif(tif)
-                st.text(f"  {tif.name}  —  {shape[0]} frames, "
-                        f"{shape[1]}x{shape[2]} px")
-            except ValueError as e:
-                st.warning(str(e))
+    # ── Validate + split into 3D stacks vs. skipped ───────────────────────
+    valid_3d: list[tuple[Path, tuple]] = []   # [(path, (T, Ly, Lx)), ...]
+    skipped: list[tuple[str, str]] = []       # [(name, reason), ...]
+    for tif in tif_files:
+        try:
+            _, shape = validate_tif(tif)
+            valid_3d.append((tif, shape))
+        except ValueError as e:
+            skipped.append((tif.name, str(e)))
 
-    # Run button
+    st.subheader(
+        f"Found {len(tif_files)} TIF file(s) "
+        f"— {len(valid_3d)} valid 3D stack(s), {len(skipped)} skipped"
+    )
+    if valid_3d:
+        with st.expander("3D stacks to process", expanded=False):
+            for tif, shape in valid_3d:
+                st.text(
+                    f"  {tif.name}  —  {shape[0]} frames, "
+                    f"{shape[1]}x{shape[2]} px"
+                )
+    if skipped:
+        with st.expander(f"{len(skipped)} file(s) skipped", expanded=False):
+            for name, reason in skipped:
+                st.text(f"  {name}: {reason}")
+
+    if not valid_3d:
+        st.error("No valid 3D TIF stacks found — nothing to run.")
+        return
+
+    # ── Disk-space preflight ──────────────────────────────────────────────
+    # Per-FOV footprint: data.bin (int16, 2 B/pix) + residual_S.dat (float32,
+    # 4 B/pix) = 6 * T * Ly * Lx bytes. Later stages transiently write S1/S2/S3
+    # residuals of the same size but delete as they go, so the maximum live
+    # footprint per FOV is ~2x the steady-state. 1.5x headroom below is a
+    # minimum safety margin. SIGBUS from mmap writes is uncatchable in Python
+    # — once you see "Bus error" the Streamlit process is dead.
+    def _bytes_per_fov(shape):
+        T, Ly, Lx = shape[0], shape[1], shape[2]
+        return int(T) * int(Ly) * int(Lx) * 6
+
+    max_fov = max(_bytes_per_fov(s) for _, s in valid_3d)
+    total_fov = sum(_bytes_per_fov(s) for _, s in valid_3d)
+
+    probe = out_path if out_path.exists() else out_path.parent
+    try:
+        free_bytes = shutil.disk_usage(probe).free
+    except FileNotFoundError:
+        st.error(
+            f"Cannot check free space — neither {out_path} nor its parent exists."
+        )
+        return
+
+    def _human(nb):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if nb < 1024:
+                return f"{nb:.1f} {unit}"
+            nb /= 1024
+        return f"{nb:.1f} PB"
+
+    # Effective parallelism is hard-capped by batch.MAX_BATCH_WORKERS and by
+    # the number of queued FOVs. The guard scales the min-safety threshold
+    # with concurrent workers: parallel FOVs each hold their own memmap set
+    # in flight at the same time.
+    from roigbiv.pipeline.batch import MAX_BATCH_WORKERS
+    effective_workers = max(1, min(int(batch_n_workers), MAX_BATCH_WORKERS, len(valid_3d)))
+    safety = int(1.5 * max_fov * effective_workers)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Free at output", _human(free_bytes))
+    c2.metric("Need per FOV (min)", _human(max_fov))
+    c3.metric("Batch total (min)", _human(total_fov))
+
+    if free_bytes < safety:
+        worker_note = (
+            f" across {effective_workers} parallel worker(s)"
+            if effective_workers > 1 else ""
+        )
+        st.error(
+            f"Insufficient free space at `{probe}`: "
+            f"{_human(free_bytes)} available, "
+            f"need ≥ {_human(safety)} for the largest FOV{worker_note} "
+            f"(and ideally ≥ {_human(int(1.5 * total_fov))} for the whole batch). "
+            f"Foundation writes multi-GB memmaps (`data.bin` + `residual_S.dat`); "
+            f"on a full filesystem these trigger SIGBUS (‘Bus error’) which "
+            f"cannot be caught and will kill the Streamlit process. "
+            f"Free disk and re-run."
+        )
+        return
+
     if not st.button("Run Pipeline", type="primary", use_container_width=True):
         return
 
-    # Output subdirectories
-    s2p_dir = out_path / "suite2p"
-    proj_dir = out_path / "projections"
-    cp_dir = out_path / "cellpose"
-    tonic_dir = out_path / "tonic"
-    merged_dir = out_path / "merged"
-    traces_dir = out_path / "traces"
-    classified_dir = out_path / "classified"
+    from roigbiv.pipeline.types import PipelineConfig
 
-    progress = st.progress(0, text="Starting pipeline...")
-    all_errors = []
+    progress = st.progress(0.0, text="Starting pipeline...")
+    errors: list[tuple[str, str]] = []
+    fov_summaries: list[dict] = []
+    t_batch = time.time()
 
-    # ── Stage 1: Suite2p (Branch B) ──────────────────────────────────────
-    with st.status("Stage 1/7: Suite2p processing...", expanded=True) as status:
-        from roigbiv.suite2p import run_suite2p_batch
-        t0 = time.time()
-        run_suite2p_batch(
-            tif_files, output_dir=str(s2p_dir),
-            fs=fs, tau=tau, anatomical_only=0,
-            do_registration=do_registration, cfg=cfg,
-            spatial_scale=spatial_scale, threshold_scaling=threshold_scaling,
+    n_valid = len(valid_3d)
+
+    if effective_workers >= 2 and n_valid >= 2:
+        # ── Parallel batch path (Phase B) ────────────────────────────────
+        _run_parallel_batch(
+            valid_3d=valid_3d, out_path=out_path,
+            fs=fs, tau=tau, k_background=k_background, model_path=model_path,
+            n_workers=effective_workers,
+            progress=progress, errors=errors, fov_summaries=fov_summaries,
         )
-        elapsed = time.time() - t0
-        status.update(label=f"Stage 1: Suite2p ({elapsed:.0f}s)", state="complete")
-    progress.progress(15, text="Suite2p complete")
+    else:
+        # ── Sequential path (unchanged from pre-Phase-B) ─────────────────
+        for i, (tif, _shape) in enumerate(valid_3d):
+            stem = tif.stem.replace("_mc", "")
+            fov_out = out_path / stem
 
-    # ── Stage 2: Extract projections ─────────────────────────────────────
-    with st.status("Stage 2/7: Extracting projections...", expanded=True) as status:
-        from roigbiv.io import extract_projections
-        t0 = time.time()
-        n_proj = extract_projections(str(s2p_dir), str(proj_dir))
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Stage 2: Projections ({n_proj} FOVs, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(25, text="Projections extracted")
+            cfg = PipelineConfig(
+                fs=float(fs),
+                tau=float(tau),
+                k_background=int(k_background),
+                cellpose_model=str(model_path),
+                output_dir=fov_out,
+                no_viewer=True,
+            )
 
-    # ── Stage 3: Cellpose (Branch A) ─────────────────────────────────────
-    with st.status("Stage 3/7: Cellpose inference...", expanded=True) as status:
-        t0 = time.time()
-        cp_results, cp_errors = _run_cellpose_branch(
-            projections_dir=proj_dir, out_dir=cp_dir,
-            model_path=model_path, diameter=diameter,
-            flow_threshold=flow_threshold,
-            cellprob_threshold=cellprob_threshold,
-            tile_norm_blocksize=tile_norm_blocksize,
-            use_vcorr=use_vcorr, denoise=denoise,
-            status_writer=status,
-        )
-        all_errors.extend(("Cellpose", s, e) for s, e in cp_errors)
-        n_cp = sum(1 for r in cp_results if not r.get("skipped"))
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Stage 3: Cellpose ({n_cp} processed, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(45, text="Cellpose complete")
+            label_prefix = f"[{i+1}/{n_valid}] {stem}"
+            with st.status(label_prefix, expanded=True) as status:
+                elapsed_ph = st.empty()
+                log_q: "queue.Queue[str]" = queue.Queue()
+                result: dict = {}
+                current_phase = ""
+                start = time.time()
 
-    # ── Stage 4: Tonic detection (Branch C) ──────────────────────────────
-    with st.status("Stage 4/7: Tonic detection...", expanded=True) as status:
-        t0 = time.time()
-        tc_results, tc_errors = _run_tonic_branch(
-            s2p_dir=s2p_dir, out_dir=tonic_dir, fs=fs,
-            n_components=n_components, soma_radius=soma_radius,
-            corr_threshold=corr_threshold,
-            min_size=tonic_min_size, max_size=tonic_max_size,
-            min_solidity=tonic_min_solidity,
-            max_eccentricity=tonic_max_eccentricity,
-            status_writer=status,
-        )
-        all_errors.extend(("Tonic", s, e) for s, e in tc_errors)
-        n_tc = sum(1 for r in tc_results if not r.get("skipped"))
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Stage 4: Tonic ({n_tc} processed, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(60, text="Tonic detection complete")
-
-    # ── Stage 5: Three-way merge ─────────────────────────────────────────
-    with st.status("Stage 5/7: Merging branches...", expanded=True) as status:
-        from roigbiv.merge import merge_batch
-        t0 = time.time()
-        stems = _discover_stems(cp_dir, s2p_dir, tonic_dir)
-        status.write(f"  Found {len(stems)} FOV stems across branches")
-        merge_df = merge_batch(
-            stems=stems, branch_a_dir=cp_dir, s2p_dir=s2p_dir,
-            branch_c_dir=tonic_dir, out_dir=merged_dir,
-            iou_threshold=iou_threshold,
-            require_spatial_support=require_spatial_support,
-        )
-        elapsed = time.time() - t0
-        n_merged = len(merge_df) if not merge_df.empty else 0
-        status.update(
-            label=f"Stage 5: Merge ({n_merged} ROIs, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(75, text="Merge complete")
-
-    # ── Stage 6: Trace extraction ────────────────────────────────────────
-    with st.status("Stage 6/7: Extracting traces...", expanded=True) as status:
-        from roigbiv.traces import extract_traces_fov
-        t0 = time.time()
-        traces_dir.mkdir(parents=True, exist_ok=True)
-
-        trace_stems = sorted(
-            p.stem.replace("_merged_masks", "")
-            for p in merged_dir.glob("*_merged_masks.tif"))
-        n_done = 0
-
-        for i, stem in enumerate(trace_stems):
-            # Load merge records for tonic identification
-            rec_path = merged_dir / f"{stem}_merge_records.csv"
-            merge_records = None
-            if rec_path.exists():
-                merge_records = pd.read_csv(str(rec_path)).to_dict("records")
-
-            try:
-                result = extract_traces_fov(
-                    stem=stem, merged_mask_dir=merged_dir, s2p_dir=s2p_dir,
-                    out_dir=traces_dir, merge_records=merge_records,
-                    fs=fs, tau=tau,
-                    inner_radius=int(tr_cfg.get("inner_radius", 2)),
-                    min_neuropil_pixels=int(tr_cfg.get("min_neuropil_pixels", 350)),
-                    baseline_window=float(tr_cfg.get("baseline_window_seconds", 60.0)),
-                    baseline_percentile=float(tr_cfg.get("baseline_percentile", 10.0)),
-                    tonic_multiplier=float(tr_cfg.get("tonic_baseline_multiplier", 2.0)),
-                    do_deconvolve=bool(tr_cfg.get("do_deconvolve", True)),
-                    chunk_frames=int(tr_cfg.get("chunk_frames", 200)),
+                worker = threading.Thread(
+                    target=_run_pipeline_worker,
+                    args=(tif, cfg, log_q, result),
+                    daemon=True,
                 )
-                if result.get("status") == "done":
-                    n_done += 1
-                    status.write(
-                        f"  [{i+1}/{len(trace_stems)}] {stem}: "
-                        f"{result.get('n_rois', '?')} ROIs, "
-                        f"{result.get('n_frames', '?')} frames")
+                worker.start()
+
+                while worker.is_alive():
+                    while True:
+                        try:
+                            line = log_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        status.write(line)
+                        stripped = line.lstrip()
+                        for marker in PHASE_MARKERS:
+                            if stripped.startswith(marker):
+                                current_phase = marker.rstrip(":")
+                                break
+                    elapsed = time.time() - start
+                    elapsed_str = _fmt_elapsed(elapsed)
+                    elapsed_ph.markdown(f"**Elapsed:** {elapsed_str}")
+                    label_bits = [label_prefix, elapsed_str]
+                    if current_phase:
+                        label_bits.append(current_phase)
+                    status.update(label=" — ".join(label_bits))
+                    time.sleep(0.5)
+
+                worker.join()
+                while not log_q.empty():
+                    status.write(log_q.get_nowait())
+
+                elapsed = time.time() - start
+                elapsed_ph.markdown(f"**Elapsed:** {_fmt_elapsed(elapsed)}")
+
+                if "exc" in result:
+                    exc = result["exc"]
+                    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC:
+                        msg = (f"Disk full while writing to {fov_out}. "
+                               f"Free space and retry. (Note: any SIGBUS "
+                               f"from a partially-written memmap would have "
+                               f"killed Streamlit; if you're seeing this "
+                               f"caught error instead, you got lucky.)")
+                    elif isinstance(exc, OSError):
+                        msg = f"OSError: {exc}"
+                    else:
+                        msg = f"ERROR: {exc}"
+                    status.write(msg)
+                    errors.append((stem, msg))
+                    status.update(
+                        label=f"{label_prefix} — FAILED after {_fmt_elapsed(elapsed)}",
+                        state="error",
+                    )
                 else:
-                    status.write(f"  {stem}: {result.get('status', 'unknown')}")
-            except Exception as e:
-                all_errors.append(("Traces", stem, str(e)))
-                status.write(f"  {stem}: ERROR — {e}")
+                    fov = result["fov"]
+                    fov_summaries.append({
+                        "stem": stem,
+                        "n_rois": len(fov.rois),
+                        "elapsed_s": elapsed,
+                    })
+                    status.update(
+                        label=f"{label_prefix} — {len(fov.rois)} ROIs "
+                              f"({_fmt_elapsed(elapsed)})",
+                        state="complete",
+                    )
+            progress.progress(
+                (i + 1) / n_valid,
+                text=f"Processed {i+1}/{n_valid} FOVs",
+            )
 
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Stage 6: Traces ({n_done} FOVs, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(90, text="Traces extracted")
-
-    # ── Stage 7: Classification ──────────────────────────────────────────
-    with st.status("Stage 7/7: Classifying ROIs...", expanded=True) as status:
-        from roigbiv.classify import classify_fov
-        t0 = time.time()
-        classified_dir.mkdir(parents=True, exist_ok=True)
-
-        cls_stems = sorted(
-            p.name.removesuffix("_F.npy")
-            for p in traces_dir.glob("*_F.npy"))
-        cls_dfs = []
-
-        for i, stem in enumerate(cls_stems):
-            try:
-                rec_path = merged_dir / f"{stem}_merge_records.csv"
-                df = classify_fov(
-                    stem=stem, traces_dir=traces_dir,
-                    merged_mask_dir=merged_dir,
-                    merge_records_path=rec_path,
-                    out_dir=classified_dir, fs=fs,
-                    snr_min=snr_min, area_min=area_min,
-                    area_max=area_max, compact_min=compact_min,
-                )
-                if not df.empty:
-                    cls_dfs.append(df)
-                    n_cells = int(df["is_cell"].sum())
-                    status.write(
-                        f"  [{i+1}/{len(cls_stems)}] {stem}: "
-                        f"{n_cells}/{len(df)} cells")
-            except Exception as e:
-                all_errors.append(("Classify", stem, str(e)))
-                status.write(f"  {stem}: ERROR — {e}")
-
-        # Write combined summary
-        if cls_dfs:
-            combined = pd.concat(cls_dfs, ignore_index=True)
-            combined.to_csv(
-                str(classified_dir / "classification_summary.csv"), index=False)
-
-        elapsed = time.time() - t0
-        status.update(
-            label=f"Stage 7: Classification ({len(cls_dfs)} FOVs, {elapsed:.0f}s)",
-            state="complete")
-    progress.progress(100, text="Pipeline complete!")
+    elapsed_batch = time.time() - t_batch
+    progress.progress(
+        1.0, text=f"Pipeline complete — {n_valid} FOV(s) in "
+                  f"{elapsed_batch:.0f}s")
 
     # ── Summary ──────────────────────────────────────────────────────────
-    st.balloons()
+    if fov_summaries:
+        st.balloons()
+        total_rois = sum(f["n_rois"] for f in fov_summaries)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("FOVs processed", len(fov_summaries))
+        c2.metric("Total ROIs", total_rois)
+        c3.metric("Batch time (s)", f"{elapsed_batch:.0f}")
 
-    if all_errors:
-        with st.expander(f"{len(all_errors)} error(s) occurred", expanded=False):
-            for stage, stem, err in all_errors:
-                st.warning(f"**{stage}** — {stem}: {err}")
-
-    # Quick summary
-    if cls_dfs:
-        combined = pd.concat(cls_dfs, ignore_index=True)
-        n_total = len(combined)
-        n_cells = int(combined["is_cell"].sum())
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total ROIs", n_total)
-        col2.metric("Cells Accepted", n_cells)
-        col3.metric("Cells Rejected", n_total - n_cells)
-        col4.metric("FOVs", combined["fov"].nunique())
-
-        if not merge_df.empty:
-            st.subheader("Merge Tier Breakdown")
-            tier_counts = merge_df["tier"].value_counts().sort_index()
-            st.dataframe(
-                tier_counts.rename("count").to_frame(),
-                use_container_width=True)
-
-        st.subheader("Activity Types")
-        type_counts = combined.loc[
-            combined["is_cell"], "activity_type"].value_counts()
-        st.dataframe(
-            type_counts.rename("count").to_frame(),
-            use_container_width=True)
-    else:
-        st.info("No ROIs were classified. Check for errors above.")
+    if errors:
+        with st.expander(f"{len(errors)} error(s) occurred", expanded=False):
+            for stem, err in errors:
+                st.warning(f"**{stem}**: {err}")
 
 
-# ── Visualization helpers (Napari launcher) ───────────────────────────────────
+# ── Napari launcher ──────────────────────────────────────────────────────────
 
-def _launch_napari(
-    out_path: Path, stem: str,
-    load_a: bool, load_b: bool, load_c: bool,
-    load_outlines: bool, load_labels: bool,
-) -> None:
-    """Generate a self-contained Napari viewer script and launch it as a subprocess."""
-    import subprocess
-    import tempfile
-
-    cp_dir = out_path / "cellpose"
-    tonic_dir = out_path / "tonic"
-    merged_dir = out_path / "merged"
-    s2p_plane = out_path / "suite2p" / stem / "suite2p" / "plane0"
-
-    L = [
-        "import sys",
-        f"sys.path.insert(0, r'{PROJECT_ROOT}')",
-        "import napari",
-        "import numpy as np",
-        "import pandas as pd",
-        "import tifffile",
-        "",
-        f"viewer = napari.Viewer(title='ROIGBIV \u2014 {stem}')",
-        "",
-    ]
-
-    # Mean projection (always-on background)
-    mean_p = out_path / "projections" / f"{stem}_mean.tif"
-    if mean_p.exists():
-        L.append(
-            f"viewer.add_image(tifffile.imread(r'{mean_p}').astype('float32'),"
-            f" name='Mean Projection', colormap='gray')"
-        )
-
-    # Cellpose
-    if load_a:
-        p = cp_dir / f"{stem}_masks.tif"
-        if p.exists():
-            L.append(
-                f"viewer.add_labels(tifffile.imread(r'{p}'),"
-                f" name='Cellpose', opacity=0.5)"
-            )
-
-    # Suite2p (reconstruct from stat.npy)
-    if load_b:
-        stat_p = s2p_plane / "stat.npy"
-        ops_p = s2p_plane / "ops.npy"
-        if stat_p.exists() and ops_p.exists():
-            L += [
-                "from roigbiv.merge import stat_to_mask",
-                f"_stat = np.load(r'{stat_p}', allow_pickle=True)",
-                f"_ops = np.load(r'{ops_p}', allow_pickle=True).item()",
-                "viewer.add_labels(stat_to_mask(_stat, _ops['Ly'], _ops['Lx']),"
-                " name='Suite2p', opacity=0.5)",
-            ]
-
-    # Tonic
-    if load_c:
-        p = tonic_dir / f"{stem}_tonic_masks.tif"
-        if p.exists():
-            L.append(
-                f"viewer.add_labels(tifffile.imread(r'{p}'),"
-                f" name='Tonic', opacity=0.5)"
-            )
-
-    # Merged mask (shared by outline + label layers)
-    merged_p = merged_dir / f"{stem}_merged_masks.tif"
-    rec_p = merged_dir / f"{stem}_merge_records.csv"
-
-    need_merged = (load_outlines or load_labels) and merged_p.exists()
-    if need_merged:
-        L.append(f"_merged = tifffile.imread(r'{merged_p}')")
-
-    # Merged ROI Outlines
-    if load_outlines and merged_p.exists():
-        L += [
-            "_outline_layer = viewer.add_labels(_merged.copy(),"
-            " name='Merged ROI Outlines', opacity=0.9)",
-            "_outline_layer.contour = 2",
-        ]
-
-    # ROI Labels (numeric IDs at centroids)
-    if load_labels and merged_p.exists() and rec_p.exists():
-        L += [
-            f"_rec = pd.read_csv(r'{rec_p}')",
-            "if len(_rec) > 0:",
-            "    _coords = _rec[['centroid_y', 'centroid_x']].values",
-            "    _ids = _rec['roi_id'].astype(str).tolist()",
-            "    _text = {'string': _ids, 'size': 10, 'color': 'white'}",
-            "    viewer.add_points(_coords, name='ROI Labels',"
-            "     text=_text, size=1, face_color='transparent',"
-            "     border_color='transparent', visible=True)",
-        ]
-
-    L += ["", "napari.run()"]
-
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-        f.write("\n".join(L))
-        tmp_path = f.name
-
-    subprocess.Popen([sys.executable, tmp_path])
-
-
-def _launch_curator(out_path: Path, stem: str) -> None:
-    """Generate a self-contained ROI curator script and launch it as a subprocess."""
-    import subprocess
-    import tempfile
-
-    merged_dir = out_path / "merged"
-    proj_dir = out_path / "projections"
-
+def _launch_napari(fov_out_dir: Path) -> None:
+    """Spawn a napari process that reads the FOV output dir and opens the full layer set."""
     script = "\n".join([
         "import sys",
         f"sys.path.insert(0, r'{PROJECT_ROOT}')",
-        "from roigbiv.curator import open_curator",
-        f"open_curator(",
-        f"    stem=r'{stem}',",
-        f"    merged_dir=r'{merged_dir}',",
-        f"    projections_dir=r'{proj_dir}',",
-        ")",
+        "from pathlib import Path",
+        "from roigbiv.pipeline.loaders import load_fov_from_output_dir",
+        "from roigbiv.pipeline.napari_viewer import display_pipeline_results",
+        f"fov, review_queue = load_fov_from_output_dir(Path(r'{fov_out_dir}'))",
+        "display_pipeline_results(fov, review_queue=review_queue)",
     ])
 
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
@@ -871,56 +643,45 @@ def _launch_curator(out_path: Path, stem: str) -> None:
     subprocess.Popen([sys.executable, tmp_path])
 
 
-def _viz_section(out_path: Path) -> None:
-    """Napari ROI mask visualization launcher in the Results tab."""
-    merged_dir = out_path / "merged"
-    mask_tifs = sorted(merged_dir.glob("*_merged_masks.tif"))
-    if not mask_tifs:
-        st.info("No merged mask files found. Run the pipeline first.")
-        return
-
-    stems = [p.name.removesuffix("_merged_masks.tif") for p in mask_tifs]
-
-    st.subheader("ROI Mask Visualization")
-    col_fov, _ = st.columns([2, 3])
-    with col_fov:
-        stem = st.selectbox("FOV", stems, key="viz_fov")
-
-    st.caption("Select layers to load:")
-    c1, c2 = st.columns(2)
-    with c1:
-        load_a        = st.checkbox("Cellpose",             value=True, key="viz_a")
-        load_b        = st.checkbox("Suite2p",              value=True, key="viz_b")
-        load_c        = st.checkbox("Tonic",                value=True, key="viz_c")
-    with c2:
-        load_outlines = st.checkbox("Merged ROI Outlines",  value=True, key="viz_outlines")
-        load_labels   = st.checkbox("ROI Labels",           value=True, key="viz_labels")
-
-    btn_col1, btn_col2 = st.columns(2)
-    with btn_col1:
-        if st.button("Open in Napari", type="primary", key="viz_open"):
-            try:
-                _launch_napari(
-                    out_path=out_path, stem=stem,
-                    load_a=load_a, load_b=load_b, load_c=load_c,
-                    load_outlines=load_outlines, load_labels=load_labels,
-                )
-                st.success("Napari launched \u2014 check for a new window.")
-            except Exception as e:
-                st.error(f"Failed to launch Napari: {e}")
-    with btn_col2:
-        if st.button("Curate ROIs", type="secondary", key="viz_curate"):
-            try:
-                _launch_curator(out_path=out_path, stem=stem)
-                st.success(
-                    "Curator launched \u2014 check for a new window. "
-                    "Re-run Stages 6\u20137 after saving curated masks."
-                )
-            except Exception as e:
-                st.error(f"Failed to launch curator: {e}")
-
-
 # ── Results tab ──────────────────────────────────────────────────────────────
+
+def _iter_fov_dirs(out_path: Path) -> list[Path]:
+    """Return subdirectories of out_path that look like pipeline output dirs."""
+    if not out_path.exists():
+        return []
+    return sorted(
+        d for d in out_path.iterdir()
+        if d.is_dir() and (d / "pipeline_log.json").exists()
+    )
+
+
+def _aggregate_logs(fov_dirs: list[Path]) -> pd.DataFrame:
+    rows = []
+    for d in fov_dirs:
+        try:
+            log = json.loads((d / "pipeline_log.json").read_text())
+        except Exception:
+            continue
+        sc = log.get("stage_counts", {})
+        row = {
+            "fov": d.name,
+            "total_rois": log.get("total_rois", 0),
+            "shape": "x".join(str(x) for x in log.get("shape", [])),
+        }
+        for key in ("stage1", "stage2", "stage3", "stage4"):
+            s = sc.get(key, {})
+            row[f"{key}_detected"] = s.get("detected", 0)
+            row[f"{key}_accepted"] = s.get("accepted", 0)
+            row[f"{key}_flagged"]  = s.get("flagged", 0)
+            row[f"{key}_rejected"] = s.get("rejected", 0)
+        act = log.get("activity_type_counts", {})
+        for k in ("phasic", "sparse", "tonic", "silent", "ambiguous"):
+            row[k] = act.get(k, 0)
+        rq = log.get("review_queue_summary", {})
+        row["review_total"] = rq.get("total", 0)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
 
 def _results_tab(output_dir):
     if not output_dir:
@@ -928,93 +689,95 @@ def _results_tab(output_dir):
         return
 
     out_path = Path(output_dir)
-    merged_dir = out_path / "merged"
-    classified_dir = out_path / "classified"
-
-    cls_csv = classified_dir / "classification_summary.csv"
-    merge_csv = merged_dir / "merge_summary.csv"
-
-    if not cls_csv.exists() and not merge_csv.exists():
-        st.info("No results found. Run the pipeline first.")
+    fov_dirs = _iter_fov_dirs(out_path)
+    if not fov_dirs:
+        st.info("No pipeline outputs found under this directory. Run the pipeline first.")
         return
 
-    # ── Classification summary ────────────────────────────────────────
-    if cls_csv.exists():
-        df = pd.read_csv(str(cls_csv))
-        n_total = len(df)
-        n_cells = int(df["is_cell"].sum())
-        n_fovs = df["fov"].nunique()
+    df = _aggregate_logs(fov_dirs)
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total ROIs", n_total)
-        col2.metric("Cells Accepted", n_cells)
-        col3.metric("Cells Rejected", n_total - n_cells)
-        col4.metric("FOVs", n_fovs)
+    # ── Top-line metrics ──────────────────────────────────────────────────
+    if not df.empty:
+        total_rois = int(df["total_rois"].sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("FOVs", len(df))
+        c2.metric("Total ROIs", total_rois)
+        c3.metric("Phasic + Sparse", int(df["phasic"].sum() + df["sparse"].sum()))
+        c4.metric("Tonic", int(df["tonic"].sum()))
 
-        # Activity type breakdown
-        st.subheader("Activity Types")
-        type_counts = df.loc[df["is_cell"], "activity_type"].value_counts()
+        st.subheader("Per-stage breakdown")
+        stage_cols = [c for c in df.columns if c.startswith(("stage1_", "stage2_", "stage3_", "stage4_"))]
         st.dataframe(
-            type_counts.rename("count").to_frame(), use_container_width=True)
-
-    # ── Per-FOV detail ────────────────────────────────────────────────
-    if cls_csv.exists():
-        st.subheader("Per-FOV Detail")
-        fovs = sorted(df["fov"].unique())
-        selected_fov = st.selectbox("Select FOV", fovs)
-
-        if selected_fov:
-            fov_df = df[df["fov"] == selected_fov]
-            n_cells_fov = int(fov_df["is_cell"].sum())
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("ROIs", len(fov_df))
-            c2.metric("Cells", n_cells_fov)
-            if n_cells_fov > 0:
-                dominant = fov_df.loc[
-                    fov_df["is_cell"], "activity_type"].value_counts().index[0]
-                c3.metric("Dominant Type", dominant)
-
-            st.dataframe(fov_df, use_container_width=True, height=300)
-
-    # ── Mask visualization ────────────────────────────────────────────
-    st.divider()
-    _viz_section(out_path)
-
-    # ── Downloads ─────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Download Results")
-
-    dl_col1, dl_col2, dl_col3 = st.columns(3)
-    if cls_csv.exists():
-        dl_col1.download_button(
-            "classification_summary.csv",
-            data=cls_csv.read_bytes(),
-            file_name="classification_summary.csv",
-            mime="text/csv",
-        )
-    if merge_csv.exists():
-        dl_col2.download_button(
-            "merge_summary.csv",
-            data=merge_csv.read_bytes(),
-            file_name="merge_summary.csv",
-            mime="text/csv",
+            df[["fov", "total_rois", *stage_cols]],
+            use_container_width=True, hide_index=True,
         )
 
-    if dl_col3.button("Download all as ZIP"):
+        st.subheader("Activity types")
+        act_cols = ["phasic", "sparse", "tonic", "silent", "ambiguous"]
+        st.dataframe(
+            df[["fov", *act_cols, "review_total"]],
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Per-FOV detail + napari launcher ──────────────────────────────────
+    st.divider()
+    st.subheader("Inspect a FOV")
+    stems = [d.name for d in fov_dirs]
+    stem = st.selectbox("FOV", stems, key="viz_fov")
+    fov_out = out_path / stem
+
+    meta_path = fov_out / "roi_metadata.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        meta_df = pd.DataFrame(meta)
+        keep = [c for c in [
+            "label_id", "source_stage", "confidence", "gate_outcome",
+            "activity_type", "area", "solidity", "eccentricity",
+            "cellpose_prob", "iscell_prob", "event_count", "corr_contrast",
+            "review_priority",
+        ] if c in meta_df.columns]
+        st.dataframe(meta_df[keep], use_container_width=True,
+                     hide_index=True, height=320)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Open in Napari", type="primary", key="viz_open"):
+            try:
+                _launch_napari(fov_out)
+                st.success("Napari launched — check for a new window.")
+            except Exception as e:
+                st.error(f"Failed to launch Napari: {e}")
+    with col2:
+        hitl_staging = fov_out / "hitl_staging"
+        if hitl_staging.exists():
+            st.info(
+                f"**HITL curation**: open `{hitl_staging}` in the Cellpose GUI. "
+                f"It contains `images/{stem}.tif` + `masks/{stem}_seg.tif` "
+                f"ready for review / editing."
+            )
+
+    # ── Downloads ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Downloads")
+    dl_cols = st.columns(3)
+    for col, name in zip(dl_cols, ("pipeline_log.json", "roi_metadata.json", "review_queue.json")):
+        p = fov_out / name
+        if p.exists():
+            col.download_button(
+                name, data=p.read_bytes(),
+                file_name=f"{stem}_{name}", mime="application/json",
+                key=f"dl_{name}",
+            )
+
+    if st.button(f"Download all artifacts for {stem} as ZIP"):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for subdir in ["merged", "classified"]:
-                d = out_path / subdir
-                if d.exists():
-                    for f in d.iterdir():
-                        if f.is_file() and f.suffix == ".csv":
-                            zf.write(f, f"{subdir}/{f.name}")
+            for f in fov_out.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f.relative_to(fov_out))
         st.download_button(
-            "Save ZIP",
-            data=buf.getvalue(),
-            file_name="roigbiv_results.zip",
-            mime="application/zip",
+            "Save ZIP", data=buf.getvalue(),
+            file_name=f"{stem}_pipeline.zip", mime="application/zip",
         )
 
 

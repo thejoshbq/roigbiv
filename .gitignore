@@ -31,6 +31,13 @@ env/
 
 # ── Claude IDE (local settings only — project memories stay tracked) ──────────
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# ── Local test workspace (generated, multi-GB; not checked in) ───────────────
+# test_raw/  — raw TIF inputs used for local smoke tests (~4 GB)
+# test_output/ — pipeline-generated summary/stage artifacts (~13 GB)
+test_raw/
+test_output/
 
 # ── Large data files ──────────────────────────────────────────────────────────
 # Raw TIF stacks and all generated/intermediate data products.

@@ -16,6 +16,7 @@ Motion correction: controlled by ``do_registration``. Set False (default) for
 pre-corrected (*_mc.tif) stacks. The parameter is scaffolded so it can be
 toggled per-dataset without changing any other code.
 """
+import os
 import shutil
 import time
 from pathlib import Path
@@ -135,13 +136,20 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
         return False
 
     # Stage TIF to local storage — Suite2p's file scanner cannot reliably
-    # reach Google Drive FUSE paths across Suite2p versions.
+    # reach Google Drive FUSE paths across Suite2p versions. Use a hardlink
+    # when possible (same filesystem, no extra bytes); fall back to copy only
+    # when the staging dir is on a different device (Colab/GDrive case).
     stage_dir = output_dir / "_stage" / stem
     stage_dir.mkdir(parents=True, exist_ok=True)
     local_tif = stage_dir / tif_path.name
     try:
         print("staging... ", end="", flush=True)
-        shutil.copy2(str(tif_path), str(local_tif))
+        if local_tif.exists():
+            local_tif.unlink()
+        try:
+            os.link(str(tif_path), str(local_tif))
+        except OSError:
+            shutil.copy2(str(tif_path), str(local_tif))
         ops = _build_ops(stage_dir, fs, tau, anatomical_only, do_registration, cfg,
                          spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
