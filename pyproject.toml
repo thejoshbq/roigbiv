@@ -19,6 +19,8 @@ dependencies = [
     "matplotlib",
     "ipywidgets",
     "pyyaml",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 # suite2p and cellpose are NOT listed here — they must be installed with specific
 # ordering in the notebook (suite2p first, then cellpose<4.0.0 --upgrade) to
@@ -28,10 +30,12 @@ dependencies = [
 app = ["streamlit"]
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
+postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 roigbiv-pipeline = "roigbiv.pipeline.run:main"
 roigbiv-cli = "roigbiv.cli:main"
+roigbiv-registry = "roigbiv.cli_registry:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

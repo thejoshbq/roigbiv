@@ -609,6 +609,10 @@ def main():
                         help="Output directory (default: inference/pipeline/{stem}/)")
     parser.add_argument("--no-viewer", action="store_true",
                         help="Skip Napari display at the end")
+    parser.add_argument("--registry", action="store_true",
+                        help=("Register/match this FOV against the cross-session "
+                              "registry (SQLite under inference/registry.db by "
+                              "default; override with ROIGBIV_REGISTRY_DSN)."))
     args = parser.parse_args()
 
     cfg = PipelineConfig(
@@ -620,7 +624,49 @@ def main():
         no_viewer=args.no_viewer,
     )
 
-    run_pipeline(args.input, cfg)
+    fov = run_pipeline(args.input, cfg)
+
+    if args.registry:
+        _register_fov_after_pipeline(args.input, fov)
+
+
+def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> None:
+    """Call the registry with the live FOVData after `run_pipeline` returns."""
+    from roigbiv.registry import build_blob_store, build_store, register_or_match
+    from roigbiv.registry.fingerprint import cells_from_rois
+
+    if fov.mean_M is None:
+        print("WARN: fov.mean_M is None; skipping registry.", flush=True)
+        return
+
+    cells = cells_from_rois(fov.rois)
+    if not cells:
+        print("WARN: no non-rejected ROIs on this FOV; skipping registry.", flush=True)
+        return
+
+    stem = Path(tif_path).stem.replace("_mc", "")
+    store = build_store()
+    blob_store = build_blob_store()
+    report = register_or_match(
+        fov_stem=stem,
+        mean_m=fov.mean_M,
+        cells=cells,
+        output_dir=fov.output_dir,
+        store=store,
+        blob_store=blob_store,
+    )
+    decision = report.get("decision")
+    if decision == "new_fov":
+        print(f"Registry: minted new fov_id={report['fov_id']} "
+              f"({report['n_new_cells']} cells)", flush=True)
+    elif decision in ("auto_match", "hash_match"):
+        print(f"Registry: {decision} fov_id={report['fov_id']} "
+              f"sim={report.get('fov_sim', 1.0):.3f} "
+              f"matched={report['n_matched']} new={report['n_new']} "
+              f"missing={report['n_missing']}", flush=True)
+    elif decision == "review":
+        print(f"Registry: review band (sim={report['fov_sim']:.3f}); "
+              "no session written — resolve in Streamlit.", flush=True)
 
 
 if __name__ == "__main__":

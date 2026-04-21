@@ -289,8 +289,8 @@ def main():
                      "Requires ≥ 2 FOVs queued; GPU VRAM caps parallelism at 2.")
 
     # ── Tabs ──────────────────────────────────────────────────────────────
-    tab_instr, tab_run, tab_results = st.tabs(
-        ["Instructions", "Run Pipeline", "View Results"])
+    tab_instr, tab_run, tab_results, tab_registry = st.tabs(
+        ["Instructions", "Run Pipeline", "View Results", "Registry"])
 
     with tab_instr:
         _instructions_tab()
@@ -305,6 +305,9 @@ def main():
 
     with tab_results:
         _results_tab(output_dir)
+
+    with tab_registry:
+        _registry_tab(output_dir)
 
 
 # ── Instructions tab ─────────────────────────────────────────────────────────
@@ -779,6 +782,151 @@ def _results_tab(output_dir):
             "Save ZIP", data=buf.getvalue(),
             file_name=f"{stem}_pipeline.zip", mime="application/zip",
         )
+
+
+# ── Registry tab ─────────────────────────────────────────────────────────────
+
+
+def _registry_tab(output_dir: str) -> None:
+    """Cross-session FOV + cell tracking.
+
+    Three panels:
+      1. Overview — every FOV in the registry with session counts.
+      2. FOV detail — per-session match quality and cell deltas.
+      3. Longitudinal cell browser — select global_cell_id, see every session
+         it appears in and the local_label_id used each time.
+    """
+    from roigbiv.registry import build_blob_store, build_store, register_or_match
+    from roigbiv.registry.backfill import run_backfill
+
+    st.header("Cross-Session Registry")
+    st.caption(
+        "Tracks which FOVs have been seen before and maps local ROI labels "
+        "across sessions. Populated by running the pipeline with `--registry` "
+        "or the Backfill button below."
+    )
+
+    try:
+        store = build_store()
+        store.ensure_schema()
+    except Exception as exc:
+        st.error(f"Could not open registry: {exc}")
+        return
+
+    with st.expander("Backfill existing runs"):
+        backfill_root = st.text_input(
+            "Root directory to scan",
+            value=output_dir or "inference/pipeline",
+            key="registry_backfill_root",
+            help="Walks this directory, registers/matches every FOV in "
+                 "chronological order.",
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Dry run", key="registry_backfill_dryrun"):
+                reports = run_backfill(Path(backfill_root), dry_run=True)
+                st.write(f"{len(reports)} candidate(s) found")
+                st.dataframe(pd.DataFrame(reports))
+        with col_b:
+            if st.button("Backfill now", type="primary", key="registry_backfill_run"):
+                with st.spinner("Registering…"):
+                    reports = run_backfill(Path(backfill_root), dry_run=False)
+                st.success(f"Processed {len(reports)} FOV(s)")
+                st.dataframe(pd.DataFrame(reports))
+
+    fovs = store.list_fovs()
+    if not fovs:
+        st.info(
+            "Registry is empty. Run the pipeline with `--registry` or use the "
+            "Backfill button above to ingest existing outputs."
+        )
+        return
+
+    fov_rows = pd.DataFrame([
+        {
+            "fov_id": f.fov_id,
+            "animal_id": f.animal_id,
+            "region": f.region,
+            "latest_session": (
+                f.latest_session_date.isoformat() if f.latest_session_date else "-"
+            ),
+            "sessions": len(store.list_sessions(f.fov_id)),
+            "cells": len(store.list_cells(f.fov_id)),
+            "fingerprint": f.fingerprint_hash[:12],
+        }
+        for f in fovs
+    ])
+    st.subheader(f"{len(fovs)} FOV(s) in registry")
+    st.dataframe(fov_rows, use_container_width=True)
+
+    st.divider()
+    st.subheader("FOV detail")
+    fov_choice = st.selectbox(
+        "Select a FOV",
+        options=[f.fov_id for f in fovs],
+        format_func=lambda fid: (
+            f"{fid[:8]} — "
+            f"{next((f.animal_id for f in fovs if f.fov_id == fid), '?')} / "
+            f"{next((f.region for f in fovs if f.fov_id == fid), '?')}"
+        ),
+        key="registry_fov_select",
+    )
+    if fov_choice:
+        sessions = store.list_sessions(fov_choice)
+        cells = store.list_cells(fov_choice)
+        st.write(f"**{len(cells)} cell(s), {len(sessions)} session(s)**")
+        if sessions:
+            st.dataframe(pd.DataFrame([
+                {
+                    "session_date": s.session_date.isoformat(),
+                    "fov_sim": s.fov_sim,
+                    "n_matched": s.n_matched,
+                    "n_new": s.n_new,
+                    "n_missing": s.n_missing,
+                    "output_dir": s.output_dir,
+                }
+                for s in sessions
+            ]), use_container_width=True)
+
+        with st.expander("Cells in this FOV"):
+            st.dataframe(pd.DataFrame([
+                {
+                    "global_cell_id": c.global_cell_id,
+                    "first_session_id": c.first_seen_session_id,
+                    "first_local_label_id": c.morphology_summary.get(
+                        "first_local_label_id"
+                    ),
+                }
+                for c in cells
+            ]), use_container_width=True)
+
+    st.divider()
+    st.subheader("Longitudinal cell browser")
+    cell_id = st.text_input(
+        "global_cell_id",
+        key="registry_track_cell",
+        help="Paste a global_cell_id from the table above to see every "
+             "session it was observed in.",
+    )
+    if cell_id:
+        obs = store.list_observations_for_cell(cell_id.strip())
+        if not obs:
+            st.info("No observations for that global_cell_id.")
+        else:
+            sessions_by_id = {}
+            for f in fovs:
+                for s in store.list_sessions(f.fov_id):
+                    sessions_by_id[s.session_id] = s
+            rows = []
+            for o in obs:
+                s = sessions_by_id.get(o.session_id)
+                rows.append({
+                    "session_date": s.session_date.isoformat() if s else "-",
+                    "local_label_id": o.local_label_id,
+                    "match_score": o.match_score,
+                    "output_dir": s.output_dir if s else "-",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 if __name__ == "__main__":
