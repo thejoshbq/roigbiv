@@ -16,6 +16,8 @@ dependencies = [
     "pandas",
     "tifffile",
     "scikit-image",
+    "scikit-learn",
+    "opencv-python",
     "matplotlib",
     "ipywidgets",
     "pyyaml",
@@ -31,6 +33,10 @@ app = ["streamlit"]
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
 postgres = ["psycopg[binary]>=3.1"]
+# `embeddings` pulls in ROICaT's ROInet (SimCLR-trained ConvNeXt) for the
+# cross-session FOV/cell matcher. Optional because the pipeline degrades to
+# the legacy phase-correlation path when roicat is missing.
+embeddings = ["roicat>=1.5", "torch>=2.0", "torchvision"]
 
 [project.scripts]
 roigbiv-pipeline = "roigbiv.pipeline.run:main"

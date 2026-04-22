@@ -1,0 +1,135 @@
+{
+  "db_path": "/home/thejoshbq/Otis-Lab/Projects/roigbiv/inference/registry_roicat.db",
+  "blob_root": "/home/thejoshbq/Otis-Lab/Projects/roigbiv/inference/fingerprints_v3",
+  "adapter_config": {
+    "um_per_pixel": 1.0,
+    "device": "cuda",
+    "alignment_method": "RoMa",
+    "all_to_all": false,
+    "nonrigid": false,
+    "sequential_hungarian_thresh_cost": 0.6,
+    "d_cutoff": null
+  },
+  "accept_threshold": 0.9,
+  "review_threshold": 0.5,
+  "calibration_trained": false,
+  "steps": [
+    {
+      "index": 0,
+      "stem": "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_PRE-002",
+      "elapsed_seconds": 0.2,
+      "n_query_rois": 83,
+      "decision": "new_fov",
+      "fov_id": "48c96fe5-a4f4-4395-b27b-a18d4b2feaf4",
+      "candidate_fov_id": null,
+      "fov_posterior": null,
+      "best_candidate_posterior": null,
+      "best_candidate_decision": null,
+      "alignment_method": null,
+      "alignment_inlier_rate": null,
+      "n_shared_clusters": null,
+      "fraction_query_clustered": null,
+      "mean_cluster_cohesion": null,
+      "n_matched": null,
+      "n_new": 83,
+      "n_missing": null,
+      "fingerprint_hash": "2d41f7e2eeafa7e0667e4ecc42646b9277f695f8adbe7d991e0c8577c6644128",
+      "fingerprint_version": 3
+    },
+    {
+      "index": 1,
+      "stem": "T1_221215_PrL-NAc-G6-5M_LOW-D1_FOV1_PRE-000",
+      "elapsed_seconds": 26.63,
+      "n_query_rois": 75,
+      "decision": "auto_match",
+      "fov_id": "48c96fe5-a4f4-4395-b27b-a18d4b2feaf4",
+      "candidate_fov_id": null,
+      "fov_posterior": 0.9933439929946833,
+      "best_candidate_posterior": null,
+      "best_candidate_decision": null,
+      "alignment_method": "RoMa",
+      "alignment_inlier_rate": 0.7611848100718197,
+      "n_shared_clusters": 57,
+      "fraction_query_clustered": 0.76,
+      "mean_cluster_cohesion": 0.27693934189645864,
+      "n_matched": 57,
+      "n_new": 18,
+      "n_missing": 0,
+      "fingerprint_hash": "2d41f7e2eeafa7e0667e4ecc42646b9277f695f8adbe7d991e0c8577c6644128",
+      "fingerprint_version": 3
+    },
+    {
+      "index": 2,
+      "stem": "T1_230116_PrL-NAc-G6-5M_EXT-D9_FOV1_EXT-D9_PRE-000",
+      "elapsed_seconds": 24.03,
+      "n_query_rois": 68,
+      "decision": "auto_match",
+      "fov_id": "48c96fe5-a4f4-4395-b27b-a18d4b2feaf4",
+      "candidate_fov_id": null,
+      "fov_posterior": 0.9872433426517419,
+      "best_candidate_posterior": null,
+      "best_candidate_decision": null,
+      "alignment_method": "RoMa",
+      "alignment_inlier_rate": 0.6743024968923256,
+      "n_shared_clusters": 50,
+      "fraction_query_clustered": 0.7352941176470589,
+      "mean_cluster_cohesion": 0.31525697867075597,
+      "n_matched": 50,
+      "n_new": 18,
+      "n_missing": 25,
+      "fingerprint_hash": "2d41f7e2eeafa7e0667e4ecc42646b9277f695f8adbe7d991e0c8577c6644128",
+      "fingerprint_version": 3
+    }
+  ],
+  "final_db": {
+    "n_fovs": 1,
+    "fovs": [
+      {
+        "fov_id": "48c96fe5-a4f4-4395-b27b-a18d4b2feaf4",
+        "animal_id": "T1",
+        "region": "PrL-NAc",
+        "fingerprint_version": 3,
+        "fingerprint_hash": "2d41f7e2eeafa7e0667e4ecc42646b9277f695f8adbe7d991e0c8577c6644128",
+        "latest_session_date": "2023-01-16",
+        "n_sessions": 3,
+        "n_cells": 119,
+        "sessions": [
+          {
+            "session_date": "2022-12-09",
+            "output_dir": "/home/thejoshbq/Otis-Lab/Projects/roigbiv/data/output/T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_PRE-002",
+            "fov_posterior": null,
+            "n_matched": 0,
+            "n_new": 83,
+            "n_missing": 0,
+            "cluster_labels_uri": "file:///home/thejoshbq/Otis-Lab/Projects/roigbiv/inference/fingerprints_v3/48c96fe5-a4f4-4395-b27b-a18d4b2feaf4/sessions/2196a6e6-fa42-4966-97da-cd4fc977346c/cluster_labels.npy"
+          },
+          {
+            "session_date": "2022-12-15",
+            "output_dir": "/home/thejoshbq/Otis-Lab/Projects/roigbiv/data/output/T1_221215_PrL-NAc-G6-5M_LOW-D1_FOV1_PRE-000",
+            "fov_posterior": 0.9933439929946833,
+            "n_matched": 57,
+            "n_new": 18,
+            "n_missing": 0,
+            "cluster_labels_uri": "file:///home/thejoshbq/Otis-Lab/Projects/roigbiv/inference/fingerprints_v3/48c96fe5-a4f4-4395-b27b-a18d4b2feaf4/sessions/2ccad68f-10e2-4dca-83f9-df9e868854ae/cluster_labels.npy"
+          },
+          {
+            "session_date": "2023-01-16",
+            "output_dir": "/home/thejoshbq/Otis-Lab/Projects/roigbiv/data/output/T1_230116_PrL-NAc-G6-5M_EXT-D9_FOV1_EXT-D9_PRE-000",
+            "fov_posterior": 0.9872433426517419,
+            "n_matched": 50,
+            "n_new": 18,
+            "n_missing": 25,
+            "cluster_labels_uri": "file:///home/thejoshbq/Otis-Lab/Projects/roigbiv/inference/fingerprints_v3/48c96fe5-a4f4-4395-b27b-a18d4b2feaf4/sessions/00073179-ff6d-40c4-bb2a-2ac152c68a72/cluster_labels.npy"
+          }
+        ]
+      }
+    ]
+  },
+  "verdict": {
+    "pass": true,
+    "expected_n_fov": 1,
+    "expected_n_sessions_in_fov": 3,
+    "actual_n_fov": 1,
+    "actual_n_sessions": 3
+  }
+}

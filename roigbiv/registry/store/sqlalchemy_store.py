@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from sqlalchemy import create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session as SASession
@@ -34,6 +35,9 @@ class SQLAlchemyStore:
 
     def ensure_schema(self) -> None:
         m.Base.metadata.create_all(self.engine)
+        from roigbiv.registry.migrate import ensure_alembic_head
+
+        ensure_alembic_head()
 
     # ── FOV ───────────────────────────────────────────────────────────────
     def get_fov_by_hash(self, fingerprint_hash: str) -> Optional[FOVRecord]:
@@ -56,6 +60,51 @@ class SQLAlchemyStore:
             ).all()
             return [_fov_to_record(r) for r in rows]
 
+    def find_candidates_by_embedding(
+        self,
+        animal_id: str,
+        region: str,
+        fov_embedding: np.ndarray,
+        blob_store,
+        top_k: int = 10,
+        min_cosine: float = 0.0,
+    ) -> list[FOVRecord]:
+        """Rank (animal_id, region) FOVs by cosine similarity of pooled embedding.
+
+        Only FOVs with a populated ``fov_embedding_uri`` are considered; FOVs
+        without an embedding (v1 rows) are silently skipped. Returns up to
+        ``top_k`` records sorted by descending similarity. If no v2 FOVs exist
+        in the candidate pool this returns an empty list, letting the caller
+        fall back to the region-only ``find_candidates``.
+        """
+        candidates = self.find_candidates(animal_id, region)
+        query = np.asarray(fov_embedding, dtype=np.float32).ravel()
+        q_norm = float(np.linalg.norm(query))
+        if q_norm <= 0:
+            return []
+        query = query / q_norm
+        scored: list[tuple[float, FOVRecord]] = []
+        for cand in candidates:
+            if not cand.fov_embedding_uri:
+                continue
+            try:
+                blob = blob_store.get(cand.fov_embedding_uri)
+            except Exception:
+                continue
+            import io
+            vec = np.load(io.BytesIO(blob), allow_pickle=False).astype(np.float32).ravel()
+            if vec.shape != query.shape:
+                continue
+            n = float(np.linalg.norm(vec))
+            if n <= 0:
+                continue
+            sim = float(np.dot(query, vec / n))
+            if sim < min_cosine:
+                continue
+            scored.append((sim, cand))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [rec for _, rec in scored[:top_k]]
+
     def list_fovs(self, filters: Optional[dict] = None) -> list[FOVRecord]:
         with self._Session() as s:
             stmt = select(m.FOV)
@@ -75,7 +124,27 @@ class SQLAlchemyStore:
                 centroid_table_uri=fov.centroid_table_uri,
                 created_at=fov.created_at,
                 latest_session_date=fov.latest_session_date,
+                fingerprint_version=fov.fingerprint_version,
+                fov_embedding_uri=fov.fov_embedding_uri,
+                roi_embeddings_uri=fov.roi_embeddings_uri,
             ))
+            s.commit()
+
+    def update_fov_embeddings(
+        self,
+        fov_id: str,
+        fov_embedding_uri: str,
+        roi_embeddings_uri: str,
+        fingerprint_version: int,
+    ) -> None:
+        """Attach embedding blob URIs to an existing FOV row (v1 → v2 upgrade)."""
+        with self._Session() as s:
+            row = s.get(m.FOV, fov_id)
+            if row is None:
+                return
+            row.fov_embedding_uri = fov_embedding_uri
+            row.roi_embeddings_uri = roi_embeddings_uri
+            row.fingerprint_version = fingerprint_version
             s.commit()
 
     def update_fov_latest_session(self, fov_id: str, session_date: date) -> None:
@@ -96,11 +165,24 @@ class SQLAlchemyStore:
                 session_date=session.session_date,
                 output_dir=session.output_dir,
                 fov_sim=session.fov_sim,
+                fov_posterior=session.fov_posterior,
                 n_matched=session.n_matched,
                 n_new=session.n_new,
                 n_missing=session.n_missing,
                 created_at=session.created_at or datetime.now(timezone.utc),
+                cluster_labels_uri=session.cluster_labels_uri,
             ))
+            s.commit()
+
+    def update_session_cluster_labels(
+        self, session_id: str, cluster_labels_uri: str
+    ) -> None:
+        """Attach a cluster-labels blob URI to an existing session row."""
+        with self._Session() as s:
+            row = s.get(m.Session, session_id)
+            if row is None:
+                return
+            row.cluster_labels_uri = cluster_labels_uri
             s.commit()
 
     def list_sessions(self, fov_id: str) -> list[SessionRecord]:
@@ -142,6 +224,7 @@ class SQLAlchemyStore:
                     session_id=obs.session_id,
                     local_label_id=obs.local_label_id,
                     match_score=obs.match_score,
+                    cluster_label=obs.cluster_label,
                 ))
             s.commit()
 
@@ -172,6 +255,9 @@ def _fov_to_record(row: m.FOV) -> FOVRecord:
         centroid_table_uri=row.centroid_table_uri,
         created_at=row.created_at,
         latest_session_date=row.latest_session_date,
+        fingerprint_version=row.fingerprint_version or 1,
+        fov_embedding_uri=row.fov_embedding_uri,
+        roi_embeddings_uri=row.roi_embeddings_uri,
     )
 
 
@@ -182,10 +268,12 @@ def _session_to_record(row: m.Session) -> SessionRecord:
         session_date=row.session_date,
         output_dir=row.output_dir,
         fov_sim=row.fov_sim,
+        fov_posterior=row.fov_posterior,
         n_matched=row.n_matched,
         n_new=row.n_new,
         n_missing=row.n_missing,
         created_at=row.created_at,
+        cluster_labels_uri=row.cluster_labels_uri,
     )
 
 
@@ -205,4 +293,5 @@ def _obs_to_record(row: m.CellObservation) -> ObservationRecord:
         session_id=row.session_id,
         local_label_id=row.local_label_id,
         match_score=row.match_score,
+        cluster_label=row.cluster_label,
     )

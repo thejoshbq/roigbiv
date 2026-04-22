@@ -38,6 +38,9 @@ class FOV(Base):
     centroid_table_uri: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     latest_session_date: Mapped[datetime] = mapped_column(Date, nullable=True)
+    fingerprint_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    fov_embedding_uri: Mapped[str] = mapped_column(String(512), nullable=True)
+    roi_embeddings_uri: Mapped[str] = mapped_column(String(512), nullable=True)
 
     cells = relationship("Cell", back_populates="fov", cascade="all, delete-orphan")
     sessions = relationship("Session", back_populates="fov", cascade="all, delete-orphan")
@@ -75,10 +78,13 @@ class Session(Base):
     session_date: Mapped[datetime] = mapped_column(Date, nullable=False)
     output_dir: Mapped[str] = mapped_column(String(1024), nullable=False)
     fov_sim: Mapped[float] = mapped_column(Float, nullable=True)
+    fov_posterior: Mapped[float] = mapped_column(Float, nullable=True)
     n_matched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     n_new: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     n_missing: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # v3: blob URI for the per-session int32 ROICaT cluster label array.
+    cluster_labels_uri: Mapped[str] = mapped_column(String(512), nullable=True)
 
     fov = relationship("FOV", back_populates="sessions")
 
@@ -99,6 +105,9 @@ class CellObservation(Base):
     )
     local_label_id: Mapped[int] = mapped_column(Integer, nullable=False)
     match_score: Mapped[float] = mapped_column(Float, nullable=True)
+    # v3: ROICaT cluster label for this observation. Mutable (may change when
+    # the FOV is re-clustered); canonical per-ROI identity remains global_cell_id.
+    cluster_label: Mapped[int] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("session_id", "local_label_id", name="uq_obs_session_label"),

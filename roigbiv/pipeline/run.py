@@ -632,41 +632,84 @@ def main():
 
 def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> None:
     """Call the registry with the live FOVData after `run_pipeline` returns."""
-    from roigbiv.registry import build_blob_store, build_store, register_or_match
-    from roigbiv.registry.fingerprint import cells_from_rois
+    from roigbiv.registry import (
+        RegistryConfig,
+        build_adapter_config,
+        build_blob_store,
+        build_store,
+        load_calibration,
+        register_or_match,
+    )
+    from roigbiv.registry.roicat_adapter import SessionInput
 
     if fov.mean_M is None:
         print("WARN: fov.mean_M is None; skipping registry.", flush=True)
         return
 
-    cells = cells_from_rois(fov.rois)
-    if not cells:
+    merged_masks = _build_merged_masks(fov)
+    if merged_masks is None or int((merged_masks > 0).any()) == 0:
         print("WARN: no non-rejected ROIs on this FOV; skipping registry.", flush=True)
         return
 
     stem = Path(tif_path).stem.replace("_mc", "")
-    store = build_store()
-    blob_store = build_blob_store()
+    cfg = RegistryConfig.from_env()
+    store = build_store(cfg)
+    blob_store = build_blob_store(cfg)
+    adapter_cfg = build_adapter_config(cfg)
+    calibration = load_calibration(cfg)
+
+    query = SessionInput(
+        session_key=stem,
+        mean_m=np.asarray(fov.mean_M, dtype=np.float32),
+        merged_masks=np.asarray(merged_masks, dtype=np.uint16),
+    )
+
     report = register_or_match(
         fov_stem=stem,
-        mean_m=fov.mean_M,
-        cells=cells,
+        query=query,
         output_dir=fov.output_dir,
         store=store,
         blob_store=blob_store,
+        adapter_config=adapter_cfg,
+        calibration=calibration,
+        accept_threshold=cfg.fov_accept_threshold,
+        review_threshold=cfg.fov_review_threshold,
     )
     decision = report.get("decision")
+    posterior = report.get("fov_posterior") or report.get("fov_sim") or 1.0
     if decision == "new_fov":
         print(f"Registry: minted new fov_id={report['fov_id']} "
               f"({report['n_new_cells']} cells)", flush=True)
     elif decision in ("auto_match", "hash_match"):
         print(f"Registry: {decision} fov_id={report['fov_id']} "
-              f"sim={report.get('fov_sim', 1.0):.3f} "
-              f"matched={report['n_matched']} new={report['n_new']} "
-              f"missing={report['n_missing']}", flush=True)
+              f"posterior={posterior:.3f} "
+              f"matched={report.get('n_matched', 0)} "
+              f"new={report.get('n_new', 0)} "
+              f"missing={report.get('n_missing', 0)}", flush=True)
     elif decision == "review":
-        print(f"Registry: review band (sim={report['fov_sim']:.3f}); "
+        print(f"Registry: review band (posterior={posterior:.3f}); "
               "no session written — resolve in Streamlit.", flush=True)
+
+
+def _build_merged_masks(fov: FOVData) -> "np.ndarray | None":
+    """Reassemble the per-cell label image from the accepted ROIs.
+
+    The registry wants a single uint16 label image where each cell's pixels
+    carry its ``local_label_id``. Stitches them back together in the same
+    coordinate frame as ``fov.mean_M``.
+    """
+    if fov.mean_M is None or not fov.rois:
+        return None
+    Ly, Lx = fov.mean_M.shape
+    label_image = np.zeros((Ly, Lx), dtype=np.uint16)
+    for roi in fov.rois:
+        if getattr(roi, "gate_outcome", None) == "reject":
+            continue
+        mask = roi.mask
+        if mask is None or not mask.any():
+            continue
+        label_image[mask] = int(roi.label_id)
+    return label_image
 
 
 if __name__ == "__main__":

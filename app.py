@@ -646,6 +646,26 @@ def _launch_napari(fov_out_dir: Path) -> None:
     subprocess.Popen([sys.executable, tmp_path])
 
 
+def _launch_cross_session_napari(fov_id: str) -> None:
+    """Spawn a napari process that opens the cross-session viewer for a FOV.
+
+    The subprocess re-resolves the registry from the inherited
+    ``ROIGBIV_REGISTRY_DSN`` env, so only ``fov_id`` needs to be passed.
+    """
+    script = "\n".join([
+        "import sys",
+        f"sys.path.insert(0, r'{PROJECT_ROOT}')",
+        "from roigbiv.pipeline.cross_session_viewer import display_cross_session_fov",
+        f"display_cross_session_fov({fov_id!r})",
+    ])
+
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write(script)
+        tmp_path = f.name
+
+    subprocess.Popen([sys.executable, tmp_path])
+
+
 # ── Results tab ──────────────────────────────────────────────────────────────
 
 def _iter_fov_dirs(out_path: Path) -> list[Path]:
@@ -813,6 +833,25 @@ def _registry_tab(output_dir: str) -> None:
         st.error(f"Could not open registry: {exc}")
         return
 
+    with st.expander("Registry maintenance"):
+        st.caption(
+            "Run pending alembic migrations against the active DSN. Safe to "
+            "re-run — the migration is idempotent."
+        )
+        if st.button(
+            "Run database migrations",
+            key="registry_migrate",
+            help="Applies any pending alembic migrations to the active "
+                 "registry DSN.",
+        ):
+            try:
+                from roigbiv.registry.migrate import ensure_alembic_head
+
+                result = ensure_alembic_head()
+                st.success(f"Migrations: {result}")
+            except Exception as exc:
+                st.error(f"Migration failed: {exc}")
+
     with st.expander("Backfill existing runs"):
         backfill_root = st.text_input(
             "Root directory to scan",
@@ -879,7 +918,7 @@ def _registry_tab(output_dir: str) -> None:
             st.dataframe(pd.DataFrame([
                 {
                     "session_date": s.session_date.isoformat(),
-                    "fov_sim": s.fov_sim,
+                    "fov_posterior": s.fov_posterior if s.fov_posterior is not None else s.fov_sim,
                     "n_matched": s.n_matched,
                     "n_new": s.n_new,
                     "n_missing": s.n_missing,
@@ -887,6 +926,20 @@ def _registry_tab(output_dir: str) -> None:
                 }
                 for s in sessions
             ]), use_container_width=True)
+
+            if st.button(
+                "Open cross-session viewer in Napari",
+                type="primary",
+                key=f"xsess_napari_{fov_choice}",
+                help="Per-session mean projections, ROI overlays colored by "
+                     "global_cell_id (same color across sessions = same cell), "
+                     "and a hidden cell-ID text layer.",
+            ):
+                try:
+                    _launch_cross_session_napari(fov_choice)
+                    st.success("Napari launched — check for a new window.")
+                except Exception as exc:
+                    st.error(f"Launch failed: {exc}")
 
         with st.expander("Cells in this FOV"):
             st.dataframe(pd.DataFrame([

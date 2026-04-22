@@ -49,6 +49,7 @@ data/union_rois/
 data/training/
 data/masks/
 data/run*/
+data/output/
 
 # ── Suite2p workspace (intermediate outputs, ~11 GB) ─────────────────────────
 # Contains .npy stat arrays, .bin binary stacks, .tif masks — all generated.
@@ -58,6 +59,18 @@ suite2p_workspace/
 inference/output/
 inference/consensus/
 inference/traces/
+inference/pipeline/
+
+# ── Registry runtime artifacts (SQLite DBs, fingerprint blobs, calibration) ──
+# Populated by roigbiv-registry at runtime from the pipeline outputs and
+# ROICaT embeddings; regenerable via `roigbiv-registry backfill`.
+inference/*.db
+inference/*.db-wal
+inference/*.db-shm
+inference/*.db-journal
+inference/fingerprints/
+inference/fingerprints_v3/
+inference/registry_calibration.json
 
 # ── Model training checkpoints (~13 GB, 500+ files at ~26 MB each) ───────────
 # Only the deployed model is needed; it is tracked via Git LFS (.gitattributes).

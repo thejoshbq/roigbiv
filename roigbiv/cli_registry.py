@@ -16,9 +16,17 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from roigbiv.registry import build_blob_store, build_store, register_or_match
+from roigbiv.registry import (
+    RegistryConfig,
+    build_adapter_config,
+    build_blob_store,
+    build_store,
+    load_calibration,
+    register_or_match,
+)
 from roigbiv.registry.backfill import run_backfill
 from roigbiv.registry.filename import parse_filename_metadata
+from roigbiv.registry.roicat_adapter import load_session_input
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -47,7 +55,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     bf = sub.add_parser(
         "backfill",
-        help="Walk inference/pipeline/ and register each FOV.",
+        help="Walk a root directory and register each FOV.",
     )
     bf.add_argument("--root", type=Path, default=Path("inference/pipeline"),
                     help="Root directory to scan (default: inference/pipeline).")
@@ -83,7 +91,8 @@ def _cmd_list() -> int:
     for f in rows:
         last = f.latest_session_date.isoformat() if f.latest_session_date else "-"
         print(f"{f.fov_id}  animal={f.animal_id}  region={f.region}  "
-              f"last={last}  hash={f.fingerprint_hash[:12]}")
+              f"last={last}  hash={f.fingerprint_hash[:12]}  "
+              f"v={f.fingerprint_version}")
     return 0
 
 
@@ -98,48 +107,44 @@ def _cmd_show(fov_id: str) -> int:
     cells = store.list_cells(fov_id)
     print(f"FOV {fov.fov_id}")
     print(f"  animal_id: {fov.animal_id}  region: {fov.region}")
-    print(f"  fingerprint: {fov.fingerprint_hash}")
+    print(f"  fingerprint: {fov.fingerprint_hash}  v={fov.fingerprint_version}")
     print(f"  created_at: {fov.created_at.isoformat() if fov.created_at else '-'}")
     print(f"  cells: {len(cells)}")
     print(f"  sessions: {len(sessions)}")
     for s in sessions:
-        print(f"    {s.session_date.isoformat()}  sim={s.fov_sim}  "
+        posterior = s.fov_posterior if s.fov_posterior is not None else s.fov_sim
+        posterior_str = f"{posterior:.3f}" if posterior is not None else "-"
+        print(f"    {s.session_date.isoformat()}  posterior={posterior_str}  "
               f"matched={s.n_matched} new={s.n_new} missing={s.n_missing}  "
               f"{s.output_dir}")
     return 0
 
 
 def _cmd_match(output_dir: Path) -> int:
-    import numpy as np
-    import tifffile
-
-    from roigbiv.registry.fingerprint import cells_from_masks
-
     output_dir = output_dir.resolve()
-    mean_m_path = output_dir / "summary" / "mean_M.tif"
-    masks_path = output_dir / "merged_masks.tif"
-    meta_path = output_dir / "roi_metadata.json"
-    for p in (mean_m_path, masks_path, meta_path):
-        if not p.exists():
-            print(f"missing required file: {p}", file=sys.stderr)
-            return 1
+    try:
+        query = load_session_input(output_dir)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
-    mean_m = tifffile.imread(str(mean_m_path)).astype(np.float32)
-    merged = tifffile.imread(str(masks_path))
-    meta = json.loads(meta_path.read_text())
-    cells = cells_from_masks(merged, meta)
-
-    store = build_store()
-    blob_store = build_blob_store()
+    cfg = RegistryConfig.from_env()
+    store = build_store(cfg)
+    blob_store = build_blob_store(cfg)
+    adapter_cfg = build_adapter_config(cfg)
+    calibration = load_calibration(cfg)
     fname = parse_filename_metadata(output_dir.name)
     report = register_or_match(
         fov_stem=output_dir.name,
-        mean_m=mean_m,
-        cells=cells,
+        query=query,
         output_dir=output_dir,
         store=store,
         blob_store=blob_store,
         session_date_override=fname.session_date,
+        adapter_config=adapter_cfg,
+        calibration=calibration,
+        accept_threshold=cfg.fov_accept_threshold,
+        review_threshold=cfg.fov_review_threshold,
     )
     print(json.dumps(report, indent=2, default=str))
     return 0
@@ -153,18 +158,23 @@ def _cmd_track(global_cell_id: str) -> int:
         print(f"no observations for global_cell_id {global_cell_id!r}",
               file=sys.stderr)
         return 1
-    sessions_by_id = {}
+    sessions_by_id: dict = {}
     for o in obs:
         if o.session_id not in sessions_by_id:
-            for s in store.list_sessions(_fov_id_from_obs(store, o)):
-                sessions_by_id[s.session_id] = s
+            fov_id = _fov_id_from_obs(store, o)
+            if fov_id:
+                for s in store.list_sessions(fov_id):
+                    sessions_by_id[s.session_id] = s
     print(f"global_cell_id: {global_cell_id}")
     for o in obs:
         s = sessions_by_id.get(o.session_id)
         date_s = s.session_date.isoformat() if s else "-"
         out_dir = s.output_dir if s else "-"
+        cluster_str = (
+            f" cluster={o.cluster_label}" if o.cluster_label is not None else ""
+        )
         print(f"  {date_s}  local_label_id={o.local_label_id}  "
-              f"score={o.match_score}  {out_dir}")
+              f"score={o.match_score}{cluster_str}  {out_dir}")
     return 0
 
 
@@ -187,15 +197,17 @@ def _cmd_backfill(root: Path, dry_run: bool) -> int:
             print(f"ERR  {r.get('stem', '?')}: {r['error']}")
         else:
             dec = r.get("decision") or r.get("action")
+            posterior = r.get("fov_posterior") or r.get("fov_sim") or 1.0
             if dec == "new_fov":
                 print(f"new  {r['stem']}  fov_id={r['fov_id']}  "
                       f"cells={r['n_new_cells']}")
             elif dec in ("auto_match", "hash_match"):
                 print(f"{dec}  {r['stem']}  fov_id={r['fov_id']}  "
-                      f"sim={r.get('fov_sim', 1.0):.3f}  "
-                      f"m={r['n_matched']} n={r['n_new']} x={r['n_missing']}")
+                      f"p={posterior:.3f}  "
+                      f"m={r.get('n_matched', 0)} n={r.get('n_new', 0)} "
+                      f"x={r.get('n_missing', 0)}")
             elif dec == "review":
-                print(f"rev  {r['stem']}  sim={r['fov_sim']:.3f}")
+                print(f"rev  {r['stem']}  p={posterior:.3f}")
             else:
                 print(f"{dec}  {r.get('stem', '?')}")
     return 0

@@ -1,11 +1,12 @@
-"""Retroactively register/match every FOV already under inference/pipeline/.
+"""Retroactively register / match pipeline output directories against the registry.
 
-Walks the directory, reads summary/mean_M.tif + merged_masks.tif +
-roi_metadata.json per FOV, and feeds them through `register_or_match` in
-chronological order (by session_date parsed from the filename stem, falling
-back to pipeline_log.json's ISO timestamp).
+Walks a root directory, collects every subdirectory that has the minimum set
+of pipeline outputs (``merged_masks.tif`` + ``summary/mean_M.tif``), parses
+their filename metadata, sorts by ``(session_date, stem)``, and calls
+:func:`register_or_match` on each in chronological order.
 
-The `dry_run=True` mode reports intended actions without mutating state.
+Because :func:`register_or_match` is idempotent for the hash-pre-filter
+shortcut, re-running the backfill on an already-populated registry is safe.
 """
 from __future__ import annotations
 
@@ -15,13 +16,16 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import tifffile
-
-from roigbiv.registry import build_blob_store, build_store
+from roigbiv.registry.config import (
+    RegistryConfig,
+    build_adapter_config,
+    build_blob_store,
+    build_store,
+    load_calibration,
+)
 from roigbiv.registry.filename import parse_filename_metadata
-from roigbiv.registry.fingerprint import cells_from_masks
 from roigbiv.registry.orchestrator import register_or_match
+from roigbiv.registry.roicat_adapter import load_session_input
 
 
 @dataclass
@@ -33,7 +37,12 @@ class BackfillCandidate:
 
 
 def discover(root: Path) -> list[BackfillCandidate]:
-    """Find every FOV output dir that has the files we need."""
+    """Find every FOV output dir under ``root`` that has the required files.
+
+    Required files (per the roigbiv pipeline output contract):
+      * ``merged_masks.tif`` — the uint16 unified label image.
+      * ``summary/mean_M.tif`` — the mean projection.
+    """
     root = Path(root)
     out: list[BackfillCandidate] = []
     if not root.exists():
@@ -54,7 +63,13 @@ def discover(root: Path) -> list[BackfillCandidate]:
     return out
 
 
-def run_backfill(root: Path, *, dry_run: bool = False) -> list[dict]:
+def run_backfill(
+    root: Path,
+    *,
+    dry_run: bool = False,
+    cfg: Optional[RegistryConfig] = None,
+) -> list[dict]:
+    """Register/match every discovered session in chronological order."""
     candidates = discover(root)
     if not candidates:
         return []
@@ -67,13 +82,17 @@ def run_backfill(root: Path, *, dry_run: bool = False) -> list[dict]:
             "action": "would_register",
         } for c in candidates]
 
-    store = build_store()
-    blob_store = build_blob_store()
+    cfg = cfg or RegistryConfig.from_env()
+    store = build_store(cfg)
+    blob_store = build_blob_store(cfg)
+    adapter_cfg = build_adapter_config(cfg)
+    calibration = load_calibration(cfg)
+
     reports: list[dict] = []
     for cand in candidates:
         try:
-            mean_m, cells = _load_fov_inputs(cand.output_dir)
-        except Exception as exc:
+            query = load_session_input(cand.output_dir, session_key=cand.stem)
+        except Exception as exc:  # noqa: BLE001
             reports.append({
                 "output_dir": str(cand.output_dir),
                 "stem": cand.stem,
@@ -83,16 +102,19 @@ def run_backfill(root: Path, *, dry_run: bool = False) -> list[dict]:
         try:
             report = register_or_match(
                 fov_stem=cand.stem,
-                mean_m=mean_m,
-                cells=cells,
+                query=query,
                 output_dir=cand.output_dir,
                 store=store,
                 blob_store=blob_store,
                 session_date_override=cand.session_date,
+                calibration=calibration,
+                adapter_config=adapter_cfg,
+                accept_threshold=cfg.fov_accept_threshold,
+                review_threshold=cfg.fov_review_threshold,
             )
             report["stem"] = cand.stem
             reports.append(report)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             reports.append({
                 "output_dir": str(cand.output_dir),
                 "stem": cand.stem,
@@ -105,16 +127,7 @@ def _has_required_outputs(d: Path) -> bool:
     return (
         (d / "summary" / "mean_M.tif").exists()
         and (d / "merged_masks.tif").exists()
-        and (d / "roi_metadata.json").exists()
     )
-
-
-def _load_fov_inputs(d: Path):
-    mean_m = tifffile.imread(str(d / "summary" / "mean_M.tif")).astype(np.float32)
-    merged_masks = tifffile.imread(str(d / "merged_masks.tif"))
-    roi_metadata = json.loads((d / "roi_metadata.json").read_text())
-    cells = cells_from_masks(merged_masks, roi_metadata)
-    return mean_m, cells
 
 
 def _fallback_date_from_log(d: Path) -> Optional[date]:

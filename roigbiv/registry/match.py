@@ -1,216 +1,191 @@
-"""Pure FOV + cell matching logic.
+"""v3 FOV matcher — thin wrapper around the ROICaT adapter + calibrated logistic.
 
-Two-pass FOV match:
-  1. Phase correlation on mean_M (downsampled) → translation (dy, dx) + peak.
-  2. Cell-distribution Hungarian match → fov_sim.
+The heavy lifting (alignment, embedding, clustering) lives in
+:mod:`roigbiv.registry.roicat_adapter`. This module owns the two pieces that
+turn a clustering result into a registry decision:
 
-Cell match (within a matched FOV): Hungarian over a cost matrix combining
-centroid distance (after translation) and morphology distance.
-
-All functions operate on numpy arrays and CellFeature dataclasses; no DB
-or filesystem coupling.
+  1. :func:`compute_fov_features` — derive the FOV-level feature vector from
+     a :class:`~roigbiv.registry.roicat_adapter.ClusterResult`.
+  2. :func:`match_fov` — cluster the query alongside a candidate FOV's
+     sessions, derive features, run the calibrated logistic, and branch into
+     one of three decisions (``auto_match`` / ``review`` / ``reject``).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
-from roigbiv.registry.fingerprint import CellFeature
+from roigbiv.registry.calibration import CalibrationModel, FOVFeatures
+from roigbiv.registry.roicat_adapter import (
+    AdapterConfig,
+    ClusterResult,
+    SessionInput,
+    cluster_sessions,
+)
 
-AUTO_ACCEPT_THRESHOLD = 0.85
-REVIEW_THRESHOLD = 0.60
-MAX_CENTROID_PX = 8.0
+# Default decision thresholds. These remain module-level (and overridable via
+# :class:`roigbiv.registry.config.RegistryConfig` env vars) so downstream
+# callers that previously imported them keep working.
+AUTO_ACCEPT_THRESHOLD: float = 0.9
+REVIEW_THRESHOLD: float = 0.5
 
 
 @dataclass
 class FOVMatchResult:
-    matched: bool
-    fov_sim: float
-    peak_correlation: float
-    translation_yx: tuple[float, float]
-    decision: str
+    """Output of :func:`match_fov`.
 
-
-@dataclass
-class CellMatch:
-    query_label_id: int
-    candidate_label_id: Optional[int]
-    score: float
-
-
-@dataclass
-class CellMatchResult:
-    matches: list[CellMatch] = field(default_factory=list)
-    new_query_labels: list[int] = field(default_factory=list)
-    missing_candidate_labels: list[int] = field(default_factory=list)
-
-
-def phase_correlate(query: np.ndarray, candidate: np.ndarray) -> tuple[tuple[float, float], float]:
-    """Return ((dy, dx), peak_correlation) aligning `query` onto `candidate`.
-
-    Uses skimage's phase_cross_correlation on equally-shaped images. If shapes
-    differ, the larger is center-cropped to match.
+    Attributes
+    ----------
+    decision : str
+        One of ``"auto_match"``, ``"review"``, ``"reject"``.
+    fov_posterior : float
+        Calibrated probability in ``[0, 1]``.
+    features : FOVFeatures
+        The exact feature vector passed to the logistic (useful for logging
+        and for populating :file:`registry_match.json`).
+    cluster_result : ClusterResult
+        The underlying ROICaT output. The orchestrator uses this to map
+        query ROIs to cluster labels and to existing global cell IDs.
+    query_session_idx : int
+        Index of the query session inside ``cluster_result.session_bool``.
+        Always equals ``len(candidate_sessions)`` because the query is
+        appended last.
     """
-    from skimage.registration import phase_cross_correlation
 
-    q, c = _crop_to_common(query, candidate)
-    shift, _, _ = phase_cross_correlation(c, q, normalization=None, upsample_factor=10)
-    dy, dx = float(shift[0]), float(shift[1])
-    peak = _normalized_peak(q, c, dy, dx)
-    return (dy, dx), peak
+    decision: str
+    fov_posterior: float
+    features: FOVFeatures
+    cluster_result: ClusterResult
+    query_session_idx: int
 
 
 def match_fov(
-    query_mean_m: np.ndarray,
-    query_cells: list[CellFeature],
-    candidate_mean_m: np.ndarray,
-    candidate_cells: list[CellFeature],
+    *,
+    query: SessionInput,
+    candidate_sessions: list[SessionInput],
+    calibration: Optional[CalibrationModel] = None,
+    adapter_config: Optional[AdapterConfig] = None,
+    accept_threshold: float = AUTO_ACCEPT_THRESHOLD,
+    review_threshold: float = REVIEW_THRESHOLD,
 ) -> FOVMatchResult:
-    (dy, dx), peak = phase_correlate(query_mean_m, candidate_mean_m)
+    """Cluster ``query`` against ``candidate_sessions`` and decide.
 
-    translated = [
-        CellFeature(
-            local_label_id=c.local_label_id,
-            centroid_y=c.centroid_y + dy,
-            centroid_x=c.centroid_x + dx,
-            area=c.area,
-            solidity=c.solidity,
-            eccentricity=c.eccentricity,
-            nuclear_shadow_score=c.nuclear_shadow_score,
-            soma_surround_contrast=c.soma_surround_contrast,
-        )
-        for c in query_cells
-    ]
-    cell_result = match_cells(translated, candidate_cells)
+    ``candidate_sessions`` should be all sessions belonging to **one**
+    candidate FOV. To evaluate a query against multiple candidate FOVs, call
+    :func:`match_fov` once per FOV and keep the highest posterior.
+    """
+    calibration = calibration or CalibrationModel()
+    cfg = adapter_config or AdapterConfig()
 
-    denom = max(len(query_cells), len(candidate_cells), 1)
-    n_matched = len(cell_result.matches)
-    match_fraction = n_matched / denom
+    bundle = list(candidate_sessions) + [query]
+    query_idx = len(candidate_sessions)
 
-    if n_matched > 0:
-        mean_score = float(np.mean([m.score for m in cell_result.matches]))
-    else:
-        mean_score = 0.0
+    cluster_result = cluster_sessions(bundle, cfg)
+    features = compute_fov_features(cluster_result, query_session_idx=query_idx)
+    posterior = calibration.p_same_fov(features)
 
-    fov_sim = 0.5 * match_fraction + 0.5 * mean_score
-
-    if fov_sim >= AUTO_ACCEPT_THRESHOLD:
+    if posterior >= accept_threshold:
         decision = "auto_match"
-    elif fov_sim >= REVIEW_THRESHOLD:
+    elif posterior >= review_threshold:
         decision = "review"
     else:
         decision = "reject"
 
     return FOVMatchResult(
-        matched=decision == "auto_match",
-        fov_sim=float(fov_sim),
-        peak_correlation=float(peak),
-        translation_yx=(dy, dx),
         decision=decision,
+        fov_posterior=float(posterior),
+        features=features,
+        cluster_result=cluster_result,
+        query_session_idx=query_idx,
     )
 
 
-def match_cells(
-    query: list[CellFeature],
-    candidates: list[CellFeature],
-    max_px: float = MAX_CENTROID_PX,
-) -> CellMatchResult:
-    """Hungarian cell matching.
+def compute_fov_features(
+    result: ClusterResult, *, query_session_idx: int
+) -> FOVFeatures:
+    """Derive a :class:`FOVFeatures` from a ROICaT :class:`ClusterResult`.
 
-    `query` is expected to be pre-translated to the candidate coordinate
-    frame. Pairs with centroid distance > `max_px` are considered infeasible
-    and excluded from the matching; leftovers become new / missing.
+    Undefined / degenerate cases (single-session cluster, zero ROIs) return
+    a zero-valued feature vector with ``mean_cluster_cohesion = 0.5`` (the
+    neutral prior), so the calibrated logistic still produces a finite
+    posterior (typically close to the reject floor).
     """
-    from scipy.optimize import linear_sum_assignment
+    labels = result.labels
+    session_bool = result.session_bool
+    n_sessions = session_bool.shape[1] if session_bool.ndim == 2 else 0
 
-    if not query or not candidates:
-        return CellMatchResult(
-            matches=[],
-            new_query_labels=[q.local_label_id for q in query],
-            missing_candidate_labels=[c.local_label_id for c in candidates],
+    alignment_quality = float(result.alignment_inlier_rate)
+
+    if n_sessions < 2 or labels.size == 0:
+        return FOVFeatures(
+            n_shared_clusters=0,
+            fraction_query_clustered=0.0,
+            alignment_quality=alignment_quality,
+            mean_cluster_cohesion=0.5,
         )
 
-    Q = len(query)
-    C = len(candidates)
-    big = 1e6
-    cost = np.full((Q, C), big, dtype=np.float64)
-    dist_mat = np.zeros((Q, C), dtype=np.float64)
+    query_col = session_bool[:, query_session_idx]
+    # "Candidate" = any non-query session in the bundle.
+    candidate_cols = np.delete(session_bool, query_session_idx, axis=1)
+    candidate_any = candidate_cols.any(axis=1) if candidate_cols.size else np.zeros_like(query_col)
 
-    for i, q in enumerate(query):
-        for j, c in enumerate(candidates):
-            d = float(np.hypot(q.centroid_y - c.centroid_y, q.centroid_x - c.centroid_x))
-            dist_mat[i, j] = d
-            if d > max_px:
-                continue
-            morph = _morph_distance(q, c)
-            cost[i, j] = d + 2.0 * morph
+    n_query_total = int(query_col.sum())
+    n_shared_clusters = 0
+    n_query_in_shared = 0
+    intra_means_accum: list[float] = []
 
-    row_ind, col_ind = linear_sum_assignment(cost)
+    intra_by_label = _extract_intra_means(result.quality_metrics or {})
 
-    matches: list[CellMatch] = []
-    matched_rows = set()
-    matched_cols = set()
-    for i, j in zip(row_ind, col_ind):
-        if cost[i, j] >= big:
+    for lbl in np.unique(labels):
+        if lbl == -1:
             continue
-        score = _similarity_from_cost(dist_mat[i, j], _morph_distance(query[i], candidates[j]))
-        matches.append(CellMatch(
-            query_label_id=int(query[i].local_label_id),
-            candidate_label_id=int(candidates[j].local_label_id),
-            score=float(score),
-        ))
-        matched_rows.add(i)
-        matched_cols.add(j)
+        members = labels == lbl
+        q_hit = bool((members & query_col).any())
+        c_hit = bool((members & candidate_any).any())
+        if q_hit and c_hit:
+            n_shared_clusters += 1
+            n_query_in_shared += int((members & query_col).sum())
+            if intra_by_label is not None:
+                im = intra_by_label.get(int(lbl))
+                if im is not None and np.isfinite(im):
+                    intra_means_accum.append(float(im))
 
-    new_labels = [
-        int(query[i].local_label_id) for i in range(Q) if i not in matched_rows
-    ]
-    missing_labels = [
-        int(candidates[j].local_label_id) for j in range(C) if j not in matched_cols
-    ]
-    return CellMatchResult(
-        matches=matches,
-        new_query_labels=new_labels,
-        missing_candidate_labels=missing_labels,
+    fraction_query_clustered = (
+        n_query_in_shared / n_query_total if n_query_total > 0 else 0.0
+    )
+    if intra_means_accum:
+        mean_intra = float(np.mean(intra_means_accum))
+        mean_cluster_cohesion = max(0.0, min(1.0, 1.0 - mean_intra))
+    else:
+        mean_cluster_cohesion = 0.5
+
+    return FOVFeatures(
+        n_shared_clusters=int(n_shared_clusters),
+        fraction_query_clustered=float(fraction_query_clustered),
+        alignment_quality=alignment_quality,
+        mean_cluster_cohesion=float(mean_cluster_cohesion),
     )
 
 
-def _morph_distance(a: CellFeature, b: CellFeature) -> float:
-    area_rel = abs(a.area - b.area) / max(a.area, b.area, 1)
-    sol_diff = abs(a.solidity - b.solidity)
-    ecc_diff = abs(a.eccentricity - b.eccentricity)
-    nuc_diff = abs(a.nuclear_shadow_score - b.nuclear_shadow_score)
-    return float(area_rel + sol_diff + ecc_diff + 0.5 * nuc_diff)
+def _extract_intra_means(quality_metrics: dict) -> Optional[dict[int, float]]:
+    """Return a ``{cluster_label -> mean intra-cluster distance}`` mapping.
 
-
-def _similarity_from_cost(dist_px: float, morph: float) -> float:
-    dist_sim = max(0.0, 1.0 - dist_px / MAX_CENTROID_PX)
-    morph_sim = max(0.0, 1.0 - morph)
-    return 0.5 * dist_sim + 0.5 * morph_sim
-
-
-def _normalized_peak(q: np.ndarray, c: np.ndarray, dy: float, dx: float) -> float:
-    """Pearson correlation after applying the recovered translation to q."""
-    from scipy.ndimage import shift as ndi_shift
-
-    shifted = ndi_shift(q, shift=(dy, dx), order=1, mode="nearest")
-    a = shifted.ravel() - shifted.mean()
-    b = c.ravel() - c.mean()
-    denom = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    if denom <= 0:
-        return 0.0
-    return float((a * b).sum() / denom)
-
-
-def _crop_to_common(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    H = min(a.shape[0], b.shape[0])
-    W = min(a.shape[1], b.shape[1])
-
-    def _center_crop(x):
-        dy = (x.shape[0] - H) // 2
-        dx = (x.shape[1] - W) // 2
-        return x[dy:dy + H, dx:dx + W]
-
-    return _center_crop(a), _center_crop(b)
+    ROICaT 1.5.5's ``Clusterer.compute_quality_metrics`` stores two parallel
+    arrays: ``cluster_labels_unique`` and ``cluster_intra_means``. Zip them
+    into a dict keyed by label. Returns ``None`` if the expected keys are
+    missing or malformed (callers fall back to the 0.5 neutral cohesion).
+    """
+    labels_unique = quality_metrics.get("cluster_labels_unique")
+    intra_means = quality_metrics.get("cluster_intra_means")
+    if labels_unique is None or intra_means is None:
+        return None
+    try:
+        labels_arr = np.asarray(labels_unique, dtype=np.float64).ravel()
+        means_arr = np.asarray(intra_means, dtype=np.float64).ravel()
+    except Exception:
+        return None
+    if labels_arr.shape != means_arr.shape:
+        return None
+    return {int(lbl): float(v) for lbl, v in zip(labels_arr, means_arr)}

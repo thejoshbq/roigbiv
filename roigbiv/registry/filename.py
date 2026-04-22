@@ -30,7 +30,9 @@ def parse_filename_metadata(stem: str) -> FilenameMetadata:
     clean = stem.replace("_mc", "").strip("_")
 
     session_date: Optional[date] = None
-    after_date = clean
+    animal_part = ""
+    after_date = ""
+
     m_date = _DATE_RE.search(clean)
     if m_date:
         yymmdd = m_date.group(1)
@@ -39,17 +41,20 @@ def parse_filename_metadata(stem: str) -> FilenameMetadata:
             session_date = date(year, int(yymmdd[2:4]), int(yymmdd[4:6]))
         except ValueError:
             session_date = None
-        after_date = clean[m_date.end():]
+        animal_part = clean[:m_date.start(1)].rstrip("_")
+        after_date = clean[m_date.end():].lstrip("_")
+    else:
+        animal_part = clean
 
     fov_number = 1
-    animal_part = after_date
-    m_fov = _FOV_RE.search("_" + after_date)
+    indicator_part = after_date
+    m_fov = _FOV_RE.search("_" + after_date) if after_date else None
     if m_fov:
         fov_number = int(m_fov.group(1))
-        animal_part = after_date[:m_fov.start() - 1] if m_fov.start() > 0 else ""
-    animal_id = animal_part.strip("_") or "unknown"
+        indicator_part = after_date[:m_fov.start() - 1] if m_fov.start() > 0 else ""
 
-    region = _extract_region(animal_id)
+    animal_id = animal_part or "unknown"
+    region = _extract_region(indicator_part) if indicator_part else "unknown"
 
     return FilenameMetadata(
         animal_id=animal_id,
@@ -59,10 +64,10 @@ def parse_filename_metadata(stem: str) -> FilenameMetadata:
     )
 
 
-def _extract_region(animal_id: str) -> str:
-    if not animal_id or animal_id == "unknown":
+def _extract_region(indicator: str) -> str:
+    if not indicator or indicator == "unknown":
         return "unknown"
-    first_segment = animal_id.split("_")[0]
+    first_segment = indicator.split("_")[0]
     tokens = first_segment.split("-")
     region_tokens: list[str] = []
     for tok in tokens:

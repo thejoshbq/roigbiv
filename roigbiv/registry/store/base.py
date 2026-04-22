@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional, Protocol
 
+import numpy as np
+
 
 @dataclass
 class FOVRecord:
@@ -20,6 +22,10 @@ class FOVRecord:
     centroid_table_uri: str
     created_at: datetime
     latest_session_date: Optional[date] = None
+    # v2 — present when the FOV was registered with an embedding-aware pipeline.
+    fingerprint_version: int = 1
+    fov_embedding_uri: Optional[str] = None
+    roi_embeddings_uri: Optional[str] = None
 
 
 @dataclass
@@ -41,6 +47,10 @@ class SessionRecord:
     n_new: int = 0
     n_missing: int = 0
     created_at: Optional[datetime] = None
+    fov_posterior: Optional[float] = None
+    # v3: blob URI for this session's per-ROI ROICaT cluster label array
+    # (int32, length = n_rois_session).
+    cluster_labels_uri: Optional[str] = None
 
 
 @dataclass
@@ -50,6 +60,8 @@ class ObservationRecord:
     local_label_id: int
     match_score: Optional[float] = None
     observation_id: Optional[str] = None
+    # v3: ROICaT cluster label for this observation (nullable for legacy rows).
+    cluster_label: Optional[int] = None
 
 
 class RegistryStore(Protocol):
@@ -60,12 +72,24 @@ class RegistryStore(Protocol):
     def get_fov_by_hash(self, fingerprint_hash: str) -> Optional[FOVRecord]: ...
     def get_fov(self, fov_id: str) -> Optional[FOVRecord]: ...
     def find_candidates(self, animal_id: str, region: str) -> list[FOVRecord]: ...
+    def find_candidates_by_embedding(
+        self,
+        animal_id: str,
+        region: str,
+        fov_embedding: np.ndarray,
+        blob_store,
+        top_k: int = 10,
+        min_cosine: float = 0.0,
+    ) -> list[FOVRecord]: ...
     def list_fovs(self, filters: Optional[dict] = None) -> list[FOVRecord]: ...
     def insert_fov(self, fov: FOVRecord) -> None: ...
     def update_fov_latest_session(self, fov_id: str, session_date: date) -> None: ...
 
     def insert_session(self, session: SessionRecord) -> None: ...
     def list_sessions(self, fov_id: str) -> list[SessionRecord]: ...
+    def update_session_cluster_labels(
+        self, session_id: str, cluster_labels_uri: str
+    ) -> None: ...
 
     def insert_cell(self, cell: CellRecord) -> None: ...
     def list_cells(self, fov_id: str) -> list[CellRecord]: ...

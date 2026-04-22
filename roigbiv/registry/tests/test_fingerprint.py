@@ -1,77 +1,85 @@
+"""Tests for the v3 footprint-derived fingerprint."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from roigbiv.registry.fingerprint import (
-    CellFeature,
+    FINGERPRINT_VERSION,
     compute_fingerprint,
-    deserialize_cells,
+    deserialize_centroids,
     deserialize_mean_m,
-    downsample,
+    deserialize_merged_masks,
 )
 
 
-def _synthetic_cells(n: int = 5) -> list[CellFeature]:
-    rng = np.random.default_rng(0)
-    out = []
-    for i in range(n):
-        out.append(CellFeature(
-            local_label_id=i + 1,
-            centroid_y=float(rng.uniform(10, 200)),
-            centroid_x=float(rng.uniform(10, 200)),
-            area=int(rng.integers(40, 200)),
-            solidity=float(rng.uniform(0.7, 1.0)),
-            eccentricity=float(rng.uniform(0.0, 0.9)),
-            nuclear_shadow_score=float(rng.uniform(0.0, 0.5)),
-        ))
+def _mask_image(H: int, W: int, centers: list[tuple[int, int]]) -> np.ndarray:
+    out = np.zeros((H, W), dtype=np.uint16)
+    yy, xx = np.ogrid[:H, :W]
+    for lbl, (cy, cx) in enumerate(centers, start=1):
+        out[((yy - cy) ** 2 + (xx - cx) ** 2) <= 4] = lbl
     return out
 
 
-def test_fingerprint_is_deterministic():
-    rng = np.random.default_rng(42)
-    img = rng.normal(size=(256, 256)).astype(np.float32)
-    cells = _synthetic_cells()
-    a = compute_fingerprint(img, cells)
-    b = compute_fingerprint(img, cells)
+def _mean_m(shape):
+    return np.random.default_rng(0).standard_normal(shape).astype(np.float32)
+
+
+def test_fingerprint_version_is_3():
+    assert FINGERPRINT_VERSION == 3
+
+
+def test_fingerprint_deterministic_across_calls():
+    mask = _mask_image(16, 16, [(4, 4), (10, 10)])
+    mean_m = _mean_m((16, 16))
+    a = compute_fingerprint(mask, mean_m)
+    b = compute_fingerprint(mask, mean_m)
+    assert a.fingerprint_hash == b.fingerprint_hash
+    assert a.fingerprint_version == 3
+
+
+def test_fingerprint_hash_ignores_mean_projection():
+    mask = _mask_image(16, 16, [(4, 4), (10, 10)])
+    a = compute_fingerprint(mask, _mean_m((16, 16)))
+    b = compute_fingerprint(mask, _mean_m((16, 16)) + 100.0)
     assert a.fingerprint_hash == b.fingerprint_hash
 
 
-def test_fingerprint_changes_on_image_edit():
-    rng = np.random.default_rng(1)
-    img = rng.normal(size=(256, 256)).astype(np.float32)
-    cells = _synthetic_cells()
-    a = compute_fingerprint(img, cells)
-    img2 = img.copy()
-    img2[0, 0] += 10_000.0
-    b = compute_fingerprint(img2, cells)
+def test_fingerprint_hash_changes_with_centroid_shift():
+    mask_a = _mask_image(16, 16, [(4, 4), (10, 10)])
+    mask_b = _mask_image(16, 16, [(5, 4), (10, 10)])  # shifted one pixel
+    mean_m = _mean_m((16, 16))
+    a = compute_fingerprint(mask_a, mean_m)
+    b = compute_fingerprint(mask_b, mean_m)
     assert a.fingerprint_hash != b.fingerprint_hash
 
 
-def test_fingerprint_changes_on_cell_drop():
-    rng = np.random.default_rng(2)
-    img = rng.normal(size=(128, 128)).astype(np.float32)
-    cells = _synthetic_cells()
-    a = compute_fingerprint(img, cells)
-    b = compute_fingerprint(img, cells[:-1])
-    assert a.fingerprint_hash != b.fingerprint_hash
+def test_fingerprint_blob_roundtrip():
+    mask = _mask_image(12, 12, [(3, 3), (8, 9)])
+    mean_m = _mean_m((12, 12))
+    fp = compute_fingerprint(mask, mean_m)
+
+    np.testing.assert_array_equal(deserialize_merged_masks(fp.merged_masks_blob), mask)
+    np.testing.assert_allclose(deserialize_mean_m(fp.mean_m_blob), mean_m)
+    cent = deserialize_centroids(fp.centroids_blob)
+    assert cent.shape == (2, 2)
+    np.testing.assert_array_equal(cent, fp.centroids)
 
 
-def test_downsample_shape():
-    img = np.random.rand(500, 500).astype(np.float32)
-    ds = downsample(img)
-    assert ds.shape == (64, 64)
+def test_fingerprint_empty_mask():
+    mask = np.zeros((8, 8), dtype=np.uint16)
+    mean_m = np.zeros((8, 8), dtype=np.float32)
+    fp = compute_fingerprint(mask, mean_m)
+    assert fp.label_ids.shape == (0,)
+    assert fp.centroids.shape == (0, 2)
+    assert fp.areas.shape == (0,)
+    assert isinstance(fp.fingerprint_hash, str)
+    assert len(fp.fingerprint_hash) == 64
 
 
-def test_roundtrip_serialization():
-    rng = np.random.default_rng(3)
-    img = rng.normal(size=(96, 96)).astype(np.float32)
-    cells = _synthetic_cells(7)
-    fp = compute_fingerprint(img, cells)
-    restored_img = deserialize_mean_m(fp.mean_m_blob)
-    np.testing.assert_allclose(restored_img, img, rtol=1e-5)
-    restored_cells = deserialize_cells(fp.centroid_blob)
-    assert len(restored_cells) == len(cells)
-    for a, b in zip(cells, restored_cells):
-        assert a.local_label_id == b.local_label_id
-        assert abs(a.centroid_y - b.centroid_y) < 1e-3
-        assert abs(a.centroid_x - b.centroid_x) < 1e-3
+def test_fingerprint_rejects_shape_mismatch():
+    with pytest.raises(ValueError, match="shape"):
+        compute_fingerprint(
+            np.zeros((8, 8), dtype=np.uint16),
+            np.zeros((10, 10), dtype=np.float32),
+        )
