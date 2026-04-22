@@ -237,11 +237,48 @@ def _process_one(
             log(f"  WARNING: registry call failed — "
                 f"{type(exc).__name__}: {exc}")
 
+    # Single-shot traces/ bundle write — after registry so the sidecar can
+    # carry session_id / fov_id / global_cell_id in one deterministic pass.
+    try:
+        _write_traces_bundle(fov, cfg, workspace, registry, log)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARNING: traces bundle write failed — "
+            f"{type(exc).__name__}: {exc}")
+
     return FOVRunResult(
         tif=tif, output_dir=out_dir,
         duration_s=duration, fov=fov,
         registry=registry, roi_counts=counts,
     )
+
+
+def _write_traces_bundle(
+    fov: FOVData,
+    cfg: PipelineConfig,
+    workspace: "WorkspacePaths",
+    registry_report: Optional[dict],
+    log: "LogCallback",
+) -> None:
+    """Write ``{out_dir}/traces/`` for the pynapse handoff. See traces_io."""
+    from roigbiv.pipeline.traces_io import finalize_fov_bundle
+
+    if fov.F_raw is None or fov.F_neu is None or fov.F_corrected is None:
+        log("  traces: skipped (no trace matrices on FOVData)")
+        return
+    rois_sorted = sorted(fov.rois, key=lambda r: int(r.label_id))
+    finalize_fov_bundle(
+        rois_sorted,
+        fov.F_raw,
+        fov.F_neu,
+        fov.F_corrected,
+        fov.output_dir,
+        cfg,
+        registry_report=registry_report,
+        data_bin_path=fov.data_bin_path,
+        fov_shape=tuple(fov.shape),
+        workspace_root=workspace.input_root,
+    )
+    log(f"  traces: wrote {fov.output_dir}/traces/")
 
 
 def _build_config(output_dir: Path, overrides: dict) -> PipelineConfig:

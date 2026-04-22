@@ -570,6 +570,12 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         review_queue, overlap_groups, output_dir, cfg,
         stage_timings, warnings, subtraction_summary,
     )
+    # Stash trace matrices on the FOVData so downstream callers (registry +
+    # traces_io.finalize_fov_bundle) can write the pynapse-facing bundle once
+    # the registry decision is known.
+    fov.F_raw = F_raw
+    fov.F_neu = F_neu
+    fov.F_corrected = F_corrected
     stage_timings["hitl_s"] = time.time() - t_start
 
     if warnings:
@@ -598,7 +604,14 @@ def main():
     parser.add_argument("--input", required=True, type=Path,
                         help="Path to raw *.tif or motion-corrected *_mc.tif stack")
     parser.add_argument("--fs", required=True, type=float,
-                        help="Acquisition frame rate (Hz)")
+                        help=("Effective frame rate (Hz) of the stack being "
+                              "processed. For 4x-averaged 30 Hz acquisitions "
+                              "pass 7.5."))
+    parser.add_argument("--frame-averaging", dest="frame_averaging",
+                        type=int, default=1,
+                        help=("Temporal binning factor that produced --fs "
+                              "(default 1 = un-averaged). Recorded in "
+                              "traces_meta.json for pynapse handoff."))
     parser.add_argument("--model", type=str, default="models/deployed/current_model",
                         help="Cellpose model path or built-in name (default: deployed fine-tune)")
     parser.add_argument("--tau", type=float, default=1.0,
@@ -627,6 +640,7 @@ def main():
         workspace = resolve_workspace(args.input)
         overrides = {
             "fs": args.fs,
+            "frame_averaging": args.frame_averaging,
             "tau": args.tau,
             "k_background": args.k,
             "cellpose_model": args.model,
@@ -642,6 +656,7 @@ def main():
 
     cfg = PipelineConfig(
         fs=args.fs,
+        frame_averaging=args.frame_averaging,
         tau=args.tau,
         k_background=args.k,
         cellpose_model=args.model,
@@ -651,12 +666,18 @@ def main():
 
     fov = run_pipeline(args.input, cfg)
 
+    report = None
     if args.registry:
-        _register_fov_after_pipeline(args.input, fov)
+        report = _register_fov_after_pipeline(args.input, fov)
+    _write_traces_bundle(fov, cfg, registry_report=report)
 
 
-def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> None:
-    """Call the registry with the live FOVData after `run_pipeline` returns."""
+def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":
+    """Call the registry with the live FOVData after `run_pipeline` returns.
+
+    Returns the registry report dict, or ``None`` if the registry call was
+    skipped (no mean_M or no non-rejected ROIs).
+    """
     from roigbiv.registry import (
         RegistryConfig,
         build_adapter_config,
@@ -669,12 +690,12 @@ def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> None:
 
     if fov.mean_M is None:
         print("WARN: fov.mean_M is None; skipping registry.", flush=True)
-        return
+        return None
 
     merged_masks = _build_merged_masks(fov)
     if merged_masks is None or int((merged_masks > 0).any()) == 0:
         print("WARN: no non-rejected ROIs on this FOV; skipping registry.", flush=True)
-        return
+        return None
 
     stem = Path(tif_path).stem.replace("_mc", "")
     cfg = RegistryConfig.from_env()
@@ -714,6 +735,39 @@ def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> None:
     elif decision == "review":
         print(f"Registry: review band (posterior={posterior:.3f}); "
               "no session written — resolve in Streamlit.", flush=True)
+    return report
+
+
+def _write_traces_bundle(
+    fov: FOVData,
+    cfg: PipelineConfig,
+    *,
+    registry_report: "dict | None" = None,
+) -> None:
+    """Write the canonical ``traces/`` bundle for pynapse handoff.
+
+    Called unconditionally after ``run_pipeline`` (and after any registry
+    call) so both classic and workspace modes produce ``traces/`` by default.
+    No-op if the pipeline produced no traces (empty FOV / extraction skipped).
+    """
+    from roigbiv.pipeline.traces_io import finalize_fov_bundle
+
+    if fov.F_raw is None or fov.F_neu is None or fov.F_corrected is None:
+        print("WARN: no trace matrices on FOVData; skipping traces bundle.",
+              flush=True)
+        return
+    rois_sorted = sorted(fov.rois, key=lambda r: int(r.label_id))
+    finalize_fov_bundle(
+        rois_sorted,
+        fov.F_raw,
+        fov.F_neu,
+        fov.F_corrected,
+        fov.output_dir,
+        cfg,
+        registry_report=registry_report,
+        data_bin_path=fov.data_bin_path,
+        fov_shape=tuple(fov.shape),
+    )
 
 
 def _build_merged_masks(fov: FOVData) -> "np.ndarray | None":

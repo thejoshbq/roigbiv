@@ -137,6 +137,13 @@ class FOVData:
     # consumed by the napari viewer and by the Stage 4 TIFF exports.
     corr_contrast_maps: dict = field(default_factory=dict)  # {"fast": (H,W) float32, "medium": ..., "slow": ...}
 
+    # Trace matrices populated at the end of run_pipeline (rows aligned to
+    # rois sorted by label_id). Consumed by traces_io.finalize_fov_bundle
+    # after the optional registry step.
+    F_raw: Optional[np.ndarray] = None
+    F_neu: Optional[np.ndarray] = None
+    F_corrected: Optional[np.ndarray] = None
+
 
 @dataclass
 class PipelineConfig:
@@ -151,7 +158,8 @@ class PipelineConfig:
     batch_size: int = 500                   # Suite2p registration batch
     nonrigid: bool = True
     do_registration: bool = False           # *_mc.tif inputs are pre-corrected
-    fs: float = 30.0                        # user-required via CLI
+    fs: float = 30.0                        # user-required via CLI; effective Hz (after frame averaging)
+    frame_averaging: int = 1                # temporal binning factor that produced fs (1 = un-averaged)
     tau: float = 1.0                        # GCaMP6s
     svd_bin_frames: int = 5000              # target binned frame count
     reconstruct_chunk: int = 500            # temporal chunk size for L+S streaming

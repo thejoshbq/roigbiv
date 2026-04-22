@@ -24,6 +24,7 @@ import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.pipeline.corrections import CorrectionOp
+from roigbiv.pipeline.traces_io import compute_corrections_rev
 from roigbiv.ui.components.figure import build_roi_figure
 from roigbiv.ui.components.sidebar import segmented, workspace_summary_card
 from roigbiv.ui.services.app_state import get_app_state
@@ -34,6 +35,7 @@ from roigbiv.ui.services.corrections_session import (
 )
 from roigbiv.ui.services.loaders import load_fov_bundle
 from roigbiv.ui.services.registry_service import list_fovs, list_sessions_for_fov
+from roigbiv.ui.services.traces_runner import get_traces_runner
 
 
 # ── layout ─────────────────────────────────────────────────────────────────
@@ -122,7 +124,9 @@ def _commit_card() -> dbc.Card:
         html.P(
             "Commit writes corrections.jsonl + corrected_masks.tif alongside "
             "the pipeline outputs. Re-register runs the cross-session matcher "
-            "against the corrected artifacts.",
+            "against the corrected artifacts. Re-extract traces rebuilds the "
+            "per-ROI calcium traces from the corrected ROI set and writes "
+            "them to a revision-scoped sibling under traces/.",
             className="text-muted small",
         ),
         dbc.ButtonGroup([
@@ -131,8 +135,14 @@ def _commit_card() -> dbc.Card:
                        color="success", size="sm"),
             dbc.Button("Re-register", id="roigbiv-review-reregister",
                        color="primary", size="sm"),
+            dbc.Button("Re-extract traces",
+                       id="roigbiv-review-reextract",
+                       color="info", size="sm"),
         ]),
         html.Div(id="roigbiv-review-commit-output", className="mt-2"),
+        html.Div(id="roigbiv-review-reextract-output", className="mt-2"),
+        dcc.Interval(id="roigbiv-review-reextract-tick",
+                     interval=1500, disabled=True),
     ]))
 
 
@@ -307,6 +317,70 @@ def register_callbacks(app: dash.Dash) -> None:
         summary = sess.summary()
         return (no_update, _render_pending_ops(sess.pending),
                 _status_banner(summary))
+
+    @app.callback(
+        Output("roigbiv-review-reextract-output", "children",
+               allow_duplicate=True),
+        Output("roigbiv-review-reextract-tick", "disabled",
+               allow_duplicate=True),
+        Input("roigbiv-review-reextract", "n_clicks"),
+        State("roigbiv-review-output-dir", "data"),
+        prevent_initial_call=True,
+    )
+    def _start_reextract(n_clicks, output_dir):
+        if not n_clicks:
+            return no_update, no_update
+        if not output_dir:
+            return (dbc.Alert("Select a session first.", color="warning"),
+                    True)
+        sess = get_corrections_session(Path(output_dir))
+        rois_corrected = sess.corrected_rois()
+        if not rois_corrected:
+            return (dbc.Alert(
+                "No corrected ROIs yet — commit a correction first.",
+                color="warning"), True)
+        rev = compute_corrections_rev(rois_corrected)
+        target = Path(output_dir) / "traces" / f"corrections-{rev}"
+        if (target / "traces_meta.json").exists():
+            return (dbc.Alert(
+                f"Already extracted: traces/corrections-{rev}/ (no-op).",
+                color="secondary"), True)
+        runner = get_traces_runner()
+        started = runner.start(Path(output_dir))
+        if not started:
+            return (dbc.Alert(
+                "Another re-extract is in flight; wait for it to finish.",
+                color="warning"), True)
+        return (dbc.Alert(
+            f"Re-extract started for corrections-{rev}. This can take "
+            f"several minutes for large movies.",
+            color="info"), False)
+
+    @app.callback(
+        Output("roigbiv-review-reextract-output", "children",
+               allow_duplicate=True),
+        Output("roigbiv-review-reextract-tick", "disabled",
+               allow_duplicate=True),
+        Input("roigbiv-review-reextract-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _poll_reextract(_n):
+        runner = get_traces_runner()
+        snap = runner.snapshot()
+        if snap.active:
+            msg = "Re-extracting traces..."
+            if snap.logs:
+                msg += "  " + snap.logs[-1]
+            return dbc.Alert(msg, color="info"), False
+        # not active → stop polling
+        if snap.error:
+            return (dbc.Alert(f"Re-extract failed: {snap.error}",
+                              color="danger"), True)
+        if snap.target_dir:
+            return (dbc.Alert(
+                f"Re-extract complete: wrote {snap.target_dir}",
+                color="success"), True)
+        return no_update, True
 
     @app.callback(
         Output("roigbiv-review-selected-roi", "data"),

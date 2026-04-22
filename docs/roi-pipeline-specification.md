@@ -1165,6 +1165,77 @@ computation
 | `spks.npy` | Deconvolved spike estimates | (N_rois, T) float32 |
 | `F_bandpass.npy` | Bandpass-filtered traces (for tonic ROIs) | (N_tonic, T) float32 |
 | `pipeline_log.json` | Run parameters, k value, ROI counts per stage, diagnostics | dict |
+| `traces/traces.npy` | Neuropil-corrected traces, pynapse-facing primary | (N_rois, T) float32 |
+| `traces/traces_raw.npy` | Raw fluorescence, same row order as `traces.npy` | (N_rois, T) float32 |
+| `traces/traces_neuropil.npy` | Neuropil estimate, same row order | (N_rois, T) float32 |
+| `traces/traces_meta.json` | Row→(session_id, fov_id, local_label_id, global_cell_id?) map, fs, frame_averaging, provenance | dict |
+| `traces/corrections-{hash12}/…` | Revision-scoped bundle produced by HITL re-extract (same four files) | — |
+
+### 17.1.1 Trace Persistence & Pynapse Handoff
+
+The `traces/` bundle is the pynapse-facing contract. Pynapse's
+`SignalRecording` loads the `.npy` directly and identifies neurons by row
+index only, so the row→ID mapping lives in the sidecar.
+
+**Row-ordering contract.** Row `K` of every `.npy` in `traces/` (and of
+`roi_metadata.json`) corresponds to the ROI at position `K` in
+`rois_sorted` (sorted by `label_id`). The same ROI's label appears at the
+matching integer value in `merged_masks.tif`.
+
+**Frame-rate convention.** `PipelineConfig.fs` (and the sidecar's `fs`
+field) is the **effective** rate — i.e. the rate of the frames actually
+stored in `traces.npy` (7.5 Hz for the reference 4×-averaged 30 Hz stack).
+`frame_averaging` is the temporal binning factor that produced `fs`. To
+hand this off to pynapse, whose `Sample.fps` expects the raw acquisition
+rate, pass `fps = meta["fs"] * meta["frame_averaging"]` (pynapse computes
+`effective_fps = fps / frame_averaging` — matching `meta["fs"]` exactly).
+`fs` and `frame_averaging` come from `PipelineConfig` and are never
+inferred from file timestamps.
+
+**`rois[]` schema.** Each entry is
+`{row_index, local_label_id, source_stage, gate_outcome, confidence,
+  activity_type?, global_cell_id?}`. `global_cell_id` is **omitted** —
+not `null` — when the FOV is unregistered or the row is a fresh HITL
+label. Top-level `session_id` / `fov_id` / `registry_decision` are `null`
+when the pipeline ran without `--registry` or the registry returned the
+`review` decision.
+
+**Determinism.** `traces_meta.json` is written with `sort_keys=True`, no
+wall-clock fields, and ROI order locked by `label_id`. Rerunning the
+pipeline on the same inputs with the same registry state produces a
+byte-identical sidecar.
+
+**HITL re-extract.** `roigbiv.pipeline.reextract.reextract_from_corrections`
+reads `corrections/corrected_masks.tif` + `corrections/corrections.jsonl`,
+computes a 12-char `corrections_rev` from the replayed ROI set (not the
+JSONL bytes — that makes the hash stable under undo/redo), and writes a
+full bundle to `traces/corrections-{rev}/`. The primary `traces.npy` is
+never mutated. Identifiers (`session_id`, `fov_id`, per-row
+`global_cell_id`) are inherited from the primary sidecar for ROIs that
+survived corrections with their original `label_id`; fresh labels minted
+by `add` / `merge` / `split` get no `global_cell_id` (re-extract never
+writes to the registry DB).
+
+**Example (pynapse).**
+
+```python
+from pynapse.core.io.microscopy import SignalRecording
+from pynapse.core.sample import Sample
+import json
+
+meta = json.load(open("traces/traces_meta.json"))
+sig = SignalRecording(source="traces/traces.npy")
+sample = Sample(
+    event_data=<REACHER event log>,
+    signal_data=sig,
+    fps=meta["fs"] * meta["frame_averaging"],
+    frame_averaging=meta["frame_averaging"],
+)
+# sample.effective_fps == meta["effective_fps"] == meta["fs"]
+# rows: row K ↔ meta["rois"][K]["local_label_id"] ↔ (optionally) global_cell_id
+```
+
+See `scripts/roigbiv_to_pynapse.py` for a runnable version.
 
 ### 17.2 Stage-Wise ROI Count Log
 
