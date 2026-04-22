@@ -613,7 +613,32 @@ def main():
                         help=("Register/match this FOV against the cross-session "
                               "registry (SQLite under inference/registry.db by "
                               "default; override with ROIGBIV_REGISTRY_DSN)."))
+    parser.add_argument("--workspace", action="store_true",
+                        help=("Run in workspace mode: outputs go under "
+                              "<input_root>/output/{stem}/, the registry lives "
+                              "in <input_root>/registry.db, and alembic "
+                              "upgrade + backfill are performed automatically. "
+                              "Overrides --output-dir and --registry."))
     args = parser.parse_args()
+
+    if args.workspace:
+        from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
+
+        workspace = resolve_workspace(args.input)
+        overrides = {
+            "fs": args.fs,
+            "tau": args.tau,
+            "k_background": args.k,
+            "cellpose_model": args.model,
+            "no_viewer": True,   # workspace flow is non-interactive
+        }
+        results = run_with_workspace(
+            workspace, overrides, log_cb=lambda m: print(m, flush=True),
+        )
+        failures = [r for r in results if r.error]
+        if failures:
+            raise SystemExit(1)
+        return
 
     cfg = PipelineConfig(
         fs=args.fs,

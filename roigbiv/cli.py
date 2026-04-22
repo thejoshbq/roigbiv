@@ -122,6 +122,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                               "pass the password on the command line."))
     parser.add_argument("--no-email", action="store_true",
                         help="Skip sending email even when --email-to is set.")
+    parser.add_argument("--workspace", action="store_true",
+                        help=("Run in workspace mode: outputs go under "
+                              "<input_root>/output/{stem}/ and the registry "
+                              "lives in <input_root>/registry.db. Migrate + "
+                              "backfill run automatically. Overrides "
+                              "--output-dir."))
 
     args = parser.parse_args(argv)
 
@@ -475,8 +481,84 @@ def _fmt_duration(seconds: float) -> str:
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
+def _run_workspace(args: argparse.Namespace) -> int:
+    """Workspace mode: in-input output/ + registry.db + auto-migrate + backfill.
+
+    Sequential (ignores --n-workers); still wires email if requested.
+    """
+    from roigbiv import overlay as _overlay
+    from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
+
+    try:
+        workspace = resolve_workspace(args.input)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    model_name = Path(_resolve_model(args.model)).name
+    overrides = {
+        "fs": args.fs,
+        "tau": args.tau,
+        "k_background": args.k,
+        "cellpose_model": _resolve_model(args.model),
+        "diameter": args.diameter,
+        "cellprob_threshold": args.cellprob_threshold,
+        "flow_threshold": args.flow_threshold,
+        "channels": args.channels,
+    }
+    ws_results = run_with_workspace(
+        workspace, overrides, log_cb=lambda m: print(m, flush=True),
+    )
+
+    fov_results: list[_FOVResult] = []
+    for wr in ws_results:
+        fov_stem = wr.tif.stem.replace("_mc", "")
+        png_path: Optional[Path] = None
+        if wr.fov is not None:
+            try:
+                png_path = _overlay.render_overlay(
+                    fov=wr.fov,
+                    output_dir=wr.output_dir,
+                    model_name=model_name,
+                    fov_stem=fov_stem,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                print(f"WARN: overlay render failed for {fov_stem}: {exc}",
+                      file=sys.stderr)
+        fov_results.append(_FOVResult(
+            tif=wr.tif, output_dir=wr.output_dir,
+            fov=wr.fov, png_path=png_path,
+            duration_s=wr.duration_s, error=wr.error,
+            roi_counts=wr.roi_counts,
+        ))
+
+    successes = [r for r in fov_results if r.error is None]
+    failures = [r for r in fov_results if r.error is not None]
+    print("\n=== Summary ===", flush=True)
+    for r in fov_results:
+        if r.error is not None:
+            print(f"  {r.tif.name}: FAILED — {r.error}")
+        else:
+            c = r.roi_counts
+            png = r.png_path.name if r.png_path else "<no overlay>"
+            print(
+                f"  {r.tif.name}: accept={c.get('accept', 0)} "
+                f"flag={c.get('flag', 0)} reject={c.get('reject', 0)}  "
+                f"[{_fmt_duration(r.duration_s)}]  → {png}"
+            )
+    print(f"{len(successes)} succeeded, {len(failures)} failed.", flush=True)
+
+    if args.email_to and not args.no_email and successes:
+        _send_email(fov_results, args)
+
+    return 0 if successes else 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+
+    if args.workspace:
+        return _run_workspace(args)
 
     try:
         tifs = _iter_inputs(args.input)

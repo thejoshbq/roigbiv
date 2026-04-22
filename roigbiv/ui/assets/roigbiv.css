@@ -1,0 +1,47 @@
+/* ROIGBIV Dash UI — minimal overrides on top of the Flatly dbc theme. */
+
+.roigbiv-brand {
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    font-size: 1.2rem;
+}
+.roigbiv-brand-accent {
+    background: linear-gradient(90deg, #e74c3c, #f39c12, #f1c40f, #2ecc71, #3498db, #9b59b6);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+.roigbiv-navbar {
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    backdrop-filter: blur(4px);
+}
+.roigbiv-card-accent {
+    border-left: 4px solid #18bc9c;
+}
+.roigbiv-muted-code {
+    font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    background: rgba(0, 0, 0, 0.04);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+}
+.roigbiv-log-stream {
+    font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.80rem;
+    background: #2f3640;
+    color: #ecf0f1;
+    padding: 0.75rem 0.9rem;
+    border-radius: 6px;
+    max-height: 18rem;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+.roigbiv-segmented .btn {
+    font-size: 0.85rem;
+}
+.roigbiv-panel-section + .roigbiv-panel-section {
+    margin-top: 1.25rem;
+}
+.roigbiv-tooltip-table td {
+    padding: 0.1rem 0.5rem;
+}
