@@ -89,6 +89,7 @@ def resolve_workspace(input_path: Path) -> WorkspacePaths:
             t for t in all_tifs
             if output_root not in t.resolve().parents
         ]
+        tif_list = _dedup_mc_pairs(tif_list)
 
     if not tif_list:
         raise FileNotFoundError(
@@ -103,6 +104,30 @@ def resolve_workspace(input_path: Path) -> WorkspacePaths:
         blob_root=input_root / "registry_blobs",
         calibration_path=input_root / "registry_calibration.json",
     )
+
+
+def _dedup_mc_pairs(tifs: list[Path]) -> list[Path]:
+    """Collapse ``foo.tif`` + ``foo_mc.tif`` pairs to a single entry.
+
+    The pipeline maps both variants to the same output stem
+    (``_process_one`` strips ``_mc`` — see stem derivation below), so
+    processing both doubles the registry session rows for the same FOV.
+    When both exist we keep the ``_mc`` file because the pipeline is
+    designed around motion-corrected input (see CLAUDE.md §Conventions).
+    """
+    by_stem: dict[str, Path] = {}
+    for t in tifs:
+        stem = t.stem.replace("_mc", "")
+        incumbent = by_stem.get(stem)
+        if incumbent is None:
+            by_stem[stem] = t
+            continue
+        # Prefer the _mc variant when both raw and motion-corrected exist.
+        incumbent_is_mc = incumbent.stem.endswith("_mc")
+        candidate_is_mc = t.stem.endswith("_mc")
+        if candidate_is_mc and not incumbent_is_mc:
+            by_stem[stem] = t
+    return sorted(by_stem.values())
 
 
 def configure_registry_env(workspace: WorkspacePaths) -> None:
@@ -371,6 +396,9 @@ def _format_registry_decision(decision: str, report: dict,
     if decision == "new_fov":
         return (f"  registry: new_fov fov_id={report.get('fov_id')} "
                 f"({report.get('n_new_cells', 0)} cells)")
+    if decision == "already_registered":
+        return (f"  registry: already_registered fov_id={report.get('fov_id')} "
+                f"(no-op)")
     if decision in ("auto_match", "hash_match"):
         post = f"{posterior:.3f}" if posterior is not None else "n/a"
         return (f"  registry: {decision} fov_id={report.get('fov_id')} "

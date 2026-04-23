@@ -130,3 +130,39 @@ def test_unrelated_fov_mints_new_because_candidates_mismatch_animal(tmp_path: Pa
     assert r2["decision"] == "new_fov"
     assert r2["fov_id"] != store.list_fovs()[0].fov_id or len(store.list_fovs()) == 2
     assert len(store.list_fovs()) == 2
+
+
+def test_repeat_call_on_same_output_dir_is_idempotent(tmp_path: Path):
+    """Calling register_or_match twice with the same output_dir writes one session row.
+
+    This guards the workspace flow: the pipeline's per-TIF pass registers a
+    session, then ``_safety_backfill`` sweeps the same output dirs — without
+    idempotency that would double every session.
+    """
+    store, blob = _build_backends(tmp_path)
+    query = _session("q", [(16, 16), (32, 32), (48, 48)])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    r1 = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1",
+        query=query,
+        output_dir=out_dir,
+        store=store,
+        blob_store=blob,
+    )
+    assert r1["decision"] == "new_fov"
+    fov_id = r1["fov_id"]
+    assert len(store.list_sessions(fov_id)) == 1
+
+    r2 = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1",
+        query=query,
+        output_dir=out_dir,
+        store=store,
+        blob_store=blob,
+    )
+    assert r2["decision"] == "already_registered"
+    assert r2["fov_id"] == fov_id
+    assert r2["session_id"] == r1["session_id"]
+    assert len(store.list_sessions(fov_id)) == 1
+    assert len(store.list_fovs()) == 1

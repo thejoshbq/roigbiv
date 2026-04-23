@@ -194,6 +194,23 @@ class SQLAlchemyStore:
             ).all()
             return [_session_to_record(r) for r in rows]
 
+    def get_session_by_output_dir(
+        self, output_dir: str
+    ) -> Optional[SessionRecord]:
+        """Return the most recent session row keyed to ``output_dir``.
+
+        Multiple rows can exist during the transition window before the
+        workspace DB has been deduped; callers treat the newest one as
+        authoritative.
+        """
+        with self._Session() as s:
+            row = s.scalars(
+                select(m.Session)
+                .where(m.Session.output_dir == output_dir)
+                .order_by(m.Session.created_at.desc())
+            ).first()
+            return _session_to_record(row) if row else None
+
     # ── Cell ──────────────────────────────────────────────────────────────
     def insert_cell(self, cell: CellRecord) -> None:
         with self._Session() as s:

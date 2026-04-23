@@ -112,6 +112,18 @@ def register_or_match(
 
     fp = compute_fingerprint(query.merged_masks, query.mean_m)
 
+    # 0. Idempotency guard — if a session row already points at this exact
+    #    output_dir and the FOV it's tied to still carries the same
+    #    fingerprint hash we're about to register, this is a duplicate call
+    #    (backfill re-registering what the per-TIF pass already wrote, or a
+    #    user running `roigbiv-registry match` twice on the same directory).
+    #    Short-circuit: no DB writes, return the cached report.
+    existing_report = _load_idempotent_report(
+        store=store, output_dir=output_dir, fingerprint_hash=fp.fingerprint_hash
+    )
+    if existing_report is not None:
+        return existing_report
+
     # 1. Hash pre-filter — exact re-run shortcut.
     hit = store.get_fov_by_hash(fp.fingerprint_hash)
     if hit is not None:
@@ -219,6 +231,54 @@ def register_or_match(
         best_match_result=best_result,
     )
     return _write_report(output_dir, report)
+
+
+# ── Idempotency ────────────────────────────────────────────────────────────
+
+
+def _load_idempotent_report(
+    *,
+    store: RegistryStore,
+    output_dir: Path,
+    fingerprint_hash: str,
+) -> Optional[dict]:
+    """Detect a duplicate ``register_or_match`` call and return a cached report.
+
+    A call is considered a duplicate when:
+      1. a session row already exists with the same ``output_dir``, AND
+      2. the FOV it points at still carries the same fingerprint hash we're
+         about to register (i.e. the outputs on disk haven't been overwritten
+         with different masks since the row was written).
+
+    When both hold we reuse the persisted ``registry_match.json`` in
+    ``output_dir`` and stamp the decision as ``already_registered`` so callers
+    can log the no-op. If the cached report can't be read, we synthesize a
+    minimal one from the DB so downstream code keeps a consistent shape.
+    """
+    existing = store.get_session_by_output_dir(str(output_dir))
+    if existing is None:
+        return None
+    fov = store.get_fov(existing.fov_id)
+    if fov is None or fov.fingerprint_hash != fingerprint_hash:
+        return None
+
+    cached_path = Path(output_dir) / "registry_match.json"
+    report: dict
+    if cached_path.exists():
+        try:
+            report = json.loads(cached_path.read_text())
+        except Exception:  # noqa: BLE001
+            report = {}
+    else:
+        report = {}
+
+    report.update({
+        "decision": "already_registered",
+        "fov_id": existing.fov_id,
+        "session_id": existing.session_id,
+        "fingerprint_hash": fingerprint_hash,
+    })
+    return report
 
 
 # ── Candidate loading ──────────────────────────────────────────────────────

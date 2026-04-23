@@ -5,8 +5,9 @@ of pipeline outputs (``merged_masks.tif`` + ``summary/mean_M.tif``), parses
 their filename metadata, sorts by ``(session_date, stem)``, and calls
 :func:`register_or_match` on each in chronological order.
 
-Because :func:`register_or_match` is idempotent for the hash-pre-filter
-shortcut, re-running the backfill on an already-populated registry is safe.
+Re-running the backfill is safe: :func:`register_or_match` short-circuits to
+an ``already_registered`` no-op when a session row already points at the
+output dir and carries the same fingerprint hash.
 """
 from __future__ import annotations
 

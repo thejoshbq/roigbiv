@@ -6,6 +6,7 @@ Subcommands:
   match       — retroactively match a single output dir (no re-run)
   track       — longitudinal trace across sessions for one global_cell_id
   backfill    — walk inference/pipeline/ and register every FOV present
+  dedupe      — collapse duplicate session rows (legacy workspace cleanup)
   migrate     — run `alembic upgrade head` against the active DSN
 """
 from __future__ import annotations
@@ -62,6 +63,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     bf.add_argument("--dry-run", action="store_true",
                     help="Report what would happen without mutating state.")
 
+    dedupe = sub.add_parser(
+        "dedupe",
+        help="Collapse duplicate session rows keyed by (fov_id, output_dir).",
+    )
+    dedupe.add_argument("--dry-run", action="store_true",
+                        help="Report what would be deleted without mutating state.")
+
     sub.add_parser("migrate", help="Run `alembic upgrade head` against the DSN.")
 
     args = parser.parse_args(argv)
@@ -76,6 +84,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cmd_track(args.global_cell_id)
     if args.cmd == "backfill":
         return _cmd_backfill(args.root, args.dry_run)
+    if args.cmd == "dedupe":
+        return _cmd_dedupe(args.dry_run)
     if args.cmd == "migrate":
         return _cmd_migrate()
     return 2
@@ -210,6 +220,19 @@ def _cmd_backfill(root: Path, dry_run: bool) -> int:
                 print(f"rev  {r['stem']}  p={posterior:.3f}")
             else:
                 print(f"{dec}  {r.get('stem', '?')}")
+    return 0
+
+
+def _cmd_dedupe(dry_run: bool) -> int:
+    from roigbiv.registry.dedupe import dedupe_from_env
+
+    summary = dedupe_from_env(dry_run=dry_run)
+    prefix = "would delete" if dry_run else "deleted"
+    print(
+        f"dedupe: {summary.n_groups_with_duplicates} group(s) with duplicates; "
+        f"{prefix} {summary.n_session_rows_deleted} session row(s) and "
+        f"{summary.n_observation_rows_deleted} observation row(s)."
+    )
     return 0
 
 

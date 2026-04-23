@@ -13,9 +13,10 @@ The page is organised top-to-bottom in the right column:
 
 Modes (orthogonal):
 
-``geometry``  outline | fill
 ``color``     single  | stage | feature | gcid   (gcid = cross-session ID)
 ``kind``      dff     | f                          (signal for trace panels)
+
+ROIs are always rendered as outlines.
 
 URL params: ``/viewer?fov_id=<uuid>`` preselects the FOV to show.
 """
@@ -125,12 +126,6 @@ def _controls_card() -> dbc.Card:
                       className="mb-3"),
         html.H6("Signal", className="mb-2"),
         segmented("roigbiv-viewer-kind", KIND_OPTIONS, value="dff"),
-        html.H6("Geometry", className="mt-3 mb-2"),
-        segmented(
-            "roigbiv-viewer-geometry",
-            [("outline", "Outline"), ("fill", "Fill")],
-            value="outline",
-        ),
         html.H6("Color", className="mt-3 mb-2"),
         segmented(
             "roigbiv-viewer-color",
@@ -207,10 +202,9 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-viewer-title", "children"),
         Input("roigbiv-viewer-state", "data"),
         Input("roigbiv-viewer-session-check", "value"),
-        Input("roigbiv-viewer-geometry", "value"),
         Input("roigbiv-viewer-color", "value"),
     )
-    def _render_canvas(viewer_state, selected_ids, geometry, color_mode):
+    def _render_canvas(viewer_state, selected_ids, color_mode):
         if not viewer_state or "fov_id" not in viewer_state:
             return html.Em("Select a FOV to load sessions.",
                            className="text-muted"), "Viewer"
@@ -236,7 +230,6 @@ def register_callbacks(app: dash.Dash) -> None:
             date_str = s.session_date.isoformat() if s.session_date else s.session_id[:8]
             fig = build_roi_figure(
                 fb.mean_M, fb.rois,
-                geometry=geometry or "outline",
                 color_mode=color_mode or "stage",
                 title=None,
             )
