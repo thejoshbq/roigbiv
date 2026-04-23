@@ -61,6 +61,32 @@ def color_for_gcid(gcid: Optional[str]) -> str:
     return f"rgba({int(r * 255)}, {int(g * 255)}, {int(b * 255)}, {a:.2f})"
 
 
+def session_colors(n: int, *, alpha: float = 0.65) -> list[str]:
+    """Return ``n`` rgba strings sampled from viridis in chronological order.
+
+    Samples are evenly spaced in ``[0.15, 0.85]`` so both extremes stay
+    readable on a white background. For ``n <= 1`` the single color is the
+    midpoint of the palette.
+    """
+    if n <= 0:
+        return []
+    from plotly.colors import sample_colorscale
+
+    if n == 1:
+        positions = [0.5]
+    else:
+        step = (0.85 - 0.15) / (n - 1)
+        positions = [0.15 + i * step for i in range(n)]
+
+    out: list[str] = []
+    for raw in sample_colorscale("Viridis", positions):
+        # sample_colorscale returns 'rgb(r, g, b)' strings.
+        inner = raw[raw.index("(") + 1 : raw.index(")")]
+        r, g, b = (int(round(float(p.strip()))) for p in inner.split(","))
+        out.append(f"rgba({r}, {g}, {b}, {alpha:.2f})")
+    return out
+
+
 STAGE_LABELS: dict[int, str] = {
     1: "Stage 1 — Cellpose",
     2: "Stage 2 — Suite2p",

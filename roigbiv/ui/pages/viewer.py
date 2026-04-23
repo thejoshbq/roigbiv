@@ -1,10 +1,21 @@
-"""Viewer page — per-FOV multi-mode ROI overlay + cross-session comparison.
+"""Viewer page — per-FOV ROI canvas + FOV-level and ROI-level trace panels.
+
+The page is organised top-to-bottom in the right column:
+
+1. **Viewer canvas** — the mean projection + ROI overlay, one card per
+   selected session, rendered by :func:`build_roi_figure`.
+2. **FOV-level trace** — the per-session mean-of-ROIs line plot. One line
+   for a single selected session, one line per session otherwise.
+3. **ROI-level trace** — the signal trace(s) of whichever ROI the user last
+   clicked in the canvas. If the ROI carries a ``global_cell_id`` it is drawn
+   across every session on the FOV, with the source session highlighted.
+4. **ROI metadata** — the :func:`roi_panel` summary of the clicked ROI.
 
 Modes (orthogonal):
 
 ``geometry``  outline | fill
 ``color``     single  | stage | feature | gcid   (gcid = cross-session ID)
-``layout``    single  | compare                  (side-by-side sessions)
+``kind``      dff     | f                          (signal for trace panels)
 
 URL params: ``/viewer?fov_id=<uuid>`` preselects the FOV to show.
 """
@@ -22,14 +33,26 @@ from dash import Input, Output, State, dcc, html, no_update
 from roigbiv.ui.components.figure import build_roi_figure
 from roigbiv.ui.components.roi_panel import roi_panel
 from roigbiv.ui.components.sidebar import segmented, workspace_summary_card
+from roigbiv.ui.components.trace_figure import (
+    build_mean_multi,
+    build_mean_single,
+    build_roi_across_sessions,
+)
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.loaders import (
     CrossSessionBundle,
     FOVBundle,
     load_cross_session_bundle,
-    load_fov_bundle,
 )
 from roigbiv.ui.services.registry_service import list_fovs
+from roigbiv.ui.services.trace_viz import (
+    collect_cross_session_traces,
+    collect_sessions_for_fov,
+    load_session_traces,
+)
+
+
+KIND_OPTIONS = [("dff", "dF/F"), ("f", "F corrected")]
 
 
 # ── layout ─────────────────────────────────────────────────────────────────
@@ -50,6 +73,37 @@ def layout() -> html.Div:
                         className="mb-2"),
                 html.Div(id="roigbiv-viewer-canvas"),
                 html.Hr(),
+                html.H5("FOV signal — per-session mean",
+                        className="mb-2 text-muted"),
+                dcc.Graph(
+                    id="roigbiv-viewer-fov-trace",
+                    figure=_placeholder_fig("Select a FOV to load traces."),
+                    config={
+                        "displayModeBar": True,
+                        "displaylogo": False,
+                        "modeBarButtonsToRemove": ["select2d", "lasso2d",
+                                                    "autoScale2d",
+                                                    "toggleSpikelines"],
+                        "scrollZoom": True,
+                    },
+                ),
+                html.H5("ROI signal — across sessions",
+                        className="mt-4 mb-2 text-muted"),
+                dcc.Graph(
+                    id="roigbiv-viewer-roi-trace",
+                    figure=_placeholder_fig(
+                        "Click an ROI in a session above to load traces."
+                    ),
+                    config={
+                        "displayModeBar": True,
+                        "displaylogo": False,
+                        "modeBarButtonsToRemove": ["select2d", "lasso2d",
+                                                    "autoScale2d",
+                                                    "toggleSpikelines"],
+                        "scrollZoom": True,
+                    },
+                ),
+                html.Hr(),
                 html.Div(id="roigbiv-viewer-roi-detail",
                          children=roi_panel(None, None)),
             ], md=8),
@@ -69,7 +123,9 @@ def _controls_card() -> dbc.Card:
         dbc.Checklist(id="roigbiv-viewer-session-check",
                       options=[], value=[], switch=False,
                       className="mb-3"),
-        html.H6("Geometry", className="mb-2"),
+        html.H6("Signal", className="mb-2"),
+        segmented("roigbiv-viewer-kind", KIND_OPTIONS, value="dff"),
+        html.H6("Geometry", className="mt-3 mb-2"),
         segmented(
             "roigbiv-viewer-geometry",
             [("outline", "Outline"), ("fill", "Fill")],
@@ -192,23 +248,24 @@ def register_callbacks(app: dash.Dash) -> None:
             title,
         )
 
+    # Store the last-clicked ROI (session_id + local_label_id) so the metadata
+    # panel and the ROI-level trace figure can react independently.
     @app.callback(
-        Output("roigbiv-viewer-roi-detail", "children"),
+        Output("roigbiv-viewer-selected-roi", "data"),
         Input({"type": "roigbiv-session-graph", "session_id": dash.ALL},
               "clickData"),
         State("roigbiv-viewer-state", "data"),
     )
     def _on_roi_click(click_datas, viewer_state):
         if not click_datas or not viewer_state:
-            return roi_panel(None, None)
-        # Find which session was clicked most recently.
+            return no_update
         triggered = [(i, cd) for i, cd in enumerate(click_datas) if cd]
         if not triggered:
-            return roi_panel(None, None)
+            return no_update
         _, cd = triggered[-1]
         points = (cd or {}).get("points") or []
         if not points:
-            return roi_panel(None, None)
+            return no_update
         label_id: Optional[int] = None
         cd_data = points[0].get("customdata")
         if cd_data:
@@ -219,17 +276,115 @@ def register_callbacks(app: dash.Dash) -> None:
             except (TypeError, ValueError):
                 label_id = None
         if label_id is None:
-            return roi_panel(None, None)
+            return no_update
 
         triggered_id = dash.callback_context.triggered_id
         session_id = (
-            triggered_id.get("session_id") if isinstance(triggered_id, dict) else None
+            triggered_id.get("session_id")
+            if isinstance(triggered_id, dict) else None
         )
         if not session_id:
+            return no_update
+        return {"session_id": session_id, "local_label_id": int(label_id)}
+
+    @app.callback(
+        Output("roigbiv-viewer-roi-detail", "children"),
+        Input("roigbiv-viewer-selected-roi", "data"),
+        State("roigbiv-viewer-state", "data"),
+    )
+    def _render_metadata(selected_roi, viewer_state):
+        if not (selected_roi and viewer_state and viewer_state.get("fov_id")):
             return roi_panel(None, None)
-        bundle = load_cross_session_bundle(viewer_state["fov_id"])
+        session_id = selected_roi.get("session_id")
+        if session_id not in (viewer_state.get("session_ids") or []):
+            return roi_panel(None, None)
+        try:
+            bundle = load_cross_session_bundle(viewer_state["fov_id"])
+        except Exception:  # noqa: BLE001
+            return roi_panel(None, None)
         fb = bundle.bundles.get(session_id)
-        return roi_panel(fb, label_id)
+        return roi_panel(fb, int(selected_roi["local_label_id"]))
+
+    @app.callback(
+        Output("roigbiv-viewer-fov-trace", "figure"),
+        Input("roigbiv-viewer-state", "data"),
+        Input("roigbiv-viewer-session-check", "value"),
+        Input("roigbiv-viewer-kind", "value"),
+    )
+    def _render_fov_trace(viewer_state, selected_ids, kind):
+        if not (viewer_state and viewer_state.get("fov_id")):
+            return _placeholder_fig("Select a FOV to load traces.")
+        kind = kind or "dff"
+        fov_id = viewer_state["fov_id"]
+        fov_meta = _lookup_fov_meta(fov_id)
+        sel_set = set(selected_ids or [])
+        try:
+            all_sessions = collect_sessions_for_fov(fov_id, kind=kind)
+        except Exception as exc:  # noqa: BLE001
+            return _placeholder_fig(f"Error: {type(exc).__name__}: {exc}")
+        if not all_sessions:
+            return _placeholder_fig("No sessions on this FOV yet.")
+        chosen = [s for s in all_sessions if s.session_id in sel_set]
+        if not chosen:
+            chosen = all_sessions[:1]
+
+        try:
+            if len(chosen) == 1:
+                return build_mean_single(fov_meta, chosen[0])
+            return build_mean_multi(fov_meta, chosen)
+        except Exception as exc:  # noqa: BLE001
+            return _placeholder_fig(f"Error: {type(exc).__name__}: {exc}")
+
+    @app.callback(
+        Output("roigbiv-viewer-roi-trace", "figure"),
+        Input("roigbiv-viewer-selected-roi", "data"),
+        Input("roigbiv-viewer-kind", "value"),
+        State("roigbiv-viewer-state", "data"),
+    )
+    def _render_roi_trace(selected_roi, kind, viewer_state):
+        if not (selected_roi and viewer_state and viewer_state.get("fov_id")):
+            return _placeholder_fig(
+                "Click an ROI in a session above to load traces."
+            )
+        session_id = selected_roi.get("session_id")
+        if session_id not in (viewer_state.get("session_ids") or []):
+            return _placeholder_fig(
+                "Click an ROI in a session above to load traces."
+            )
+        fov_id = viewer_state["fov_id"]
+        kind = kind or "dff"
+        local_label_id = int(selected_roi["local_label_id"])
+        fov_meta = _lookup_fov_meta(fov_id)
+
+        try:
+            bundle = load_cross_session_bundle(fov_id)
+        except Exception as exc:  # noqa: BLE001
+            return _placeholder_fig(f"Error: {type(exc).__name__}: {exc}")
+        fb = bundle.bundles.get(session_id)
+        if fb is None:
+            return _placeholder_fig("Selected session is no longer available.")
+
+        gcid = _lookup_global_cell_id(fb, local_label_id)
+        try:
+            if gcid:
+                pairs = collect_cross_session_traces(fov_id, gcid, kind=kind)
+            else:
+                ref = next((s for s in bundle.sessions
+                            if s.session_id == session_id), None)
+                if ref is None:
+                    return _placeholder_fig("Selected session not found.")
+                sess = load_session_traces(
+                    Path(ref.output_dir),
+                    kind=kind,
+                    session_date=ref.session_date,
+                    session_id=ref.session_id,
+                )
+                row = sess.row_for_local_label(local_label_id)
+                pairs = [(sess, row)] if row is not None else []
+        except Exception as exc:  # noqa: BLE001
+            return _placeholder_fig(f"Error: {type(exc).__name__}: {exc}")
+
+        return build_roi_across_sessions(fov_meta, pairs, session_id)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -273,3 +428,41 @@ def _preselect_from_search(search: Optional[str]) -> Optional[str]:
     if values and values[0]:
         return values[0]
     return None
+
+
+def _lookup_fov_meta(fov_id: str) -> dict:
+    try:
+        rows = list_fovs()
+    except Exception:  # noqa: BLE001
+        return {"fov_id": fov_id}
+    for r in rows:
+        if r.fov_id == fov_id:
+            return {"fov_id": fov_id, "animal_id": r.animal_id,
+                    "region": r.region}
+    return {"fov_id": fov_id}
+
+
+def _lookup_global_cell_id(fb: FOVBundle, local_label_id: int) -> Optional[str]:
+    for roi in fb.rois:
+        if int(roi.label_id) == int(local_label_id):
+            return getattr(roi, "global_cell_id", None)
+    return None
+
+
+def _placeholder_fig(message: str) -> dict:
+    return {
+        "data": [],
+        "layout": {
+            "height": 420,
+            "template": "plotly_white",
+            "xaxis": {"visible": False},
+            "yaxis": {"visible": False},
+            "annotations": [{
+                "text": message,
+                "showarrow": False,
+                "xref": "paper", "yref": "paper",
+                "x": 0.5, "y": 0.5,
+                "font": {"size": 14, "color": "#888"},
+            }],
+        },
+    }

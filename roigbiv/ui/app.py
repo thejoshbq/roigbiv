@@ -5,9 +5,8 @@ Pages in a top nav:
 * **Process** — scan a workspace, set params, run the pipeline.
 * **Registry** — browse FOVs and sessions; migrate / backfill escape hatches.
 * **Viewer** — per-FOV and cross-session viewer with outline / fill / stage /
-  feature / cross-session color modes.
-* **Traces** — per-ROI fluorescence traces (mean-FOV and single-cell views,
-  single session or across sessions).
+  feature / cross-session color modes, plus FOV-level and ROI-level signal
+  trace panels driven by session selection and ROI click.
 * **Review** — HITL correction tools: polygon / freehand / eraser drawing,
   merge / split / edit / relabel, additive corrections log.
 
@@ -23,7 +22,7 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, dcc, html
 
-from roigbiv.ui.pages import process, registry, review, traces, viewer
+from roigbiv.ui.pages import process, registry, review, viewer
 from roigbiv.ui.services.app_state import get_app_state
 
 
@@ -32,7 +31,6 @@ PAGES = (
     ("/process",  "Process",  process),
     ("/registry", "Registry", registry),
     ("/viewer",   "Viewer",   viewer),
-    ("/traces",   "Traces",   traces),
     ("/review",   "Review",   review),
 )
 
