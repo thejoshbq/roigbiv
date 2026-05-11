@@ -25,21 +25,52 @@ import numpy as np
 from roigbiv.pipeline.types import PipelineConfig
 
 
-def _resolve_model_path(model_spec: str) -> str:
-    """Accept either a Cellpose built-in name ('cyto3', 'cpsam') or a filesystem path.
+# Cellpose 3.x built-in model names. Spec strings matching one of these are
+# passed through to CellposeModel(model_type=...) without filesystem lookup.
+_CELLPOSE_BUILTINS = frozenset({
+    "cyto", "cyto2", "cyto3", "cpsam",
+    "nuclei", "tissuenet", "livecell",
+    "yeast_PhC", "yeast_BF",
+})
 
-    If model_spec looks like a path (contains '/' or exists), return str(Path).
-    Otherwise pass through as-is (Cellpose treats it as a built-in model name).
+
+def _resolve_model_path(model_spec: str) -> str:
+    """Resolve a Cellpose model spec to either a built-in name or an absolute path.
+
+    Resolution order for non-builtin specs:
+      1. As given (absolute paths, or relative paths starting with `./`)
+      2. Relative to the current working directory
+      3. Relative to the roigbiv package root (so the default model resolves
+         regardless of where the CLI was invoked from)
+
+    Raises FileNotFoundError if no candidate exists. We explicitly do NOT fall
+    back to stock cyto3: an unresolvable path means the pipeline would
+    silently use the wrong model, which is exactly the bug this guards
+    against.
     """
+    if model_spec in _CELLPOSE_BUILTINS:
+        return model_spec
+
     p = Path(model_spec)
-    if model_spec.startswith("/") or model_spec.startswith(".") or p.exists():
-        # Resolve relative paths against cwd (where CLI is invoked)
-        resolved = p.resolve()
+    candidates: list[Path] = []
+    if p.is_absolute() or model_spec.startswith("."):
+        candidates.append(p)
+    else:
+        candidates.append(Path.cwd() / p)
+        candidates.append(Path(__file__).resolve().parents[2] / p)
+
+    for cand in candidates:
+        resolved = cand.resolve()
         if resolved.exists():
             return str(resolved)
-        # User passed a path that doesn't exist; let Cellpose raise a clearer error
-        return str(resolved)
-    return model_spec
+
+    tried = ", ".join(str(c.resolve()) for c in candidates)
+    raise FileNotFoundError(
+        f"Cellpose model spec {model_spec!r} not resolvable. "
+        f"Tried: {tried}. Pass an absolute path, a path relative to cwd or "
+        f"the roigbiv package root, or a Cellpose built-in name "
+        f"(one of: {sorted(_CELLPOSE_BUILTINS)})."
+    )
 
 
 def denoise_mean_S(mean_S: np.ndarray, gpu: bool = True) -> np.ndarray:
@@ -94,18 +125,17 @@ def run_cellpose_detection(
     import torch
     from cellpose.models import CellposeModel
 
-    gpu = bool(torch.cuda.is_available())
+    gpu = not cfg.force_cpu and bool(torch.cuda.is_available())
     model_path = _resolve_model_path(cfg.cellpose_model)
 
-    # CellposeModel accepts `pretrained_model` as a path or built-in name
-    # (Cellpose 3.1.1.2: name is looked up via MODEL_NAMES; path is used directly)
-    try:
+    # Cellpose 3.x silently constructs a default model when given a missing
+    # `pretrained_model` path, so we route built-in names through `model_type`
+    # explicitly and trust `_resolve_model_path` to have raised on bad paths.
+    if model_path in _CELLPOSE_BUILTINS:
+        model = CellposeModel(gpu=gpu, model_type=model_path)
+    else:
         model = CellposeModel(gpu=gpu, pretrained_model=model_path)
-    except Exception:
-        # Fall back to built-in cyto3 if the path doesn't load cleanly
-        print(f"  WARNING: could not load model at {model_path}; falling back to cyto3",
-              flush=True)
-        model = CellposeModel(gpu=gpu, model_type="cyto3")
+    print(f"  Cellpose model loaded: {model_path}", flush=True)
 
     # Optionally denoise mean_S
     t0 = time.time()

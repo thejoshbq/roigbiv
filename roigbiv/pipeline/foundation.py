@@ -144,8 +144,9 @@ def _compute_binned_movie(
 def _binned_svd_gpu(
     M_bin: np.ndarray,
     n_svd: int,
+    force_cpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute top-n_svd truncated SVD of M_bin (T_bin, N_pix) on GPU.
+    """Compute top-n_svd truncated SVD of M_bin (T_bin, N_pix) on GPU or CPU.
 
     Returns (U, S, V) where M_bin ≈ V @ diag(S) @ U.T under the spatial
     decomposition convention used downstream:
@@ -159,7 +160,14 @@ def _binned_svd_gpu(
     """
     import torch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    # torch.svd_lowrank is a randomized algorithm; without seeding the top-k
+    # subspace it returns drifts run-to-run (mean principal-angle cosine ≈0.65
+    # on real movies), which propagates into S → vcorr_S → Cellpose channel 2
+    # and shifts borderline detections.
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     # Move M_bin^T (N_pix, T_bin) to GPU; if it doesn't fit, fall back to CPU
     try:
         A = torch.from_numpy(M_bin.T).to(device)  # shape (N_pix, T_bin)
@@ -168,7 +176,9 @@ def _binned_svd_gpu(
         S = S_t.detach().cpu().numpy().astype(np.float32)       # (n_svd,)
         V = V_t.detach().cpu().numpy().astype(np.float32)       # (T_bin, n_svd)
     except (torch.cuda.OutOfMemoryError, RuntimeError):
-        # GPU OOM or unavailable — fall back to CPU
+        # GPU OOM or unavailable — fall back to CPU. Re-seed since the failed
+        # GPU call already consumed RNG state.
+        torch.manual_seed(0)
         A = torch.from_numpy(M_bin.T)
         U_t, S_t, V_t = torch.svd_lowrank(A, q=int(n_svd), niter=2)
         U = U_t.numpy().astype(np.float32)
@@ -246,7 +256,7 @@ def compute_background_separation(
     # 2. SVD on binned
     t0 = time.time()
     n_svd = min(cfg.n_svd, T_bin - 1, N_pix - 1)  # svd rank upper bounds
-    U, S, V_bin = _binned_svd_gpu(M_bin, n_svd)
+    U, S, V_bin = _binned_svd_gpu(M_bin, n_svd, force_cpu=cfg.force_cpu)
     print(f"  SVD top-{n_svd} on binned movie in {time.time()-t0:.1f}s", flush=True)
     del M_bin  # free ~5 GB
 

@@ -31,10 +31,12 @@ dependencies = [
 [project.optional-dependencies]
 # `ui` is the primary frontend — a Dash + Plotly web app with native ROI
 # drawing, cross-session coordinated colors, and integrated registry ops.
-ui = ["dash>=2.17", "dash-bootstrap-components>=1.5", "plotly>=5.22"]
-# `app` is the legacy Streamlit entry point — superseded by `ui`; kept
-# only so a `pip install roigbiv[app]` on an older environment still works.
-app = ["streamlit"]
+ui = [
+    "dash>=2.17",
+    "dash-bootstrap-components>=1.5",
+    "dash-bootstrap-templates>=1.0",
+    "plotly>=5.22",
+]
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
 postgres = ["psycopg[binary]>=3.1"]
@@ -45,8 +47,8 @@ embeddings = ["roicat>=1.5", "torch>=2.0", "torchvision"]
 
 [project.scripts]
 roigbiv-pipeline = "roigbiv.pipeline.run:main"
-roigbiv-cli = "roigbiv.cli:main"
 roigbiv-registry = "roigbiv.cli_registry:main"
+roigbiv-reingest = "roigbiv.cli_reingest:main"
 roigbiv-ui = "roigbiv.ui.__main__:main"
 
 [tool.setuptools.packages.find]

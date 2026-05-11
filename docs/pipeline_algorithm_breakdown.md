@@ -1,5 +1,14 @@
 # ROI G. Biv — Algorithm Breakdown & Astrocyte Viability Analysis
 
+> **Historical document.** This describes the **legacy parallel-consensus pipeline**
+> (three independent branches merged via IoU matching). That architecture has been
+> replaced by the sequential subtractive pipeline under `roigbiv/pipeline/`, which
+> is specified in `docs/roi-pipeline-specification.md`. Scripts named below
+> (`run_suite2p.py`, `run_inference.py`, `build_union_rois.py`, `match_rois.py`,
+> `extract_vcorr.py`, `extract_traces.py`) have been removed; their functionality
+> lives inside `roigbiv-pipeline`. Retained here for algorithm history and as
+> background for the astrocyte discussion in the second half of the document.
+
 ## What Is This System?
 
 ROI G. Biv is a **consensus cell detection pipeline** for two-photon calcium imaging data. It combines two independent detectors — Suite2p and Cellpose — and merges their outputs using spatial overlap scoring. The goal is to identify neurons in field-of-view (FOV) images with higher confidence than either tool alone could provide.

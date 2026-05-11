@@ -14,6 +14,15 @@ from typing import Optional
 import numpy as np
 
 
+# Anchor the default Cellpose model path to the package root (not cwd) so
+# pipeline runs from any working directory load the fine-tuned model. A
+# cwd-relative default silently fell back to stock cyto3 when run from
+# outside the repo, masking the regression as a detection-quality issue.
+_DEFAULT_CELLPOSE_MODEL = str(
+    Path(__file__).resolve().parents[2] / "models" / "deployed" / "current_model"
+)
+
+
 @dataclass
 class ROI:
     """A single detected region of interest.
@@ -165,7 +174,7 @@ class PipelineConfig:
     reconstruct_chunk: int = 500            # temporal chunk size for L+S streaming
 
     # ── Stage 1 (Cellpose) ────────────────────────────────────────────────
-    cellpose_model: str = "models/deployed/current_model"
+    cellpose_model: str = _DEFAULT_CELLPOSE_MODEL
     diameter: int = 12
     cellprob_threshold: float = -2.0
     flow_threshold: float = 0.6
@@ -284,6 +293,26 @@ class PipelineConfig:
     # ── Output ────────────────────────────────────────────────────────────
     output_dir: Optional[Path] = None       # None = auto: inference/pipeline/{stem}/
     no_viewer: bool = False
+
+    # ── Resume ────────────────────────────────────────────────────────────
+    # When True, run_pipeline consults output_dir for prior-run artifacts
+    # and skips stages that already completed. Refuses to resume if the
+    # config or input differs from what wrote those artifacts. See
+    # roigbiv/pipeline/resume.py for the full state machine.
+    resume: bool = False
+
+    # ── Per-stage opt-in flags ────────────────────────────────────────────
+    # All stages default on so the cheapest invocation gives full coverage.
+    # Stages 3 and 4 add ~10–25 min/FOV but yield real cells in some FOVs;
+    # users who want the fast path drop --no-stage-3 / --no-stage-4.
+    # Combined with --resume, flipping a flag from True → False (or vice
+    # versa) on a prior workspace runs only the now-enabled stage(s); these
+    # flags are excluded from the resume fingerprint
+    # (resume.py:compute_cfg_fingerprint).
+    enable_stage_2: bool = True
+    enable_stage_3: bool = True
+    enable_stage_4: bool = True
+    force_cpu: bool = False
 
     def summary_for_log(self) -> dict:
         """JSON-serializable snapshot of all config values for pipeline_log.json."""

@@ -156,6 +156,7 @@ class FOVRunResult:
     error: Optional[str] = None
     registry: Optional[dict] = None
     roi_counts: dict = field(default_factory=dict)
+    png_path: Optional[Path] = None
 
 
 def run_with_workspace(
@@ -165,13 +166,22 @@ def run_with_workspace(
     log_cb: Optional[LogCallback] = None,
     skip_registry: bool = False,
     skip_backfill: bool = False,
+    resume: bool = False,
+    n_workers: int = 1,
 ) -> list[FOVRunResult]:
     """Run the pipeline + registry over every TIF in ``workspace``.
 
-    Sequential by design — :func:`roigbiv.pipeline.batch.run_batch` exists
-    for parallel execution, but for the workspace flow we want predictable
-    per-FOV log streaming and don't want to ship a multiprocessing GPU lock
-    through the UI's background thread.
+    Sequential by default — pass ``n_workers > 1`` to fan out the heavy
+    pipeline calls through :func:`roigbiv.pipeline.batch.run_batch` (capped
+    at 2 workers per the GPU constraint). The light post-pipeline steps
+    (registry registration, traces bundle write, backfill) always run in
+    the parent process so registry env vars and SQLite writes stay
+    serialized.
+
+    When ``resume=True``, each FOV's run consults its existing output
+    directory and skips stages whose artifacts are already present. Refuses
+    a per-FOV resume if the config or input has changed since those
+    artifacts were written. See ``roigbiv.pipeline.resume`` for details.
 
     Returns one :class:`FOVRunResult` per TIF, in the same order as
     ``workspace.tifs``. Failed FOVs have ``error`` populated; successful ones
@@ -180,24 +190,147 @@ def run_with_workspace(
     configure_registry_env(workspace)
     log = log_cb or (lambda _msg: None)
     cfg_overrides = dict(cfg_overrides or {})
+    if resume:
+        cfg_overrides.setdefault("resume", True)
 
     log(f"Workspace: {workspace.input_root}")
     log(f"Output:    {workspace.output_root}")
     log(f"Registry:  {workspace.db_path}")
+    if resume:
+        log("Resume:    enabled (skipping completed stages per FOV)")
     log(f"Found {len(workspace.tifs)} TIF stack(s) to process.")
 
     _ensure_registry_schema(log)
 
-    results: list[FOVRunResult] = []
-    for idx, tif in enumerate(workspace.tifs, start=1):
-        log(f"\n[FOV {idx}/{len(workspace.tifs)}] {tif.name}")
-        results.append(_process_one(tif, workspace, cfg_overrides, log,
-                                    skip_registry=skip_registry))
+    parallel = n_workers > 1 and len(workspace.tifs) > 1
+    if parallel:
+        log(f"Parallel:  n_workers={n_workers} (capped at 2)")
+        results = _run_parallel(workspace, cfg_overrides, log,
+                                skip_registry=skip_registry,
+                                n_workers=n_workers)
+    else:
+        results = []
+        for idx, tif in enumerate(workspace.tifs, start=1):
+            log(f"\n[FOV {idx}/{len(workspace.tifs)}] {tif.name}")
+            results.append(_process_one(tif, workspace, cfg_overrides, log,
+                                        skip_registry=skip_registry))
 
     if not skip_backfill:
         _safety_backfill(workspace, log)
 
     return results
+
+
+def _run_parallel(
+    workspace: WorkspacePaths,
+    cfg_overrides: dict,
+    log: LogCallback,
+    *,
+    skip_registry: bool,
+    n_workers: int,
+) -> list[FOVRunResult]:
+    """Fan pipeline calls out to ``pipeline/batch.run_batch``; do the light
+    post-pipeline work (registry + traces bundle) sequentially in the parent.
+    """
+    from roigbiv.pipeline.batch import run_batch
+
+    jobs: list[tuple[Path, PipelineConfig]] = []
+    out_dirs: list[Path] = []
+    valid_indices: list[int] = []
+    results: list[Optional[FOVRunResult]] = [None] * len(workspace.tifs)
+
+    for idx, tif in enumerate(workspace.tifs):
+        stem = tif.stem.replace("_mc", "")
+        out_dir = workspace.output_root / stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dirs.append(out_dir)
+
+        try:
+            validate_tif(tif)
+        except ValueError as exc:
+            log(f"  invalid TIF ({tif.name}): {exc}")
+            results[idx] = FOVRunResult(tif=tif, output_dir=out_dir,
+                                        error=f"invalid_tif: {exc}")
+            continue
+
+        cfg = _build_config(out_dir, cfg_overrides)
+        jobs.append((tif, cfg))
+        valid_indices.append(idx)
+
+    if not jobs:
+        return [r for r in results if r is not None]
+
+    start_times: dict[int, float] = {}
+    fovs: dict[int, Optional[FOVData]] = {}
+    errors: dict[int, Optional[str]] = {}
+    durations: dict[int, float] = {}
+
+    for slot, idx in enumerate(valid_indices):
+        start_times[slot] = time.perf_counter()
+
+    def _log_cb(slot: int, line: str) -> None:
+        idx = valid_indices[slot]
+        log(f"[FOV {idx + 1}/{len(workspace.tifs)}] {line}")
+
+    def _on_complete(slot: int, fov: Optional[FOVData],
+                     exc: Optional[BaseException]) -> None:
+        durations[slot] = time.perf_counter() - start_times.get(
+            slot, time.perf_counter())
+        if exc is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            fovs[slot] = None
+            errors[slot] = f"{type(exc).__name__}: {exc}"
+        else:
+            fovs[slot] = fov
+            errors[slot] = None
+
+    log(f"\n=== Running {len(jobs)} FOV(s) in parallel ===")
+    run_batch(
+        jobs=jobs,
+        n_workers=n_workers,
+        log_callback=_log_cb,
+        on_complete=_on_complete,
+    )
+
+    for slot, idx in enumerate(valid_indices):
+        tif, cfg = jobs[slot]
+        out_dir = out_dirs[idx]
+        duration = durations.get(slot, 0.0)
+        err = errors.get(slot)
+        fov = fovs.get(slot)
+        if err is not None or fov is None:
+            results[idx] = FOVRunResult(tif=tif, output_dir=out_dir,
+                                        duration_s=duration, error=err)
+            continue
+
+        counts = _roi_counts(fov)
+        log(f"[FOV {idx + 1}/{len(workspace.tifs)}] "
+            f"pipeline OK ({duration:.1f}s) — "
+            f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
+            f"reject={counts.get('reject', 0)}")
+
+        stem = tif.stem.replace("_mc", "")
+        registry: Optional[dict] = None
+        if not skip_registry:
+            try:
+                registry = _register_session(stem, fov, log)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  WARNING: registry call failed — "
+                    f"{type(exc).__name__}: {exc}")
+
+        try:
+            _write_traces_bundle(fov, cfg, workspace, registry, log)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  WARNING: traces bundle write failed — "
+                f"{type(exc).__name__}: {exc}")
+
+        results[idx] = FOVRunResult(
+            tif=tif, output_dir=out_dir,
+            duration_s=duration, fov=fov,
+            registry=registry, roi_counts=counts,
+        )
+
+    return [r for r in results if r is not None]
 
 
 # ── internals ──────────────────────────────────────────────────────────────

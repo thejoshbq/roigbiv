@@ -28,6 +28,12 @@ from roigbiv.ui.services.colors import (
     color_for_stage,
 )
 from roigbiv.ui.services.loaders import ROIRender
+from roigbiv.ui.services.theme import (
+    figure_paper_bg,
+    heatmap_colorscale,
+    heatmap_reverse,
+    plotly_template,
+)
 
 
 GeometryMode = str        # "outline" | "fill"
@@ -41,7 +47,9 @@ def build_roi_figure(
     geometry: GeometryMode = "outline",
     color_mode: ColorMode = "stage",
     hide_rejected: bool = True,
+    show_overlay: bool = True,
     title: Optional[str] = None,
+    theme: Optional[str] = None,
 ) -> go.Figure:
     """Compose the mean projection with ROI overlays.
 
@@ -59,6 +67,10 @@ def build_roi_figure(
     hide_rejected :
         Drops ROIs with ``gate_outcome == "reject"`` from the overlay (they
         live in the pipeline output for auditing but add noise to viewers).
+    show_overlay :
+        If ``False``, skip all ROI glyphs so the raw mean projection is
+        visible. The figure keeps ROI-less click targets — useful for
+        inspecting registration or motion-correction quality.
     title :
         Optional figure title — kept small so the plot dominates.
     """
@@ -67,46 +79,49 @@ def build_roi_figure(
         fig.add_trace(
             go.Heatmap(
                 z=mean,
-                colorscale="Greys",
-                reversescale=True,
+                colorscale=heatmap_colorscale(theme),
+                reversescale=heatmap_reverse(theme),
                 showscale=False,
                 hoverinfo="skip",
                 name="mean_M",
             )
         )
 
-    visible = [
-        r for r in rois
-        if not (hide_rejected and r.gate_outcome == "reject")
-    ]
+    if show_overlay:
+        visible = [
+            r for r in rois
+            if not (hide_rejected and r.gate_outcome == "reject")
+        ]
 
-    if geometry == "fill" and mean is not None:
-        overlay = _build_fill_overlay(mean.shape, visible, color_mode)
-        if overlay is not None:
-            fig.add_trace(overlay)
+        if geometry == "fill" and mean is not None:
+            overlay = _build_fill_overlay(mean.shape, visible, color_mode)
+            if overlay is not None:
+                fig.add_trace(overlay)
 
-    # Outlines are drawn in both modes — they're the click target and give
-    # fills a clean edge. For "outline" mode, this is the only ROI glyph.
-    for render in visible:
-        color = _pick_color(render, color_mode)
-        for ys, xs in render.contours:
-            if not ys:
-                continue
-            fig.add_trace(
-                go.Scatter(
-                    x=xs + [xs[0]],
-                    y=ys + [ys[0]],
-                    mode="lines",
-                    line=dict(color=color, width=1.6),
-                    hovertemplate=_hover_text(render),
-                    name=str(render.label_id),
-                    customdata=[[render.label_id]] * (len(xs) + 1),
-                    showlegend=False,
+        # Outlines are drawn in both modes — they're the click target and give
+        # fills a clean edge. For "outline" mode, this is the only ROI glyph.
+        for render in visible:
+            color = _pick_color(render, color_mode)
+            for ys, xs in render.contours:
+                if not ys:
+                    continue
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs + [xs[0]],
+                        y=ys + [ys[0]],
+                        mode="lines",
+                        line=dict(color=color, width=1.6),
+                        hovertemplate=_hover_text(render),
+                        name=str(render.label_id),
+                        customdata=[[render.label_id]] * (len(xs) + 1),
+                        showlegend=False,
+                    )
                 )
-            )
 
     H, W = (mean.shape if mean is not None else (1, 1))
+    bg = figure_paper_bg(theme)
     fig.update_layout(
+        template=plotly_template(theme),
         title=dict(text=title or "", x=0.01, xanchor="left",
                    font=dict(size=13)),
         margin=dict(l=0, r=0, t=30 if title else 6, b=0),
@@ -116,8 +131,11 @@ def build_roi_figure(
         ),
         yaxis=dict(visible=False, range=[H - 1, 0]),   # invert → row 0 at top
         dragmode="pan",
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
+        # Emit click events but never enter select-state: otherwise Plotly
+        # dims all non-clicked ROI scatters, breaking cross-session tracking.
+        clickmode="event",
+        plot_bgcolor=bg,
+        paper_bgcolor=bg,
         hoverlabel=dict(bgcolor="rgba(44,62,80,0.92)", font_color="white"),
     )
     return fig

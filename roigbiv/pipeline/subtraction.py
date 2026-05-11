@@ -153,7 +153,7 @@ def solve_traces_from_chunks(
     import torch
 
     N = design.shape[1]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" if cfg.force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 
     W_t = torch.from_numpy(design).to(device)                # (P, N)
     WtW = W_t.T @ W_t                                         # (N, N)

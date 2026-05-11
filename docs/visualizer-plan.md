@@ -2,7 +2,7 @@
 
 ## Context
 
-The ROIGBIV pipeline (4-stage subtractive ROI detection on 2P calcium imaging stacks) currently emits progress only as stdout text captured by `app.py`'s Streamlit UI. There is no structured way to see *what* the pipeline is finding as it works — masks land in `roi_metadata.json` only at the end of a ~15-minute run.
+The ROIGBIV pipeline (4-stage subtractive ROI detection on 2P calcium imaging stacks) currently emits progress only as stdout text. There is no structured way to see *what* the pipeline is finding as it works — masks land in `roi_metadata.json` only at the end of a ~15-minute run.
 
 We are building a browser-based visualizer that:
 1. Watches the pipeline "paint" detected ROIs onto a persistent FOV canvas, stage-by-stage, with per-feature gate animations.
@@ -22,7 +22,7 @@ The pipeline's scientific outputs must remain byte-identical with the visualizer
 - **No web framework installed**: no Flask/FastAPI/aiohttp/websockets. Streamlit + tornado are present (Streamlit's blocking handlers are unsuitable for low-latency event push).
 - **Existing structured logs**: `pipeline_log.json` (run summary, written at end), `roi_metadata.json` (full per-ROI features, written at end), per-stage `stage{N}_report.json`.
 - **Typical FOV**: H=505, W=493, T=8624 frames, fs=7.5 Hz, neuron diameter ≈ 12 px (test case).
-- **Streamlit `app.py`** stays untouched — it remains the launcher for users who don't want the browser viewer. The new visualizer is a parallel option.
+- The Dash app (`roigbiv-ui`) is the production launcher. The new visualizer is a parallel option for live-run introspection.
 
 ---
 
@@ -158,7 +158,7 @@ All call sites use `if emitter.enabled: emitter.emit_*(...)`. No logic moves, no
 
 **Stage 3 caveat**: `_process_chunk` runs on GPU. Emitting per-pixel events from inside the GPU loop would force `.cpu()` syncs. Strategy: collect events in the chunk's existing return tuple (no change to loop), then emit from the chunk's caller in `stage3.py`. This is post-GPU and adds no sync overhead.
 
-**Single new param**: `run_pipeline(tif_path, cfg, gpu_lock=None, fov_output_dir=None)` — `fov_output_dir` is already implicit in `cfg.output_dir` resolution; pass to `emitter.init_run`. Both `cli.py` and `app.py` call sites unchanged (defaults preserved).
+**Single new param**: `run_pipeline(tif_path, cfg, gpu_lock=None, fov_output_dir=None)` — `fov_output_dir` is already implicit in `cfg.output_dir` resolution; pass to `emitter.init_run`. Both `cli.py` and the Dash UI call sites unchanged (defaults preserved).
 
 ---
 
@@ -200,7 +200,7 @@ All call sites use `if emitter.enabled: emitter.emit_*(...)`. No logic moves, no
 After Phase 5 completes:
 
 1. **Backend smoke**: `conda activate roigbiv && python -m visualizer.server --replay visualizer/tests/synthetic.ndjson` → open `http://localhost:9876` → confirm ROIs paint stage-by-stage with correct colors and gate animations.
-2. **Live run**: in one terminal `python -m visualizer.server --watch test_output/`; in another `ROIGBIV_VIS_ENABLED=1 roigbiv-cli --input test_raw/<tif>` → browser shows real-time progress.
+2. **Live run**: in one terminal `python -m visualizer.server --watch test_output/`; in another `ROIGBIV_VIS_ENABLED=1 roigbiv-pipeline --input test_raw/<tif> --fs 7.5` → browser shows real-time progress.
 3. **Identity**: `pytest visualizer/tests/test_identity.py` → green.
 4. **Log completeness**: `pytest visualizer/tests/test_emitter.py` → green.
 5. **Bundle size**: `du -sh visualizer/static/assets/*.gz` (after Vite build with gzip plugin) → confirm <500 KB total.

@@ -93,6 +93,27 @@ decomposition, and GPU-accelerated linear algebra. Cellpose provides
 spatial segmentation with a learned morphological prior. Custom code
 fills the gaps between them.
 
+### 1.7 Default On; Skip Stages Explicitly
+
+All four stages run by default (`enable_stage_2 = enable_stage_3 =
+enable_stage_4 = True` in `PipelineConfig`) so the cheapest invocation
+gives full coverage. Stage 3 (FFT sparse-firing sweep) and Stage 4
+(tonic correlation contrast) yield 0–5 and ~0 ROIs per FOV respectively
+while consuming roughly half the wall time; users who want the fast
+path drop `--no-stage-3 --no-stage-4`.
+
+Subtraction is opt-in by need: Stage N's subtraction step only executes
+when Stage N detected ROIs *and* a downstream stage is enabled to
+consume the residual. This preserves the architectural property that
+every stage sees a residual cleaned of all earlier detections, while
+avoiding a 1.5 GB residual rewrite when no consumer exists.
+
+Combined with `--resume`, this turns the pipeline into a tiered audit
+tool: re-run on an existing workspace with `--no-stage-3` /
+`--no-stage-4` for a fast pass, then re-run later with the flags
+flipped to add the slower stages on top of the prior outputs without
+redoing Foundation or Stage 1/2.
+
 ---
 
 ## 2. Architecture Overview
@@ -1469,3 +1490,96 @@ Reference to the detection challenges documented in
 - [ ] Integrate AQuA2 with STARDUST protocol
 - [ ] Implement two-tier detection (soma + process events)
 - [ ] Validate on astrocyte imaging data from Paniccia et al. 2025
+
+## 21. Resumability
+
+When `--resume` is passed (or `cfg.resume=True`), `run_pipeline` consults
+the per-FOV output directory and skips stages whose artifacts are already
+present. Default behavior is unchanged (always start fresh from
+Foundation), so existing scripts and CI are unaffected.
+
+### 21.1 Resume points
+
+Each step persists a sentinel artifact on success. A step is considered
+complete iff its sentinel exists *and* the input the next step needs is
+present (or, for Stage 4, no successor input is required).
+
+| Step | Sentinel | Input needed by next step |
+|------|----------|---------------------------|
+| Foundation       | `summary/*.tif`, `data.bin`, `residual_S.dat`, `motion_trace.npz` | `residual_S.dat` |
+| Stage 1 detect   | `stage1/stage1_report.json` + `stage1/stage1_masks.tif` | `residual_S.dat` |
+| Stage 1 subtract | `residual_S1.dat` + sidecar | `residual_S1.dat` |
+| Stage 2 detect   | `stage2/stage2_report.json` + `stage2/stage2_masks.tif` | `residual_S1.dat` |
+| Stage 2 subtract | `residual_S2.dat` + sidecar | `residual_S2.dat` |
+| Stage 3 detect   | `stage3/stage3_report.json` + `stage3/stage3_masks.tif` | `residual_S2.dat` |
+| Stage 3 subtract | `residual_S3.dat` + sidecar | `residual_S3.dat` |
+| Stage 4 detect   | `stage4/stage4_report.json` | (none — `residual_S3.dat` is deleted post-run) |
+
+Reports are written *before* their corresponding subtraction (`run.py`).
+A run interrupted between writing `stage{N}_report.json` and finishing
+`run_source_subtraction` therefore leaves `stage{N}` complete-on-disk but
+`residual_S{N}.dat` missing — `--resume` correctly identifies this as
+"replay only the subtraction step" rather than "redo the stage".
+
+### 21.2 Manifest
+
+`{output_dir}/.roigbiv_manifest.json` (advisory; the JSON reports + TIFFs
+remain authoritative for ROI content). It records:
+
+```json
+{
+  "roigbiv_version": "0.x.y",
+  "input_tif": "/abs/path/foo_mc.tif",
+  "input_stat": {"size": 12345, "mtime_ns": 1700000000000000000},
+  "cfg_fingerprint": "sha256:...",
+  "cfg_snapshot": {...PipelineConfig.summary_for_log()...},
+  "stages": {
+    "foundation":       {"completed_at": "...", "version": "0.x.y", "status": "completed"},
+    "stage1":           {...},
+    "stage1_subtract":  {...},
+    "stage2":           {...},
+    "stage2_subtract":  {"completed_at": "...", "version": "0.x.y", "status": "skipped"},
+    ...
+  }
+}
+```
+
+Each step's `status` is `"completed"` (the step ran to completion) or
+`"skipped"` (the step was intentionally bypassed because its enable flag
+was off, or its subtraction had no downstream consumer). `plan_resume`
+treats both as "advance past this step"; only an absent step (or a
+`"completed"` entry whose sentinel artifact is missing) triggers
+recovery / refusal.
+
+The fingerprint is `sha256(json.dumps(cfg.summary_for_log() minus enable_stage_*, sort_keys=True) + tif.size + tif.mtime_ns)`.
+
+### 21.3 Config-drift policy (strict, with one exception)
+
+`--resume` refuses with a field-level diff if any `PipelineConfig` field or
+the input TIFF's size/mtime differs from what produced the on-disk
+artifacts, **except** for the per-stage opt-in flags
+(`enable_stage_2`, `enable_stage_3`, `enable_stage_4`). Those are
+deliberately excluded from the resume fingerprint so that flipping a
+stage on (or off) between runs does not invalidate prior outputs:
+flipping a stage on causes `run_pipeline` to execute that stage and any
+implied subtraction work; flipping it off causes the stage to be skipped
+without disturbing already-completed stages.
+
+There is no per-stage drift bucketing for parameter *knobs* (e.g.
+`cellprob_threshold`) — changing those between runs requires a fresh
+start.
+
+### 21.4 Corrupted-state detection
+
+`--resume` raises `ResumeError` (and surfaces an actionable message) when:
+
+1. The manifest claims a step completed but its sentinel artifact is
+   missing (e.g., manifest says `stage1_subtract` done but `residual_S1.dat`
+   was deleted out-of-band).
+2. A stage's report is on disk but its masks TIFF is missing.
+3. A residual `.dat` file's size doesn't match its `.meta.json`-declared
+   shape (truncated/partial write).
+4. A subtraction step is incomplete *and* the prior residual is also gone
+   (no input from which to replay).
+
+Detection is conservative: there is no silent recovery.

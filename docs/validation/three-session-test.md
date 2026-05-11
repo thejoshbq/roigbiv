@@ -170,13 +170,13 @@ roigbiv-registry match --output-dir data/output/<session_stem>
 
 Exercises the `cli_registry.py` entry points against the post-change DB. Mostly regression coverage — checks that schema + report shape haven't drifted.
 
-### 7. Streamlit maintenance panel
+### 7. Dash UI — Registry page
 
 ```bash
-streamlit run app.py
+roigbiv-ui
 ```
 
-Open the registry tab → confirm: migrate button, FOV list, session list, cell browser all render against the v3 DB. If step 5 left sessions in the review band, visually open them here and confirm the manual-accept path works.
+Open http://127.0.0.1:8050 → **Registry** page → confirm: migrate button, FOV list, session list, cell browser all render against the v3 DB. If step 5 left sessions in the review band, visually open them here and confirm the manual-accept path works.
 
 ### 8. Before declaring a remediation successful
 
@@ -186,7 +186,7 @@ All of the following must hold on the three-session dataset:
 - [ ] Every step has `fov_posterior ≥ 0.9` (accept band).
 - [ ] `alignment_inlier_rate ≥ 0.4` on every step.
 - [ ] `fraction_query_clustered ≥ 0.4` on every step.
-- [ ] Steps 2–4 (unit tests, CLI, Streamlit) all pass.
+- [ ] Steps 2–4 (unit tests, CLI, Dash UI) all pass.
 - [ ] A new "Run N" section is appended here with the numbers.
 - [ ] Design doc `docs/design/roicat-integration.md` gains a short addendum recording the change.
 
@@ -212,9 +212,9 @@ inference/registry_roicat.db: 1 FOV row, 3 sessions, 123 cells
 
 ---
 
-## Managing the registry from the Streamlit app
+## Managing the registry from the Dash UI
 
-The Streamlit app's **Registry** tab (`app.py::_registry_tab`) is the primary UI surface for inspecting + maintaining the v3 registry. It is read-first / write-via-backfill — no manual review-band approval UI, no adapter-knob UI.
+The Dash app's **Registry** page (`roigbiv/ui/pages/registry.py`) is the primary UI surface for inspecting + maintaining the v3 registry. It is read-first / write-via-backfill — no manual review-band approval UI, no adapter-knob UI.
 
 ### Launch
 
@@ -227,10 +227,10 @@ export ROIGBIV_BLOB_ROOT="inference/fingerprints_v3"
 # export ROIGBIV_ROICAT_ALIGNMENT=PhaseCorrelation
 # export ROIGBIV_ROICAT_DEVICE=cpu
 
-streamlit run app.py
+roigbiv-ui
 ```
 
-Open **Cross-Session Registry** (the rightmost tab).
+Open http://127.0.0.1:8050 and navigate to the **Registry** page.
 
 ### 1. Registry maintenance (first-time / after schema changes)
 
@@ -272,16 +272,16 @@ Text input: paste a `global_cell_id` from the cells expander.
 
 ### What the UI does NOT expose (use the CLI or env)
 
-- **Changing alignment / adapter knobs** — set `ROIGBIV_ROICAT_*` env vars *before* launching Streamlit. Runtime changes won't apply to calls already in flight.
+- **Changing alignment / adapter knobs** — set `ROIGBIV_ROICAT_*` env vars *before* launching `roigbiv-ui`. Runtime changes won't apply to calls already in flight.
 - **Manual review-band accept** — there is no button to accept a `review`-band match. To promote one, either (a) delete the minted stub FOV from the DB and re-run backfill against a lower `ROIGBIV_FOV_ACCEPT_THRESHOLD`, or (b) manually edit `cell_observation` rows (advanced; not recommended).
 - **Deleting / merging FOVs** — no UI. Use sqlite directly or write a short script against `SQLAlchemyStore`.
-- **Viewing ROI overlays** — use the Results tab's napari launcher, or open `merged_masks.tif` directly in napari/Fiji. The registry tab doesn't render masks.
+- **Viewing ROI overlays** — use the **Viewer** page, or open `merged_masks.tif` directly in napari/Fiji. The Registry page doesn't render masks.
 - **Re-clustering existing FOVs with a new alignment method** — not currently supported. Requires deleting the v3 DB and re-running backfill. Planned as an admin action but not implemented.
 
 ### Recommended first-run workflow for a fresh dataset
 
-1. `streamlit run app.py` (with env vars set).
-2. Registry tab → **Run database migrations** (once).
+1. `roigbiv-ui` (with env vars set).
+2. Registry page → **Run database migrations** (once).
 3. **Backfill existing runs → Dry run** pointed at `data/output/`. Confirm the session count matches what you expect.
 4. **Backfill now**. Wait for the RoMa weights download on the first match.
 5. Browse the FOV overview. Expect 1 row per distinct FOV across animals/regions.

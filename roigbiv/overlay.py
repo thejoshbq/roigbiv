@@ -1,7 +1,7 @@
 """Flat PNG overlay rendering for pipeline results.
 
 Renders `fov.mean_M` (contrast-stretched) as a grayscale base with ROI contours
-drawn on top. Used by `roigbiv.cli` after a pipeline run to produce an image
+drawn on top. Used by `roigbiv.pipeline.run` after a pipeline run to produce an image
 suitable for email attachment and quick visual inspection. Pure rendering —
 no pipeline calls, no disk I/O besides the final PNG write.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -19,6 +19,13 @@ from roigbiv.pipeline.types import FOVData
 
 _ACCEPT_COLOR = "#00FF00"   # green
 _FLAG_COLOR = "#FFA500"     # orange
+_REJECT_COLOR = "#FF3030"   # red
+_COLOR_FOR_OUTCOME = {
+    "accept": _ACCEPT_COLOR,
+    "flag": _FLAG_COLOR,
+    "reject": _REJECT_COLOR,
+}
+ALL_OUTCOMES: tuple[str, ...] = ("accept", "flag", "reject")
 _TEXT_COLOR = (255, 255, 255, 255)
 _ANNOTATION_BG = (0, 0, 0, 170)
 
@@ -30,6 +37,7 @@ def render_overlay(
     fov_stem: str,
     *,
     timestamp: Optional[_dt.datetime] = None,
+    outcomes: Iterable[str] = ALL_OUTCOMES,
 ) -> Path:
     """Render ROI contours on the FOV mean projection and save as PNG.
 
@@ -48,6 +56,10 @@ def render_overlay(
         filename and annotation.
     timestamp:
         Override the annotation timestamp (for tests). Defaults to ``now()``.
+    outcomes:
+        Iterable of ``"accept" | "flag" | "reject"`` selecting which ROI gate
+        outcomes to draw. Defaults to all three. ROIs whose ``gate_outcome``
+        is not in this set are still counted in the annotation but not drawn.
 
     Returns
     -------
@@ -62,19 +74,22 @@ def render_overlay(
     if fov.mean_M is None:
         raise ValueError("fov.mean_M is None; cannot render overlay")
 
+    outcomes_tuple = tuple(outcomes)
+    draw_set = frozenset(outcomes_tuple)
+
     base = _stretch_to_uint8(fov.mean_M, 0.5, 99.5)
     img = Image.fromarray(base).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    n_accept = n_flag = 0
+    counts = {"accept": 0, "flag": 0, "reject": 0}
     for roi in fov.rois:
-        if roi.gate_outcome == "accept":
-            color = _ACCEPT_COLOR
-            n_accept += 1
-        elif roi.gate_outcome == "flag":
-            color = _FLAG_COLOR
-            n_flag += 1
-        else:
+        out = roi.gate_outcome
+        if out in counts:
+            counts[out] += 1
+        if out not in draw_set:
+            continue
+        color = _COLOR_FOR_OUTCOME.get(out)
+        if color is None:
             continue
         for contour in find_contours(roi.mask.astype(np.float32), 0.5):
             pts = [(int(round(c)), int(round(r))) for r, c in contour]
@@ -84,7 +99,12 @@ def render_overlay(
     ts = timestamp or _dt.datetime.now()
     lines = [
         fov_stem,
-        f"ROIs: {n_accept} accept  |  {n_flag} flag",
+        f"ROIs: {counts['accept']} accept  |  {counts['flag']} flag  |  "
+        f"{counts['reject']} reject",
+    ]
+    if outcomes_tuple != ALL_OUTCOMES:
+        lines.append(f"drawn: {','.join(outcomes_tuple)}")
+    lines += [
         f"Model: {model_name}",
         ts.isoformat(timespec="seconds"),
     ]
@@ -104,6 +124,7 @@ def render_overlay_from_disk(
     fov_stem: str,
     *,
     timestamp: Optional[_dt.datetime] = None,
+    outcomes: Iterable[str] = ALL_OUTCOMES,
 ) -> Path:
     """Fallback used when the live ``FOVData`` isn't available.
 
@@ -115,7 +136,10 @@ def render_overlay_from_disk(
     from roigbiv.pipeline.loaders import load_fov_from_output_dir
 
     fov, _review_queue = load_fov_from_output_dir(Path(output_dir))
-    return render_overlay(fov, output_dir, model_name, fov_stem, timestamp=timestamp)
+    return render_overlay(
+        fov, output_dir, model_name, fov_stem,
+        timestamp=timestamp, outcomes=outcomes,
+    )
 
 
 def _stretch_to_uint8(img: np.ndarray, lo_pct: float, hi_pct: float) -> np.ndarray:

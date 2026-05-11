@@ -1,19 +1,16 @@
 """
 ROI G. Biv pipeline — CLI entry point + orchestrator.
 
-Wires Foundation → Stage 1 Cellpose → Gate 1 → Source Subtraction → outputs → Napari.
+Wires Foundation → Stage 1 Cellpose → Stage 2 Suite2p → Stage 3 FFT sweep →
+Stage 4 tonic search → outputs → optional Napari + overlay PNG + email.
 
-CLI:
-  roigbiv-pipeline \\
-    --input PATH         (required)  path to *_mc.tif or raw *.tif
-    --fs FLOAT           (required)  acquisition frame rate (Hz)
-    --model PATH         default: models/deployed/current_model
-    --tau FLOAT          default: 1.0
-    --k INT              default: 30
-    --output-dir PATH    default: inference/pipeline/{stem}/
-    --no-viewer          flag
+The ``roigbiv-pipeline`` console script accepts either a single ``.tif``
+file (classic single-FOV mode) or a directory of stacks (workspace mode:
+in-input ``output/``, ``registry.db``, auto-migrate, auto-backfill). All
+four stages run by default; pass ``--no-stage-N`` to skip. See
+``docs/email-notifications.md`` for the optional email-on-done path.
 
-All non-exposed parameters are hardcoded in PipelineConfig per spec §18.
+Non-flag parameters are hardcoded in :class:`PipelineConfig` per spec §18.
 """
 from __future__ import annotations
 
@@ -38,6 +35,60 @@ def _gpu_section(gpu_lock):
     `gpu_lock is None` (single-FOV default), this is a zero-cost no-op.
     """
     return gpu_lock if gpu_lock is not None else nullcontext()
+
+
+def _any_downstream_enabled(cfg: PipelineConfig, after_stage: int) -> bool:
+    """True iff any stage strictly after ``after_stage`` is enabled.
+
+    Used to decide whether to run a stage's subtraction step: subtraction is
+    only useful if a later enabled stage will consume the residual it writes.
+    Stage 1's subtraction is unconditional (handled by callers); this helper
+    is for stages 2 and 3.
+    """
+    for k in range(after_stage + 1, 5):
+        if getattr(cfg, f"enable_stage_{k}", False):
+            return True
+    return False
+
+
+def _stage_input_residual(fov: FOVData, stage_idx: int) -> Path:
+    """Return the latest residual path to feed into Stage ``stage_idx``.
+
+    When intermediate stages are disabled (``cfg.enable_stage_N=False``),
+    their subtraction step does not run, so ``fov.residual_S{N}_path`` stays
+    ``None``. This walks the chain backward and returns the deepest residual
+    that actually exists on disk. Fallback order for Stage 3 is S2 → S1 → S
+    (Foundation); for Stage 4 it is S3 → S2 → S1 → S.
+    """
+    for i in range(stage_idx - 1, 0, -1):
+        path = getattr(fov, f"residual_S{i}_path", None)
+        if path and Path(path).exists():
+            return Path(path)
+    if fov.residual_S_path and Path(fov.residual_S_path).exists():
+        return Path(fov.residual_S_path)
+    raise RuntimeError(
+        f"_stage_input_residual: no residual on disk for stage {stage_idx}"
+    )
+
+
+def _read_subtraction_pass_count(
+    output_dir: Path, stage_idx: int, fallback: int,
+) -> int:
+    """Read ``subtraction_report_residual_S{N}.json`` and count passes.
+
+    Used on resume to populate ``n_sub_pass`` when the subtraction step was
+    skipped. Falls back to ``fallback`` (typically the ROI count, i.e.
+    "assume all passed") when the report is absent or unparseable.
+    """
+    report_path = output_dir / f"subtraction_report_residual_S{stage_idx}.json"
+    if not report_path.exists():
+        return fallback
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    return sum(1 for v in report.values()
+               if isinstance(v, dict) and v.get("pass"))
 
 
 def _default_output_dir(tif_path: Path) -> Path:
@@ -200,6 +251,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     from roigbiv.pipeline.deconvolution import deconvolve_traces
     from roigbiv.pipeline.hitl import build_review_queue, export_hitl_package
     from roigbiv.pipeline.outputs import save_pipeline_outputs, print_final_summary
+    from roigbiv.pipeline.resume import plan_resume, update_manifest
 
     tif_path = Path(tif_path).resolve()
     if cfg.output_dir is None:
@@ -207,171 +259,276 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stage_timings = {}
-    warnings = []
+    stage_timings: dict = {}
+    warnings: list[str] = []
+
+    # ── Resume planning ───────────────────────────────────────────────────
+    rp = plan_resume(output_dir, tif_path, cfg, enable=cfg.resume)
+    if rp.enabled and rp.start_stage != "foundation":
+        print(f"Resume: starting from {rp.start_stage} "
+              f"(prior outputs in {output_dir.name})", flush=True)
+
+    # Locals downstream code reads regardless of whether the stage ran or
+    # was skipped. Skipped-stage paths repopulate these from on-disk reports.
+    n_accept = n_flag = n_reject = 0
+    n2_det = n2_acc = n2_flag = n2_rej = 0
+    n3_det = n3_acc = n3_flag = n3_rej = 0
+    n4_det = n4_flag = n4_rej = 0
+    rois_to_subtract: list = []
+    n_sub_pass = n_sub_total = 0
+    s2_subtract: list = []
+    n2_sub_pass = 0
+    s3_subtract: list = []
+    n3_sub_pass = 0
 
     # ── Foundation ────────────────────────────────────────────────────────
-    t_start = time.time()
-    fov = run_foundation(tif_path, cfg, output_dir)
-    stage_timings["foundation_s"] = time.time() - t_start
-    print(f"Foundation complete. k_background={fov.k_background}  "
-          f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})", flush=True)
+    if rp.should_run("foundation"):
+        t_start = time.time()
+        fov = run_foundation(tif_path, cfg, output_dir)
+        stage_timings["foundation_s"] = time.time() - t_start
+        update_manifest(output_dir, "foundation", cfg, tif_path)
+        print(f"Foundation complete. k_background={fov.k_background}  "
+              f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})", flush=True)
+    else:
+        fov = rp.fov  # populated by plan_resume from disk
+        print(f"Resume: foundation skipped "
+              f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})",
+              flush=True)
 
     # ── Stage 1 Cellpose detection ────────────────────────────────────────
-    print("\nStage 1: Cellpose detection (dual-channel mean_S + vcorr_S)", flush=True)
-    t_start = time.time()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
+    if rp.should_run("stage1"):
+        print("\nStage 1: Cellpose detection (dual-channel mean_S + vcorr_S)", flush=True)
+        t_start = time.time()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
-    # Use mean_M (raw movie mean) as the morphological channel for Cellpose.
-    # mean_S ≈ 0 under SVD-based L+S (top components absorb per-pixel mean),
-    # so mean_M preserves the morphological contrast Cellpose's training expects.
-    with _gpu_section(gpu_lock):
-        candidates, probs, label_image, cellprob_map = run_cellpose_detection(
-            fov.mean_M, fov.vcorr_S, cfg,
+        # Use mean_M (raw movie mean) as the morphological channel for Cellpose.
+        # mean_S ≈ 0 under SVD-based L+S (top components absorb per-pixel mean),
+        # so mean_M preserves the morphological contrast Cellpose's training expects.
+        with _gpu_section(gpu_lock):
+            candidates, probs, label_image, cellprob_map = run_cellpose_detection(
+                fov.mean_M, fov.vcorr_S, cfg,
+            )
+        stage_timings["stage1_detect_s"] = time.time() - t_start
+        n_detected = len(candidates)
+
+        # Save raw Stage 1 outputs (pre-gate)
+        (output_dir / "stage1").mkdir(exist_ok=True)
+        tifffile.imwrite(str(output_dir / "stage1" / "stage1_probs.tif"),
+                         cellprob_map.astype(np.float32))
+
+        # ── Gate 1 morphological validation ───────────────────────────────
+        # Use mean_M for soma-surround contrast (raw brightness levels;
+        # mean_S is near-zero and would make the contrast metric numerically
+        # unstable).
+        t_start = time.time()
+        rois = evaluate_gate1(candidates, probs, fov.mean_M, fov.vcorr_S,
+                              fov.dog_map, cfg, starting_label_id=1)
+        stage_timings["gate1_s"] = time.time() - t_start
+
+        n_accept = sum(1 for r in rois if r.gate_outcome == "accept")
+        n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
+        n_reject = sum(1 for r in rois if r.gate_outcome == "reject")
+        print(f"Stage 1: {n_detected} detected → "
+              f"{n_accept} accepted, {n_flag} flagged, {n_reject} rejected",
+              flush=True)
+
+        # Save Stage 1 mask image (accepted + flagged only — rejects not subtracted)
+        stage1_mask_img = np.zeros(fov.mean_S.shape, dtype=np.uint16)
+        for r in rois:
+            if r.gate_outcome in ("accept", "flag"):
+                stage1_mask_img[r.mask] = r.label_id
+        tifffile.imwrite(str(output_dir / "stage1" / "stage1_masks.tif"),
+                         stage1_mask_img)
+
+        stage1_report = {
+            "detected": n_detected,
+            "accepted": n_accept,
+            "flagged": n_flag,
+            "rejected": n_reject,
+            "rois": [r.to_serializable() for r in rois],
+        }
+        (output_dir / "stage1" / "stage1_report.json").write_text(
+            json.dumps(stage1_report, indent=2)
         )
-    stage_timings["stage1_detect_s"] = time.time() - t_start
-    n_detected = len(candidates)
-
-    # Save raw Stage 1 outputs (pre-gate)
-    (output_dir / "stage1").mkdir(exist_ok=True)
-    tifffile.imwrite(str(output_dir / "stage1" / "stage1_probs.tif"),
-                     cellprob_map.astype(np.float32))
-
-    # ── Gate 1 morphological validation ───────────────────────────────────
-    # Use mean_M for soma-surround contrast (raw brightness levels; mean_S is
-    # near-zero and would make the contrast metric numerically unstable).
-    t_start = time.time()
-    rois = evaluate_gate1(candidates, probs, fov.mean_M, fov.vcorr_S, fov.dog_map,
-                          cfg, starting_label_id=1)
-    stage_timings["gate1_s"] = time.time() - t_start
-
-    n_accept = sum(1 for r in rois if r.gate_outcome == "accept")
-    n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
-    n_reject = sum(1 for r in rois if r.gate_outcome == "reject")
-    print(f"Stage 1: {n_detected} detected → "
-          f"{n_accept} accepted, {n_flag} flagged, {n_reject} rejected", flush=True)
-
-    # Save Stage 1 mask image (accepted + flagged only — rejects not subtracted)
-    stage1_mask_img = np.zeros(fov.mean_S.shape, dtype=np.uint16)
-    for r in rois:
-        if r.gate_outcome in ("accept", "flag"):
-            stage1_mask_img[r.mask] = r.label_id
-    tifffile.imwrite(str(output_dir / "stage1" / "stage1_masks.tif"), stage1_mask_img)
-
-    stage1_report = {
-        "detected": n_detected,
-        "accepted": n_accept,
-        "flagged": n_flag,
-        "rejected": n_reject,
-        "rois": [r.to_serializable() for r in rois],
-    }
-    (output_dir / "stage1" / "stage1_report.json").write_text(
-        json.dumps(stage1_report, indent=2)
-    )
-    fov.rois = rois
-    fov.stage_counts["stage1"] = {
-        "detected": n_detected, "accepted": n_accept,
-        "flagged": n_flag, "rejected": n_reject,
-    }
+        fov.rois = rois
+        fov.stage_counts["stage1"] = {
+            "detected": n_detected, "accepted": n_accept,
+            "flagged": n_flag, "rejected": n_reject,
+        }
+        update_manifest(output_dir, "stage1", cfg, tif_path)
+    else:
+        sc = fov.stage_counts.get("stage1", {})
+        n_accept = int(sc.get("accepted", 0))
+        n_flag = int(sc.get("flagged", 0))
+        n_reject = int(sc.get("rejected", 0))
+        print(f"Resume: stage1 skipped "
+              f"({n_accept} accepted, {n_flag} flagged, {n_reject} rejected)",
+              flush=True)
 
     # ── Source subtraction (on accept + flag only) ────────────────────────
-    print("\nSource subtraction: accept+flag ROIs only", flush=True)
-    t_start = time.time()
-    rois_to_subtract = [r for r in rois if r.gate_outcome in ("accept", "flag")]
-    # Spatial profile source: std_S (per-pixel rms activity) rather than mean_S.
-    # Under truncated-SVD L+S, mean_S ≈ 0 everywhere so it can't represent
-    # the neuron's spatial activity pattern. std_S = rms(S) preserves it.
-    # See subtraction.estimate_spatial_profiles docstring for rationale.
-    with _gpu_section(gpu_lock):
-        residual_S1_path, validation, traces = run_source_subtraction(
-            fov.residual_S_path,
-            fov.shape,
-            fov.std_S,
-            rois_to_subtract,
-            output_dir,
-            cfg,
-            delete_input=True,
-        )
-    stage_timings["subtraction_s"] = time.time() - t_start
-    fov.residual_S1_path = residual_S1_path
+    if rp.should_run("stage1_subtract"):
+        print("\nSource subtraction: accept+flag ROIs only", flush=True)
+        t_start = time.time()
+        rois_to_subtract = [r for r in fov.rois
+                            if r.source_stage == 1
+                            and r.gate_outcome in ("accept", "flag")]
+        # Spatial profile source: std_S (per-pixel rms activity) rather than
+        # mean_S. Under truncated-SVD L+S, mean_S ≈ 0 everywhere so it can't
+        # represent the neuron's spatial activity pattern. std_S = rms(S)
+        # preserves it. See subtraction.estimate_spatial_profiles docstring.
+        with _gpu_section(gpu_lock):
+            residual_S1_path, validation, traces = run_source_subtraction(
+                fov.residual_S_path,
+                fov.shape,
+                fov.std_S,
+                rois_to_subtract,
+                output_dir,
+                cfg,
+                delete_input=True,
+            )
+        stage_timings["subtraction_s"] = time.time() - t_start
+        fov.residual_S1_path = residual_S1_path
 
-    # Populate traces on ROI objects and gather counts
-    n_sub_pass = sum(1 for v in validation.values() if v.get("pass"))
-    n_sub_total = len(validation)
-    if rois_to_subtract:
-        for roi, trace in zip(rois_to_subtract, traces):
-            roi.trace = trace
-    print(f"Source subtraction complete. Validation: "
-          f"{n_sub_pass}/{n_sub_total} passed", flush=True)
+        n_sub_pass = sum(1 for v in validation.values() if v.get("pass"))
+        n_sub_total = len(validation)
+        if rois_to_subtract:
+            for roi, trace in zip(rois_to_subtract, traces):
+                roi.trace = trace
+        print(f"Source subtraction complete. Validation: "
+              f"{n_sub_pass}/{n_sub_total} passed", flush=True)
 
-    if n_sub_total > 0 and n_sub_pass < n_sub_total:
-        warnings.append(
-            f"Subtraction validation: {n_sub_total - n_sub_pass} ROIs flagged for HITL review "
-            f"(anticorr < {cfg.subtract_anticorr_threshold} or std_ratio out of [0.3, 3.0])"
-        )
+        if n_sub_total > 0 and n_sub_pass < n_sub_total:
+            warnings.append(
+                f"Subtraction validation: {n_sub_total - n_sub_pass} ROIs "
+                f"flagged for HITL review "
+                f"(anticorr < {cfg.subtract_anticorr_threshold} or "
+                f"std_ratio out of [0.3, 3.0])"
+            )
+        update_manifest(output_dir, "stage1_subtract", cfg, tif_path)
+    else:
+        # plan_resume already attached fov.residual_S1_path and validated it.
+        rois_to_subtract = [r for r in fov.rois
+                            if r.source_stage == 1
+                            and r.gate_outcome in ("accept", "flag")]
+        n_sub_total = len(rois_to_subtract)
+        n_sub_pass = _read_subtraction_pass_count(output_dir, 1, fallback=n_sub_total)
+        print(f"Resume: stage1 subtraction skipped "
+              f"({n_sub_pass}/{n_sub_total} previously passed)", flush=True)
 
     next_label = max((r.label_id for r in fov.rois), default=0) + 1
 
     # ── Stage 2 Suite2p Temporal Detection ────────────────────────────────
-    print("\nStage 2: Suite2p temporal detection", flush=True)
-    t_start = time.time()
-    with _gpu_section(gpu_lock):
-        stage2_candidates = run_stage2(fov, cfg, starting_label_id=next_label)
-    stage1_for_gate2 = [r for r in fov.rois
-                        if r.source_stage == 1 and r.gate_outcome in ("accept", "flag")]
-    stage2_rois = evaluate_gate2(stage2_candidates, stage1_for_gate2, cfg)
-    stage_timings["stage2_detect_s"] = time.time() - t_start
+    if rp.should_run("stage2") and cfg.enable_stage_2:
+        print("\nStage 2: Suite2p temporal detection", flush=True)
+        t_start = time.time()
+        with _gpu_section(gpu_lock):
+            stage2_candidates = run_stage2(fov, cfg, starting_label_id=next_label)
+        stage1_for_gate2 = [r for r in fov.rois
+                            if r.source_stage == 1
+                            and r.gate_outcome in ("accept", "flag")]
+        stage2_rois = evaluate_gate2(stage2_candidates, stage1_for_gate2, cfg)
+        stage_timings["stage2_detect_s"] = time.time() - t_start
 
-    n2_det = len(stage2_rois)
-    n2_acc = sum(1 for r in stage2_rois if r.gate_outcome == "accept")
-    n2_flag = sum(1 for r in stage2_rois if r.gate_outcome == "flag")
-    n2_rej = sum(1 for r in stage2_rois if r.gate_outcome == "reject")
-    print(f"Stage 2: {n2_det} detected → {n2_acc} accepted, {n2_flag} flagged, "
-          f"{n2_rej} rejected", flush=True)
+        n2_det = len(stage2_rois)
+        n2_acc = sum(1 for r in stage2_rois if r.gate_outcome == "accept")
+        n2_flag = sum(1 for r in stage2_rois if r.gate_outcome == "flag")
+        n2_rej = sum(1 for r in stage2_rois if r.gate_outcome == "reject")
+        print(f"Stage 2: {n2_det} detected → {n2_acc} accepted, "
+              f"{n2_flag} flagged, {n2_rej} rejected", flush=True)
 
-    # Save Stage 2 outputs
-    (output_dir / "stage2").mkdir(exist_ok=True)
-    stage2_mask_img = np.zeros(fov.shape[1:], dtype=np.uint16)
-    for r in stage2_rois:
-        if r.gate_outcome in ("accept", "flag"):
-            stage2_mask_img[r.mask] = r.label_id
-    tifffile.imwrite(str(output_dir / "stage2" / "stage2_masks.tif"), stage2_mask_img)
-    (output_dir / "stage2" / "stage2_report.json").write_text(json.dumps({
-        "detected": n2_det, "accepted": n2_acc, "flagged": n2_flag, "rejected": n2_rej,
-        "rois": [r.to_serializable() for r in stage2_rois],
-    }, indent=2))
+        # Save Stage 2 outputs
+        (output_dir / "stage2").mkdir(exist_ok=True)
+        stage2_mask_img = np.zeros(fov.shape[1:], dtype=np.uint16)
+        for r in stage2_rois:
+            if r.gate_outcome in ("accept", "flag"):
+                stage2_mask_img[r.mask] = r.label_id
+        tifffile.imwrite(str(output_dir / "stage2" / "stage2_masks.tif"),
+                         stage2_mask_img)
+        (output_dir / "stage2" / "stage2_report.json").write_text(json.dumps({
+            "detected": n2_det, "accepted": n2_acc, "flagged": n2_flag,
+            "rejected": n2_rej,
+            "rois": [r.to_serializable() for r in stage2_rois],
+        }, indent=2))
 
-    fov.rois.extend([r for r in stage2_rois if r.gate_outcome != "reject"])
-    fov.stage_counts["stage2"] = {
-        "detected": n2_det, "accepted": n2_acc, "flagged": n2_flag, "rejected": n2_rej,
-    }
-
-    # Subtract Stage 2 accept+flag from S₁ → S₂
-    print("\nSource subtraction (Stage 2 → S₂): accept+flag ROIs only", flush=True)
-    t_start = time.time()
-    s2_subtract = [r for r in stage2_rois if r.gate_outcome in ("accept", "flag")]
-    if s2_subtract:
-        std_S1 = compute_std_map(fov.residual_S1_path, fov.shape,
-                                 chunk=cfg.reconstruct_chunk)
+        fov.rois.extend([r for r in stage2_rois if r.gate_outcome != "reject"])
+        fov.stage_counts["stage2"] = {
+            "detected": n2_det, "accepted": n2_acc,
+            "flagged": n2_flag, "rejected": n2_rej,
+        }
+        update_manifest(output_dir, "stage2", cfg, tif_path)
+    elif rp.should_run("stage2") and not cfg.enable_stage_2:
+        print("Stage 2: skipped (disabled via cfg.enable_stage_2=False)",
+              flush=True)
+        fov.stage_counts["stage2"] = {"detected": 0, "accepted": 0,
+                                      "flagged": 0, "rejected": 0}
+        update_manifest(output_dir, "stage2", cfg, tif_path, status="skipped")
     else:
-        std_S1 = fov.std_S  # unused when no ROIs, but pass something valid
-    with _gpu_section(gpu_lock):
-        residual_S2_path, validation2, traces2 = run_source_subtraction(
-            fov.residual_S1_path, fov.shape, std_S1, s2_subtract, output_dir, cfg,
-            output_name="residual_S2",
-            delete_input=True,
-        )
-    stage_timings["stage2_subtract_s"] = time.time() - t_start
-    fov.residual_S2_path = residual_S2_path
-    if s2_subtract:
-        for roi, tr in zip(s2_subtract, traces2):
-            roi.trace = tr
-    n2_sub_pass = sum(1 for v in validation2.values() if v.get("pass"))
+        sc = fov.stage_counts.get("stage2", {})
+        n2_det = int(sc.get("detected", 0))
+        n2_acc = int(sc.get("accepted", 0))
+        n2_flag = int(sc.get("flagged", 0))
+        n2_rej = int(sc.get("rejected", 0))
+        print(f"Resume: stage2 skipped "
+              f"({n2_acc} accepted, {n2_flag} flagged, {n2_rej} rejected)",
+              flush=True)
+
+    # Subtract Stage 2 accept+flag from S₁ → S₂. Only runs when Stage 2
+    # itself ran AND a downstream stage will read the residual.
+    s2_should_subtract = (
+        cfg.enable_stage_2
+        and _any_downstream_enabled(cfg, after_stage=2)
+        and rp.should_run("stage2_subtract")
+    )
+    if s2_should_subtract:
+        print("\nSource subtraction (Stage 2 → S₂): accept+flag ROIs only", flush=True)
+        t_start = time.time()
+        s2_subtract = [r for r in fov.rois
+                       if r.source_stage == 2
+                       and r.gate_outcome in ("accept", "flag")]
+        if s2_subtract:
+            std_S1 = compute_std_map(fov.residual_S1_path, fov.shape,
+                                     chunk=cfg.reconstruct_chunk)
+        else:
+            std_S1 = fov.std_S  # unused when no ROIs, but pass something valid
+        with _gpu_section(gpu_lock):
+            residual_S2_path, validation2, traces2 = run_source_subtraction(
+                fov.residual_S1_path, fov.shape, std_S1, s2_subtract,
+                output_dir, cfg,
+                output_name="residual_S2",
+                delete_input=True,
+            )
+        stage_timings["stage2_subtract_s"] = time.time() - t_start
+        fov.residual_S2_path = residual_S2_path
+        if s2_subtract:
+            for roi, tr in zip(s2_subtract, traces2):
+                roi.trace = tr
+        n2_sub_pass = sum(1 for v in validation2.values() if v.get("pass"))
+        update_manifest(output_dir, "stage2_subtract", cfg, tif_path)
+    elif rp.should_run("stage2_subtract"):
+        # No downstream consumer (or Stage 2 disabled). Stage 3+ readers will
+        # fall back to residual_S1 via _stage_input_residual; nothing to do.
+        if not cfg.enable_stage_2:
+            reason = "Stage 2 disabled"
+        else:
+            reason = "no downstream stage enabled"
+        print(f"Stage 2 subtraction: skipped ({reason})", flush=True)
+        s2_subtract = []
+        n2_sub_pass = 0
+        update_manifest(output_dir, "stage2_subtract", cfg, tif_path,
+                        status="skipped")
+    else:
+        s2_subtract = [r for r in fov.rois
+                       if r.source_stage == 2
+                       and r.gate_outcome in ("accept", "flag")]
+        n2_sub_pass = _read_subtraction_pass_count(output_dir, 2,
+                                                   fallback=len(s2_subtract))
+        print(f"Resume: stage2 subtraction skipped "
+              f"({n2_sub_pass}/{len(s2_subtract)} previously passed)", flush=True)
 
     # Cascade warning (Blindspot 2): Stage 2 accept > 1.5 × Stage 1 accept
     if n_accept > 0 and n2_acc > 1.5 * n_accept:
@@ -381,79 +538,135 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         )
 
     # ── Stage 3 Template Sweep ────────────────────────────────────────────
-    print("\nStage 3: template sweep on S₂", flush=True)
-    next_label = max((r.label_id for r in fov.rois), default=0) + 1
-    t_start = time.time()
     template_bank = build_template_bank(cfg.fs, cfg.tau)
-    with _gpu_section(gpu_lock):
-        stage3_candidates = run_stage3(
-            residual_S2_path, fov, template_bank, cfg, starting_label_id=next_label,
+    if rp.should_run("stage3") and cfg.enable_stage_3:
+        # Stage 3 reads the latest residual on disk: S₂ if Stage 2 subtracted,
+        # else S₁. _stage_input_residual handles the fallback.
+        s3_input_residual = _stage_input_residual(fov, 3)
+        print(f"\nStage 3: template sweep on {s3_input_residual.name}",
+              flush=True)
+        next_label = max((r.label_id for r in fov.rois), default=0) + 1
+        t_start = time.time()
+        with _gpu_section(gpu_lock):
+            stage3_candidates = run_stage3(
+                s3_input_residual, fov, template_bank, cfg,
+                starting_label_id=next_label,
+            )
+        prior_for_gate3 = [r for r in fov.rois
+                           if r.gate_outcome in ("accept", "flag")]
+        stage3_rois = evaluate_gate3(
+            stage3_candidates, prior_for_gate3, s3_input_residual,
+            fov.shape, template_bank, cfg,
         )
-    prior_for_gate3 = [r for r in fov.rois
-                       if r.gate_outcome in ("accept", "flag")]
-    stage3_rois = evaluate_gate3(
-        stage3_candidates, prior_for_gate3, residual_S2_path, fov.shape,
-        template_bank, cfg,
-    )
-    stage_timings["stage3_detect_s"] = time.time() - t_start
+        stage_timings["stage3_detect_s"] = time.time() - t_start
 
-    n3_det = len(stage3_rois)
-    n3_acc = sum(1 for r in stage3_rois if r.gate_outcome == "accept")
-    n3_flag = sum(1 for r in stage3_rois if r.gate_outcome == "flag")
-    n3_rej = sum(1 for r in stage3_rois if r.gate_outcome == "reject")
-    print(f"Stage 3: {n3_det} candidates → {n3_acc} accepted, {n3_flag} flagged, "
-          f"{n3_rej} rejected", flush=True)
+        n3_det = len(stage3_rois)
+        n3_acc = sum(1 for r in stage3_rois if r.gate_outcome == "accept")
+        n3_flag = sum(1 for r in stage3_rois if r.gate_outcome == "flag")
+        n3_rej = sum(1 for r in stage3_rois if r.gate_outcome == "reject")
+        print(f"Stage 3: {n3_det} candidates → {n3_acc} accepted, "
+              f"{n3_flag} flagged, {n3_rej} rejected", flush=True)
 
-    # Save Stage 3 outputs
-    (output_dir / "stage3").mkdir(exist_ok=True)
-    stage3_mask_img = np.zeros(fov.shape[1:], dtype=np.uint16)
-    for r in stage3_rois:
-        if r.gate_outcome in ("accept", "flag"):
-            stage3_mask_img[r.mask] = r.label_id
-    tifffile.imwrite(str(output_dir / "stage3" / "stage3_masks.tif"), stage3_mask_img)
-    events_blob = [
-        {
-            "label_id": r.label_id,
-            "gate_outcome": r.gate_outcome,
-            "event_count": r.event_count,
-            "events": r.features.get("events", []),
-            "picked_events": r.features.get("picked_events", []),
+        # Save Stage 3 outputs
+        (output_dir / "stage3").mkdir(exist_ok=True)
+        stage3_mask_img = np.zeros(fov.shape[1:], dtype=np.uint16)
+        for r in stage3_rois:
+            if r.gate_outcome in ("accept", "flag"):
+                stage3_mask_img[r.mask] = r.label_id
+        tifffile.imwrite(str(output_dir / "stage3" / "stage3_masks.tif"),
+                         stage3_mask_img)
+        events_blob = [
+            {
+                "label_id": r.label_id,
+                "gate_outcome": r.gate_outcome,
+                "event_count": r.event_count,
+                "events": r.features.get("events", []),
+                "picked_events": r.features.get("picked_events", []),
+            }
+            for r in stage3_rois
+        ]
+        np.save(str(output_dir / "stage3" / "stage3_events.npy"),
+                np.array(events_blob, dtype=object), allow_pickle=True)
+        (output_dir / "stage3" / "stage3_report.json").write_text(json.dumps({
+            "detected": n3_det, "accepted": n3_acc, "flagged": n3_flag,
+            "rejected": n3_rej,
+            "rois": [r.to_serializable() for r in stage3_rois],
+        }, indent=2))
+
+        fov.rois.extend([r for r in stage3_rois if r.gate_outcome != "reject"])
+        fov.stage_counts["stage3"] = {
+            "detected": n3_det, "accepted": n3_acc,
+            "flagged": n3_flag, "rejected": n3_rej,
         }
-        for r in stage3_rois
-    ]
-    np.save(str(output_dir / "stage3" / "stage3_events.npy"),
-            np.array(events_blob, dtype=object), allow_pickle=True)
-    (output_dir / "stage3" / "stage3_report.json").write_text(json.dumps({
-        "detected": n3_det, "accepted": n3_acc, "flagged": n3_flag, "rejected": n3_rej,
-        "rois": [r.to_serializable() for r in stage3_rois],
-    }, indent=2))
-
-    fov.rois.extend([r for r in stage3_rois if r.gate_outcome != "reject"])
-    fov.stage_counts["stage3"] = {
-        "detected": n3_det, "accepted": n3_acc, "flagged": n3_flag, "rejected": n3_rej,
-    }
-
-    # Subtract Stage 3 accept+flag from S₂ → S₃ (handoff for Phase 1E)
-    print("\nSource subtraction (Stage 3 → S₃): accept+flag ROIs only", flush=True)
-    t_start = time.time()
-    s3_subtract = [r for r in stage3_rois if r.gate_outcome in ("accept", "flag")]
-    if s3_subtract:
-        std_S2 = compute_std_map(residual_S2_path, fov.shape,
-                                 chunk=cfg.reconstruct_chunk)
+        update_manifest(output_dir, "stage3", cfg, tif_path)
+    elif rp.should_run("stage3") and not cfg.enable_stage_3:
+        print("Stage 3: skipped (disabled via cfg.enable_stage_3=False)",
+              flush=True)
+        fov.stage_counts["stage3"] = {"detected": 0, "accepted": 0,
+                                      "flagged": 0, "rejected": 0}
+        update_manifest(output_dir, "stage3", cfg, tif_path, status="skipped")
     else:
-        std_S2 = fov.std_S
-    with _gpu_section(gpu_lock):
-        residual_S3_path, validation3, traces3 = run_source_subtraction(
-            residual_S2_path, fov.shape, std_S2, s3_subtract, output_dir, cfg,
-            output_name="residual_S3",
-            delete_input=True,
-        )
-    stage_timings["stage3_subtract_s"] = time.time() - t_start
-    fov.residual_S3_path = residual_S3_path
-    if s3_subtract:
-        for roi, tr in zip(s3_subtract, traces3):
-            roi.trace = tr
-    n3_sub_pass = sum(1 for v in validation3.values() if v.get("pass"))
+        sc = fov.stage_counts.get("stage3", {})
+        n3_det = int(sc.get("detected", 0))
+        n3_acc = int(sc.get("accepted", 0))
+        n3_flag = int(sc.get("flagged", 0))
+        n3_rej = int(sc.get("rejected", 0))
+        print(f"Resume: stage3 skipped "
+              f"({n3_acc} accepted, {n3_flag} flagged, {n3_rej} rejected)",
+              flush=True)
+
+    # Subtract Stage 3 accept+flag from the latest residual → S₃. Only
+    # runs when Stage 3 detected AND Stage 4 will consume the residual.
+    s3_should_subtract = (
+        cfg.enable_stage_3
+        and _any_downstream_enabled(cfg, after_stage=3)
+        and rp.should_run("stage3_subtract")
+    )
+    if s3_should_subtract:
+        s3_input_residual = _stage_input_residual(fov, 3)
+        print(f"\nSource subtraction (Stage 3 → S₃) on {s3_input_residual.name}: "
+              "accept+flag ROIs only", flush=True)
+        t_start = time.time()
+        s3_subtract = [r for r in fov.rois
+                       if r.source_stage == 3
+                       and r.gate_outcome in ("accept", "flag")]
+        if s3_subtract:
+            std_in = compute_std_map(s3_input_residual, fov.shape,
+                                     chunk=cfg.reconstruct_chunk)
+        else:
+            std_in = fov.std_S
+        with _gpu_section(gpu_lock):
+            residual_S3_path, validation3, traces3 = run_source_subtraction(
+                s3_input_residual, fov.shape, std_in, s3_subtract,
+                output_dir, cfg,
+                output_name="residual_S3",
+                delete_input=True,
+            )
+        stage_timings["stage3_subtract_s"] = time.time() - t_start
+        fov.residual_S3_path = residual_S3_path
+        if s3_subtract:
+            for roi, tr in zip(s3_subtract, traces3):
+                roi.trace = tr
+        n3_sub_pass = sum(1 for v in validation3.values() if v.get("pass"))
+        update_manifest(output_dir, "stage3_subtract", cfg, tif_path)
+    elif rp.should_run("stage3_subtract"):
+        if not cfg.enable_stage_3:
+            reason = "Stage 3 disabled"
+        else:
+            reason = "no downstream stage enabled"
+        print(f"Stage 3 subtraction: skipped ({reason})", flush=True)
+        s3_subtract = []
+        n3_sub_pass = 0
+        update_manifest(output_dir, "stage3_subtract", cfg, tif_path,
+                        status="skipped")
+    else:
+        s3_subtract = [r for r in fov.rois
+                       if r.source_stage == 3
+                       and r.gate_outcome in ("accept", "flag")]
+        n3_sub_pass = _read_subtraction_pass_count(output_dir, 3,
+                                                   fallback=len(s3_subtract))
+        print(f"Resume: stage3 subtraction skipped "
+              f"({n3_sub_pass}/{len(s3_subtract)} previously passed)", flush=True)
 
     # Cascade warning: Stage 3 accept > 0.5 × Stage 2 accept
     if n2_acc > 0 and n3_acc > 0.5 * n2_acc:
@@ -463,35 +676,54 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         )
 
     # ── Stage 4: Tonic Neuron Search ─────────────────────────────────────
-    print("\nStage 4: multi-scale bandpass + correlation contrast on S₃", flush=True)
-    next_label = max((r.label_id for r in fov.rois), default=0) + 1
-    t_start = time.time()
-    stage4_candidates = run_stage4(fov.residual_S3_path, fov, cfg,
-                                   starting_label_id=next_label)
-    prior_for_gate4 = [r for r in fov.rois if r.gate_outcome in ("accept", "flag")]
-    # Gate 4 uses mean_M (raw morphological mean) for the intensity-percentile
-    # check. mean_S ≈ 0 under SVD-based L+S (foundation.py:500) so it can't
-    # represent actual brightness; see gate4.py module docstring.
-    stage4_rois = evaluate_gate4(
-        stage4_candidates, prior_for_gate4,
-        fov.mean_M, fov.motion_x, fov.motion_y, cfg,
-    )
-    stage_timings["stage4_detect_s"] = time.time() - t_start
+    if rp.should_run("stage4") and cfg.enable_stage_4:
+        s4_input_residual = _stage_input_residual(fov, 4)
+        print(f"\nStage 4: multi-scale bandpass + correlation contrast on "
+              f"{s4_input_residual.name}", flush=True)
+        next_label = max((r.label_id for r in fov.rois), default=0) + 1
+        t_start = time.time()
+        stage4_candidates = run_stage4(s4_input_residual, fov, cfg,
+                                       starting_label_id=next_label)
+        prior_for_gate4 = [r for r in fov.rois
+                           if r.gate_outcome in ("accept", "flag")]
+        # Gate 4 uses mean_M (raw morphological mean) for the intensity-
+        # percentile check. mean_S ≈ 0 under SVD-based L+S
+        # (foundation.py:500) so it can't represent actual brightness; see
+        # gate4.py module docstring.
+        stage4_rois = evaluate_gate4(
+            stage4_candidates, prior_for_gate4,
+            fov.mean_M, fov.motion_x, fov.motion_y, cfg,
+        )
+        stage_timings["stage4_detect_s"] = time.time() - t_start
 
-    n4_det = len(stage4_rois)
-    n4_flag = sum(1 for r in stage4_rois if r.gate_outcome == "flag")
-    n4_rej = sum(1 for r in stage4_rois if r.gate_outcome == "reject")
-    print(f"Stage 4: {n4_det} candidates → {n4_flag} requires_review, "
-          f"{n4_rej} rejected (no accept tier by design)", flush=True)
+        n4_det = len(stage4_rois)
+        n4_flag = sum(1 for r in stage4_rois if r.gate_outcome == "flag")
+        n4_rej = sum(1 for r in stage4_rois if r.gate_outcome == "reject")
+        print(f"Stage 4: {n4_det} candidates → {n4_flag} requires_review, "
+              f"{n4_rej} rejected (no accept tier by design)", flush=True)
 
-    _write_stage4_outputs(fov, stage4_rois, cfg, output_dir)
-    fov.rois.extend([r for r in stage4_rois if r.gate_outcome != "reject"])
-    fov.stage_counts["stage4"] = {
-        "detected": n4_det,
-        "accepted": 0,         # Gate 4 has no accept tier
-        "flagged": n4_flag,
-        "rejected": n4_rej,
-    }
+        _write_stage4_outputs(fov, stage4_rois, cfg, output_dir)
+        fov.rois.extend([r for r in stage4_rois if r.gate_outcome != "reject"])
+        fov.stage_counts["stage4"] = {
+            "detected": n4_det,
+            "accepted": 0,         # Gate 4 has no accept tier
+            "flagged": n4_flag,
+            "rejected": n4_rej,
+        }
+        update_manifest(output_dir, "stage4", cfg, tif_path)
+    elif rp.should_run("stage4") and not cfg.enable_stage_4:
+        print("Stage 4: skipped (disabled via cfg.enable_stage_4=False)",
+              flush=True)
+        fov.stage_counts["stage4"] = {"detected": 0, "accepted": 0,
+                                      "flagged": 0, "rejected": 0}
+        update_manifest(output_dir, "stage4", cfg, tif_path, status="skipped")
+    else:
+        sc = fov.stage_counts.get("stage4", {})
+        n4_det = int(sc.get("detected", 0))
+        n4_flag = int(sc.get("flagged", 0))
+        n4_rej = int(sc.get("rejected", 0))
+        print(f"Resume: stage4 skipped "
+              f"({n4_flag} requires_review, {n4_rej} rejected)", flush=True)
 
     # Cascade warning: Stage 4 detected > Stage 3 detected is a red flag
     if n3_det > 0 and n4_det > n3_det:
@@ -505,11 +737,19 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     summary_warnings = print_detection_summary(fov)
     warnings.extend(summary_warnings)
 
-    # Drop the final residual — S₃ is no longer read by anything downstream
-    # (extract_all_traces reads data.bin, not residuals). Keeps permanent
-    # footprint at ~1 movie's worth of bytes instead of ~4.
-    if fov.residual_S3_path and Path(fov.residual_S3_path).exists():
-        Path(fov.residual_S3_path).unlink()
+    # Drop the final residual — extract_all_traces reads data.bin (not any
+    # residual), so nothing downstream needs it. The deepest residual on disk
+    # depends on which stages ran (Stage N's subtraction deletes its input,
+    # so only one residual remains).
+    for residual_attr in ("residual_S3_path", "residual_S2_path",
+                          "residual_S1_path"):
+        p = getattr(fov, residual_attr, None)
+        if p and Path(p).exists():
+            Path(p).unlink()
+            meta = Path(p).with_suffix(".meta.json")
+            if meta.exists():
+                meta.unlink()
+            break
 
     # ── Post-detection: traces, overlap correction, features, classify,
     #    dF/F, deconvolution, HITL, final outputs ─────────────────────────
@@ -593,66 +833,267 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     return fov
 
 
-def main():
+_DEFAULT_MODEL = "models/deployed/current_model"
+_CHECKPOINTS_GLOB = "models/checkpoints/models/run*_epoch_*"
+
+
+def _parse_channels(spec: str) -> tuple:
+    parts = [p.strip() for p in spec.split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"--channels must be 'int,int' (got {spec!r})"
+        )
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid --channels value: {exc}")
+
+
+def _parse_overlay_outcomes(spec: str) -> tuple[str, ...]:
+    valid = {"accept", "flag", "reject"}
+    parts = tuple(p.strip().lower() for p in spec.split(",") if p.strip())
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            "--overlay-outcomes cannot be empty"
+        )
+    bad = [p for p in parts if p not in valid]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"invalid --overlay-outcomes value(s): {bad}. "
+            "Valid: accept, flag, reject"
+        )
+    seen: set[str] = set()
+    return tuple(p for p in parts if not (p in seen or seen.add(p)))
+
+
+def _resolve_model(spec: str) -> str:
+    """Resolve the --model argument to a path or Cellpose builtin name.
+
+    ``latest`` walks ``models/checkpoints/models/run*_epoch_*`` and picks the
+    newest by mtime. Anything else is returned verbatim.
+    """
+    import sys as _sys
+
+    project_root = Path(__file__).resolve().parents[2]
+    if spec == "latest":
+        candidates = sorted(
+            project_root.glob(_CHECKPOINTS_GLOB),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if candidates:
+            chosen = candidates[-1]
+            print(f"Resolved --model latest → {chosen}", flush=True)
+            return str(chosen)
+        fallback = project_root / _DEFAULT_MODEL
+        print(
+            f"WARN: no checkpoints under {_CHECKPOINTS_GLOB}; "
+            f"falling back to {fallback}",
+            file=_sys.stderr,
+        )
+        return str(fallback)
+    return spec
+
+
+def _stage_flags(cfg: PipelineConfig) -> dict[int, bool]:
+    return {2: cfg.enable_stage_2, 3: cfg.enable_stage_3, 4: cfg.enable_stage_4}
+
+
+def _build_pipeline_summary(cfg: PipelineConfig, args: argparse.Namespace) -> dict:
+    return {
+        "model_name": Path(cfg.cellpose_model).name,
+        "fs": cfg.fs,
+        "tau": cfg.tau,
+        "diameter": args.diameter,
+        "cellprob_threshold": args.cellprob_threshold,
+        "flow_threshold": args.flow_threshold,
+        "stage_flags": _stage_flags(cfg),
+    }
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    """Entry point for the ``roigbiv-pipeline`` console script.
+
+    Exit codes:
+        0  pipeline succeeded; email succeeded (or was not requested)
+        1  all FOVs failed
+        2  bad input (missing path, no TIFs found)
+        3  pipeline succeeded but SMTP delivery failed (overlays preserved)
+    """
+    import sys
+
     parser = argparse.ArgumentParser(
         prog="roigbiv-pipeline",
         description=(
-            "ROI G. Biv sequential subtractive detection pipeline "
-            "(Foundation + Stage 1 + Gate 1 + Source Subtraction)."
+            "ROI G. Biv sequential subtractive detection pipeline. Accepts "
+            "a single TIF or a directory of TIFs. A directory input triggers "
+            "workspace mode (in-input output/, registry.db, auto-migrate). "
+            "All four stages run by default; pass --no-stage-N to skip."
         ),
+        epilog=(
+            "Email goes through Proton Mail Bridge on 127.0.0.1:1025 by\n"
+            "default. One-time Bridge setup is documented in\n"
+            "docs/email-notifications.md; copy the per-mailbox password\n"
+            "into ROIGBIV_SMTP_PASSWORD.\n\n"
+            "Examples:\n"
+            "  roigbiv-pipeline --input stack_mc.tif --fs 7.5\n"
+            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --n-workers 2\n"
+            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 \\\n"
+            "      --email-to me@example.com --smtp-user me@proton.me\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input", required=True, type=Path,
-                        help="Path to raw *.tif or motion-corrected *_mc.tif stack")
+                        help=("Path to a *.tif stack OR a directory of "
+                              "stacks. Directory ⇒ workspace mode."))
     parser.add_argument("--fs", required=True, type=float,
-                        help=("Effective frame rate (Hz) of the stack being "
-                              "processed. For 4x-averaged 30 Hz acquisitions "
-                              "pass 7.5."))
+                        help=("Effective frame rate (Hz). For 4×-averaged "
+                              "30 Hz acquisitions pass 7.5."))
     parser.add_argument("--frame-averaging", dest="frame_averaging",
                         type=int, default=1,
                         help=("Temporal binning factor that produced --fs "
                               "(default 1 = un-averaged). Recorded in "
                               "traces_meta.json for pynapse handoff."))
-    parser.add_argument("--model", type=str, default="models/deployed/current_model",
-                        help="Cellpose model path or built-in name (default: deployed fine-tune)")
+    parser.add_argument("--model", type=str, default=_DEFAULT_MODEL,
+                        help=("Cellpose model path, built-in name, or "
+                              "'latest' (newest mtime in "
+                              "models/checkpoints/models/). "
+                              f"Default: {_DEFAULT_MODEL}"))
     parser.add_argument("--tau", type=float, default=1.0,
-                        help="Indicator decay constant (default: 1.0, GCaMP6s)")
+                        help="Indicator decay constant (default: 1.0, GCaMP6s).")
+    parser.add_argument("--diameter", type=int, default=12,
+                        help="Cellpose diameter (default 12).")
+    parser.add_argument("--cellprob-threshold", dest="cellprob_threshold",
+                        type=float, default=-2.0,
+                        help="Cellpose cell-probability threshold (default -2.0).")
+    parser.add_argument("--flow-threshold", dest="flow_threshold",
+                        type=float, default=0.6,
+                        help="Cellpose flow threshold (default 0.6).")
+    parser.add_argument("--channels", type=_parse_channels, default=(1, 2),
+                        help="Cellpose channels as 'cyto,nucleus' (default 1,2).")
     parser.add_argument("--k", type=int, default=30,
-                        help="Background components for L+S separation (default: 30)")
+                        help="Background components for L+S separation (default 30).")
     parser.add_argument("--output-dir", type=Path, default=None,
-                        help="Output directory (default: inference/pipeline/{stem}/)")
+                        help=("Output directory for single-FOV runs (default: "
+                              "inference/pipeline/{stem}/). Ignored in "
+                              "workspace mode."))
     parser.add_argument("--no-viewer", action="store_true",
-                        help="Skip Napari display at the end")
+                        help=("Skip Napari display at the end of single-FOV "
+                              "runs. Implied when --email-to is set or "
+                              "input is a directory."))
     parser.add_argument("--registry", action="store_true",
-                        help=("Register/match this FOV against the cross-session "
-                              "registry (SQLite under inference/registry.db by "
-                              "default; override with ROIGBIV_REGISTRY_DSN)."))
-    parser.add_argument("--workspace", action="store_true",
-                        help=("Run in workspace mode: outputs go under "
-                              "<input_root>/output/{stem}/, the registry lives "
-                              "in <input_root>/registry.db, and alembic "
-                              "upgrade + backfill are performed automatically. "
-                              "Overrides --output-dir and --registry."))
-    args = parser.parse_args()
+                        help=("Register/match this FOV against the cross-"
+                              "session registry (single-FOV mode only — "
+                              "workspace mode always registers)."))
+    parser.add_argument("--resume", action="store_true",
+                        help=("Skip stages whose outputs already exist in "
+                              "the output directory. Refuses if config or "
+                              "input has changed."))
+    parser.add_argument("--n-workers", dest="n_workers", type=int, default=1,
+                        help=("Parallel FOV workers for directory inputs "
+                              "(capped at 2). Ignored for single-TIF input."))
+    parser.add_argument("--email-to", dest="email_to", type=str, default=None,
+                        help=("Recipient email. Omit to skip email entirely. "
+                              "On SMTP failure exit code is 3; overlays are "
+                              "preserved on disk."))
+    parser.add_argument("--smtp-host", dest="smtp_host", type=str,
+                        default="127.0.0.1",
+                        help=("SMTP host. Default targets a local Proton "
+                              "Mail Bridge instance."))
+    parser.add_argument("--smtp-port", dest="smtp_port", type=int, default=1025,
+                        help="SMTP port (STARTTLS).")
+    parser.add_argument("--smtp-user", dest="smtp_user", type=str, default=None,
+                        help="SMTP username. Required when --email-to is set.")
+    parser.add_argument("--smtp-password-env", dest="smtp_password_env",
+                        type=str, default="ROIGBIV_SMTP_PASSWORD",
+                        help=("Env-var name holding the SMTP password. "
+                              "Never pass the password on the command line."))
+    parser.add_argument("--no-email", dest="no_email", action="store_true",
+                        help="Skip email even when --email-to is set.")
+    parser.add_argument("--overlay-outcomes", dest="overlay_outcomes",
+                        type=_parse_overlay_outcomes,
+                        default=("accept", "flag", "reject"),
+                        help=("Comma-separated subset of accept,flag,reject "
+                              "controlling which gate outcomes are drawn on "
+                              "the overlay PNG. Default: all three (every "
+                              "detected ROI). Example: --overlay-outcomes "
+                              "accept,flag to hide rejects."))
+    # Per-stage flags. BooleanOptionalAction gives us --stage-N / --no-stage-N.
+    parser.add_argument("--stage-2", dest="enable_stage_2",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Run Stage 2 (Suite2p temporal detection). "
+                              "Default: enabled. Pass --no-stage-2 to skip."))
+    parser.add_argument("--stage-3", dest="enable_stage_3",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Run Stage 3 (FFT template sweep for sparse-"
+                              "firing cells). Default: enabled. Pass "
+                              "--no-stage-3 to skip."))
+    parser.add_argument("--stage-4", dest="enable_stage_4",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Run Stage 4 (tonic neuron correlation-"
+                              "contrast search). Default: enabled. Pass "
+                              "--no-stage-4 to skip."))
+    parser.add_argument("--cpu", dest="force_cpu", action="store_true",
+                        default=False,
+                        help=("Force CPU-only execution for all Torch and "
+                              "Cellpose operations. Overrides CUDA "
+                              "auto-detection. Useful on non-CUDA machines "
+                              "or when GPU memory is unavailable."))
 
-    if args.workspace:
-        from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
+    args = parser.parse_args(argv)
 
-        workspace = resolve_workspace(args.input)
-        overrides = {
-            "fs": args.fs,
-            "frame_averaging": args.frame_averaging,
-            "tau": args.tau,
-            "k_background": args.k,
-            "cellpose_model": args.model,
-            "no_viewer": True,   # workspace flow is non-interactive
-        }
-        results = run_with_workspace(
-            workspace, overrides, log_cb=lambda m: print(m, flush=True),
-        )
-        failures = [r for r in results if r.error]
-        if failures:
-            raise SystemExit(1)
-        return
+    if args.email_to and not args.no_email and not args.smtp_user:
+        parser.error("--smtp-user is required when --email-to is set")
+
+    try:
+        input_path = args.input.resolve(strict=True)
+    except FileNotFoundError:
+        print(f"ERROR: --input path does not exist: {args.input}",
+              file=sys.stderr)
+        return 2
+
+    args.model = _resolve_model(args.model)
+
+    # Stage-enable overrides only forwarded when explicitly set on the CLI
+    # (BooleanOptionalAction default=None ⇒ "untouched"); otherwise fall
+    # through to PipelineConfig's defaults.
+    stage_overrides = {
+        f"enable_stage_{n}": getattr(args, f"enable_stage_{n}")
+        for n in (2, 3, 4)
+        if getattr(args, f"enable_stage_{n}") is not None
+    }
+
+    if input_path.is_dir():
+        return _run_workspace(args, input_path, stage_overrides)
+    if input_path.is_file():
+        return _run_single(args, input_path, stage_overrides)
+    print(f"ERROR: --input is neither a file nor a directory: {input_path}",
+          file=sys.stderr)
+    return 2
+
+
+def _run_single(
+    args: argparse.Namespace,
+    tif_path: Path,
+    stage_overrides: dict,
+) -> int:
+    """Classic single-FOV path. Returns the process exit code."""
+    import sys
+    import time
+
+    from roigbiv import overlay as _overlay
+    from roigbiv.pipeline._email import (
+        EmailFOVResult,
+        EmailParams,
+        fmt_duration,
+        send_email,
+    )
+
+    # Email path implies headless: never open Napari.
+    no_viewer = args.no_viewer or bool(args.email_to and not args.no_email)
+
+    if args.force_cpu:
+        import os
+        os.environ.setdefault("ROIGBIV_ROICAT_DEVICE", "cpu")
 
     cfg = PipelineConfig(
         fs=args.fs,
@@ -660,16 +1101,209 @@ def main():
         tau=args.tau,
         k_background=args.k,
         cellpose_model=args.model,
+        diameter=args.diameter,
+        cellprob_threshold=args.cellprob_threshold,
+        flow_threshold=args.flow_threshold,
+        channels=args.channels,
         output_dir=args.output_dir,
-        no_viewer=args.no_viewer,
+        no_viewer=no_viewer,
+        resume=args.resume,
+        force_cpu=args.force_cpu,
+        **stage_overrides,
     )
 
-    fov = run_pipeline(args.input, cfg)
+    fov_stem = tif_path.stem.replace("_mc", "")
+    print(f"=== Running pipeline on {tif_path.name} ===", flush=True)
+    t0 = time.perf_counter()
+    try:
+        fov = run_pipeline(tif_path, cfg)
+    except BaseException as exc:  # noqa: BLE001
+        import traceback as _tb
+        _tb.print_exc()
+        duration = time.perf_counter() - t0
+        if args.email_to and not args.no_email:
+            failure_result = EmailFOVResult(
+                tif=tif_path,
+                output_dir=args.output_dir or tif_path.parent,
+                duration_s=duration,
+                error=f"{type(exc).__name__}: {exc}",
+                roi_counts={"accept": 0, "flag": 0, "reject": 0},
+            )
+            params = EmailParams(
+                email_to=args.email_to, smtp_host=args.smtp_host,
+                smtp_port=args.smtp_port, smtp_user=args.smtp_user,
+                smtp_password_env=args.smtp_password_env,
+            )
+            send_email([failure_result], params, _build_pipeline_summary(cfg, args))
+        return 1
+    duration = time.perf_counter() - t0
 
     report = None
     if args.registry:
-        report = _register_fov_after_pipeline(args.input, fov)
+        report = _register_fov_after_pipeline(tif_path, fov)
     _write_traces_bundle(fov, cfg, registry_report=report)
+
+    png_path = None
+    try:
+        png_path = _overlay.render_overlay(
+            fov=fov,
+            output_dir=fov.output_dir,
+            model_name=Path(cfg.cellpose_model).name,
+            fov_stem=fov_stem,
+            outcomes=args.overlay_outcomes,
+        )
+        print(f"Overlay written: {png_path}", flush=True)
+    except BaseException as exc:  # noqa: BLE001
+        print(f"WARN: overlay render failed for {fov_stem}: {exc}",
+              file=sys.stderr)
+
+    counts = {"accept": 0, "flag": 0, "reject": 0}
+    for roi in fov.rois:
+        counts[roi.gate_outcome] = counts.get(roi.gate_outcome, 0) + 1
+
+    print("\n=== Summary ===", flush=True)
+    png_name = png_path.name if png_path else "<no overlay>"
+    print(f"  {tif_path.name}: accept={counts['accept']} flag={counts['flag']} "
+          f"reject={counts['reject']}  [{fmt_duration(duration)}]  → {png_name}",
+          flush=True)
+
+    if args.email_to and not args.no_email:
+        params = EmailParams(
+            email_to=args.email_to, smtp_host=args.smtp_host,
+            smtp_port=args.smtp_port, smtp_user=args.smtp_user,
+            smtp_password_env=args.smtp_password_env,
+        )
+        results = [EmailFOVResult(
+            tif=tif_path, output_dir=fov.output_dir,
+            duration_s=duration, png_path=png_path, roi_counts=counts,
+        )]
+        if not send_email(results, params, _build_pipeline_summary(cfg, args)):
+            print("Email FAILED — overlay remains on disk.",
+                  file=sys.stderr, flush=True)
+            return 3
+    elif args.no_email:
+        print("--no-email set; skipping email dispatch.", flush=True)
+    return 0
+
+
+def _run_workspace(
+    args: argparse.Namespace,
+    input_path: Path,
+    stage_overrides: dict,
+) -> int:
+    """Workspace path: in-input output/ + registry.db + auto-migrate."""
+    import sys
+
+    from roigbiv import overlay as _overlay
+    from roigbiv.pipeline._email import (
+        EmailFOVResult,
+        EmailParams,
+        fmt_duration,
+        send_email,
+    )
+    from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
+
+    try:
+        workspace = resolve_workspace(input_path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.force_cpu:
+        import os
+        os.environ.setdefault("ROIGBIV_ROICAT_DEVICE", "cpu")
+
+    overrides = {
+        "fs": args.fs,
+        "frame_averaging": args.frame_averaging,
+        "tau": args.tau,
+        "k_background": args.k,
+        "cellpose_model": args.model,
+        "diameter": args.diameter,
+        "cellprob_threshold": args.cellprob_threshold,
+        "flow_threshold": args.flow_threshold,
+        "channels": args.channels,
+        "no_viewer": True,    # workspace runs are headless
+        "resume": args.resume,
+        "force_cpu": args.force_cpu,
+        **stage_overrides,
+    }
+
+    ws_results = run_with_workspace(
+        workspace, overrides,
+        log_cb=lambda m: print(m, flush=True),
+        resume=args.resume,
+        n_workers=args.n_workers,
+    )
+
+    model_name = Path(args.model).name
+    for wr in ws_results:
+        if wr.error is not None or wr.fov is None:
+            continue
+        fov_stem = wr.tif.stem.replace("_mc", "")
+        try:
+            wr.png_path = _overlay.render_overlay(
+                fov=wr.fov,
+                output_dir=wr.output_dir,
+                model_name=model_name,
+                fov_stem=fov_stem,
+                outcomes=args.overlay_outcomes,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            print(f"WARN: overlay render failed for {fov_stem}: {exc}",
+                  file=sys.stderr)
+
+    successes = [r for r in ws_results if r.error is None]
+    failures = [r for r in ws_results if r.error is not None]
+    print("\n=== Summary ===", flush=True)
+    for r in ws_results:
+        if r.error is not None:
+            print(f"  {r.tif.name}: FAILED — {r.error}")
+        else:
+            c = r.roi_counts
+            png = r.png_path.name if r.png_path else "<no overlay>"
+            print(
+                f"  {r.tif.name}: accept={c.get('accept', 0)} "
+                f"flag={c.get('flag', 0)} reject={c.get('reject', 0)}  "
+                f"[{fmt_duration(r.duration_s)}]  → {png}"
+            )
+    print(f"{len(successes)} succeeded, {len(failures)} failed.", flush=True)
+
+    if not successes:
+        return 1
+
+    if args.email_to and not args.no_email:
+        params = EmailParams(
+            email_to=args.email_to, smtp_host=args.smtp_host,
+            smtp_port=args.smtp_port, smtp_user=args.smtp_user,
+            smtp_password_env=args.smtp_password_env,
+        )
+        # Synthesize a representative cfg for the body summary (workspace
+        # configs are per-FOV; the run-level params we want to echo are the
+        # CLI-set overrides, which are uniform across FOVs).
+        cfg_for_summary = PipelineConfig(
+            fs=args.fs, frame_averaging=args.frame_averaging, tau=args.tau,
+            k_background=args.k, cellpose_model=args.model,
+            diameter=args.diameter, cellprob_threshold=args.cellprob_threshold,
+            flow_threshold=args.flow_threshold, channels=args.channels,
+            **stage_overrides,
+        )
+        email_results = [
+            EmailFOVResult(
+                tif=r.tif, output_dir=r.output_dir,
+                duration_s=r.duration_s, error=r.error,
+                png_path=r.png_path,
+                roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
+            )
+            for r in ws_results
+        ]
+        if not send_email(email_results, params,
+                          _build_pipeline_summary(cfg_for_summary, args)):
+            print("Email FAILED — overlays remain on disk.",
+                  file=sys.stderr, flush=True)
+            return 3
+
+    return 0
 
 
 def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":
@@ -792,4 +1426,5 @@ def _build_merged_masks(fov: FOVData) -> "np.ndarray | None":
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _sys.exit(main())

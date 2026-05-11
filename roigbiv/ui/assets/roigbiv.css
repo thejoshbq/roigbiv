@@ -1,4 +1,20 @@
-/* ROIGBIV Dash UI — minimal overrides on top of the Flatly dbc theme. */
+/* ROIGBIV Dash UI — overrides on top of dbc/Bootstrap. Light/dark theme is
+ * driven by `data-bs-theme` on <html>; we lean on Bootstrap 5.3's CSS vars
+ * so most colors invert automatically.
+ */
+
+:root {
+    --roigbiv-accent: #18bc9c;
+    --roigbiv-accent-soft: rgba(24, 188, 156, 0.18);
+    --roigbiv-log-bg: #2f3640;
+    --roigbiv-log-fg: #ecf0f1;
+}
+[data-bs-theme="dark"] {
+    --roigbiv-accent: #2ecc71;
+    --roigbiv-accent-soft: rgba(46, 204, 113, 0.20);
+    --roigbiv-log-bg: #1b1f24;
+    --roigbiv-log-fg: #ecf0f1;
+}
 
 .roigbiv-brand {
     font-weight: 700;
@@ -12,24 +28,33 @@
     color: transparent;
 }
 .roigbiv-navbar {
-    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    background-color: var(--bs-tertiary-bg);
+    border-bottom: 1px solid var(--bs-border-color);
     backdrop-filter: blur(4px);
 }
+.roigbiv-theme-toggle {
+    color: var(--bs-body-color);
+    text-decoration: none;
+}
+.roigbiv-theme-toggle:hover {
+    color: var(--roigbiv-accent);
+}
 .roigbiv-card-accent {
-    border-left: 4px solid #18bc9c;
+    border-left: 4px solid var(--roigbiv-accent);
 }
 .roigbiv-muted-code {
     font-family: "SFMono-Regular", Menlo, Consolas, monospace;
     font-size: 0.85rem;
-    background: rgba(0, 0, 0, 0.04);
+    background: var(--bs-secondary-bg);
+    color: var(--bs-body-color);
     padding: 0.1rem 0.35rem;
     border-radius: 3px;
 }
 .roigbiv-log-stream {
     font-family: "SFMono-Regular", Menlo, Consolas, monospace;
     font-size: 0.80rem;
-    background: #2f3640;
-    color: #ecf0f1;
+    background: var(--roigbiv-log-bg);
+    color: var(--roigbiv-log-fg);
     padding: 0.75rem 0.9rem;
     border-radius: 6px;
     max-height: 18rem;
@@ -44,4 +69,21 @@
 }
 .roigbiv-tooltip-table td {
     padding: 0.1rem 0.5rem;
+}
+
+/* Review page — collapsible sidebar, active-session ring, drawer. */
+.roigbiv-sidebar-toggle {
+    border: 1px solid var(--bs-border-color);
+    margin-bottom: 0.5rem;
+}
+.roigbiv-active-session {
+    border: 2px solid var(--roigbiv-accent);
+    box-shadow: 0 0 0 3px var(--roigbiv-accent-soft);
+}
+.roigbiv-drawer-hero h5 {
+    margin-bottom: 0.25rem;
+}
+.roigbiv-drawer-hero .badge {
+    font-size: 0.75rem;
+    font-weight: 600;
 }

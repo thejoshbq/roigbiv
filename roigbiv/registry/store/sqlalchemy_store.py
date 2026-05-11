@@ -5,6 +5,7 @@ change — the only difference is the DSN passed to the constructor.
 """
 from __future__ import annotations
 
+import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,21 @@ from roigbiv.registry.store.base import (
 )
 
 
+# Alembic's EnvironmentContext stores its `script` proxy in module globals,
+# so two threads overlapping in `command.upgrade` race on `del globals_['script']`
+# during __exit__ → KeyError('script'). Serialise migrations across threads and
+# memoise per-DSN so the hot path (Dash callbacks) doesn't re-run alembic.
+# In-memory SQLite (``sqlite://`` / ``sqlite:///:memory:``) is excluded from the
+# memo because each engine gets its own private DB even when the DSN string is
+# identical — caching would skip schema creation on a fresh blank engine.
+_MIGRATE_LOCK = threading.Lock()
+_MIGRATED_DSNS: set[str] = set()
+
+
+def _is_memory_sqlite(dsn: str) -> bool:
+    return dsn == "sqlite://" or dsn.startswith("sqlite:///:memory:")
+
+
 class SQLAlchemyStore:
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
@@ -34,10 +50,18 @@ class SQLAlchemyStore:
         self._Session = sessionmaker(self.engine, expire_on_commit=False, future=True)
 
     def ensure_schema(self) -> None:
-        m.Base.metadata.create_all(self.engine)
-        from roigbiv.registry.migrate import ensure_alembic_head
+        cacheable = not _is_memory_sqlite(self.dsn)
+        if cacheable and self.dsn in _MIGRATED_DSNS:
+            return
+        with _MIGRATE_LOCK:
+            if cacheable and self.dsn in _MIGRATED_DSNS:
+                return
+            m.Base.metadata.create_all(self.engine)
+            from roigbiv.registry.migrate import ensure_alembic_head
 
-        ensure_alembic_head()
+            ensure_alembic_head()
+            if cacheable:
+                _MIGRATED_DSNS.add(self.dsn)
 
     # ── FOV ───────────────────────────────────────────────────────────────
     def get_fov_by_hash(self, fingerprint_hash: str) -> Optional[FOVRecord]:
@@ -159,6 +183,14 @@ class SQLAlchemyStore:
     # ── Session ───────────────────────────────────────────────────────────
     def insert_session(self, session: SessionRecord) -> None:
         with self._Session() as s:
+            existing = s.scalar(
+                select(m.Session).where(
+                    m.Session.fov_id == session.fov_id,
+                    m.Session.output_dir == session.output_dir,
+                )
+            )
+            if existing is not None:
+                return
             s.add(m.Session(
                 session_id=session.session_id,
                 fov_id=session.fov_id,

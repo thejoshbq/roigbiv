@@ -97,6 +97,27 @@ def test_svd_roundtrip():
     print(f"  ✓ SVD round-trip reconstruction error = {err:.4f} (k={k_true})")
 
 
+def test_svd_deterministic():
+    """Two _binned_svd_gpu calls on the same input must return identical (U, S, V).
+
+    torch.svd_lowrank is randomized; foundation._binned_svd_gpu seeds it so the
+    pipeline produces reproducible vcorr_S → Cellpose channel-2 input. Without
+    seeding, top-k subspace cosines drift to ~0.65 and Cellpose detection
+    counts swing run-to-run on the same FOV.
+    """
+    from roigbiv.pipeline.foundation import _binned_svd_gpu
+
+    rng = np.random.RandomState(7)
+    M_bin = rng.randn(500, 1000).astype(np.float32)  # (T_bin, N_pix)
+
+    U1, S1, V1 = _binned_svd_gpu(M_bin, n_svd=30)
+    U2, S2, V2 = _binned_svd_gpu(M_bin, n_svd=30)
+
+    assert np.array_equal(U1, U2), "U is non-deterministic across calls"
+    assert np.array_equal(S1, S2), "S is non-deterministic across calls"
+    assert np.array_equal(V1, V2), "V is non-deterministic across calls"
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Test 3: Summary images on synthetic S memmap
 # ─────────────────────────────────────────────────────────────────────────

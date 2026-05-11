@@ -213,9 +213,22 @@ def load_cross_session_bundle(fov_id: str) -> CrossSessionBundle:
     store.ensure_schema()
 
     fov = store.get_fov(fov_id)
-    sessions_rows = sorted(
+    _all_rows = sorted(
         store.list_sessions(fov_id), key=lambda s: s.session_date or date.min,
     )
+    # Deduplicate by output_dir, keeping the row with the highest created_at.
+    # Multiple rows can exist when the pipeline or backfill registers the same
+    # output_dir more than once; treat the newest as authoritative (consistent
+    # with store.get_session_by_output_dir).
+    _best: dict[str, object] = {}
+    for _row in _all_rows:
+        _ex = _best.get(_row.output_dir)
+        if _ex is None or (
+            _row.created_at is not None
+            and (_ex.created_at is None or _row.created_at > _ex.created_at)
+        ):
+            _best[_row.output_dir] = _row
+    sessions_rows = sorted(_best.values(), key=lambda s: s.session_date or date.min)
 
     session_refs: list[SessionRef] = []
     bundles: dict[str, FOVBundle] = {}

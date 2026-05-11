@@ -214,7 +214,8 @@ paths:
   consensus_output: inference/consensus
 
 hardware:
-  # Use GPU for Suite2p and Cellpose
+  # Informational only — not read by PipelineConfig at runtime.
+  # To force CPU execution use the --cpu CLI flag or set force_cpu=True in PipelineConfig.
   gpu: true
 
   # RAM headroom: leave 3 GB free from 15 GB total

@@ -251,7 +251,7 @@ def run_stage3(
     import torch
 
     T, H, W = fov.shape
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" if cfg.force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 
     # Pad templates, move to GPU, precompute FFTs
     templates_padded = _pad_templates(template_bank)           # (K, L_max)

@@ -24,14 +24,17 @@ import numpy as np
 import plotly.graph_objects as go
 
 from roigbiv.ui.services.colors import session_colors
+from roigbiv.ui.services.theme import (
+    axis_muted_color,
+    plotly_template,
+    warning_color,
+)
 from roigbiv.ui.services.trace_viz import SessionTraces, Y_LABELS
 
 
 MEAN_COLOR = "rgba(46, 204, 113, 0.9)"
 GRAND_AVERAGE_COLOR = "#111"
 HIGHLIGHT_COLOR = "rgba(231, 76, 60, 0.95)"       # brick-red, prominent
-EMPTY_HEIGHT = 420
-MULTI_HEIGHT = 520
 
 
 # ── shared helpers ────────────────────────────────────────────────────────
@@ -56,18 +59,19 @@ def _fov_title(fov_meta: dict, suffix: str) -> str:
     return f"FOV {fov_short}… · {animal} / {region} — {suffix}"
 
 
-def _empty_fig(title: str, message: str) -> go.Figure:
+def _empty_fig(title: str, message: str,
+               theme: Optional[str] = None) -> go.Figure:
     fig = go.Figure()
     fig.update_layout(
         title=title,
-        template="plotly_white",
-        height=EMPTY_HEIGHT,
+        template=plotly_template(theme),
+        autosize=True,
         annotations=[{
             "text": message,
             "showarrow": False,
             "xref": "paper", "yref": "paper",
             "x": 0.5, "y": 0.5,
-            "font": {"size": 14, "color": "#888"},
+            "font": {"size": 14, "color": axis_muted_color(theme)},
         }],
         xaxis={"visible": False},
         yaxis={"visible": False},
@@ -125,6 +129,7 @@ def _multi_fs_mismatch(sessions: list[SessionTraces]) -> bool:
 
 def _maybe_mixed_fs_note(
     fig: go.Figure, *, mixed_fs: bool, show_grand_average: bool,
+    theme: Optional[str] = None,
 ) -> None:
     if not mixed_fs:
         return
@@ -137,7 +142,7 @@ def _maybe_mixed_fs_note(
         text=text,
         xref="paper", yref="paper",
         x=0.0, y=1.02, xanchor="left", yanchor="bottom",
-        showarrow=False, font={"size": 10, "color": "#c77"},
+        showarrow=False, font={"size": 10, "color": warning_color(theme)},
     )
 
 
@@ -147,13 +152,15 @@ def _maybe_mixed_fs_note(
 def build_mean_single(
     fov_meta: dict,
     sess: SessionTraces,
+    *,
+    theme: Optional[str] = None,
 ) -> go.Figure:
     title = _fov_title(
         fov_meta,
         f"mean trace · {_session_label(sess)} · {Y_LABELS[sess.kind]}",
     )
     if sess.matrix is None or sess.matrix.size == 0:
-        return _empty_fig(title, _note_for(sess))
+        return _empty_fig(title, _note_for(sess), theme=theme)
 
     t = _time_axis(sess)
     mean = np.nanmean(sess.matrix, axis=0)
@@ -172,8 +179,8 @@ def build_mean_single(
     ))
     fig.update_layout(
         title=title,
-        template="plotly_white",
-        height=EMPTY_HEIGHT,
+        template=plotly_template(theme),
+        autosize=True,
         xaxis_title="time (s)" if sess.fs else "frame",
         yaxis_title=Y_LABELS[sess.kind],
         margin={"l": 60, "r": 20, "t": 60, "b": 50},
@@ -184,7 +191,8 @@ def build_mean_single(
             text=f"source: {sess.source_label}",
             xref="paper", yref="paper",
             x=1.0, y=1.02, xanchor="right", yanchor="bottom",
-            showarrow=False, font={"size": 10, "color": "#888"},
+            showarrow=False,
+            font={"size": 10, "color": axis_muted_color(theme)},
         )
     return fig
 
@@ -194,6 +202,7 @@ def build_mean_multi(
     sessions: list[SessionTraces],
     *,
     show_grand_average: bool = False,
+    theme: Optional[str] = None,
 ) -> go.Figure:
     kinds = {s.kind for s in sessions} or {"dff"}
     ylabel = Y_LABELS[next(iter(kinds))]
@@ -201,7 +210,8 @@ def build_mean_multi(
         fov_meta, f"mean trace across {len(sessions)} session(s) · {ylabel}",
     )
     if not sessions:
-        return _empty_fig(title, "No sessions registered on this FOV yet.")
+        return _empty_fig(title, "No sessions registered on this FOV yet.",
+                          theme=theme)
 
     sessions_sorted = _sort_sessions(sessions)
     usable = [s for s in sessions_sorted
@@ -209,7 +219,9 @@ def build_mean_multi(
     skipped = len(sessions_sorted) - len(usable)
 
     if not usable:
-        return _empty_fig(title, "No sessions on this FOV have trace data yet.")
+        return _empty_fig(title,
+                          "No sessions on this FOV have trace data yet.",
+                          theme=theme)
 
     palette = session_colors(len(usable))
     mixed_fs = _multi_fs_mismatch(usable)
@@ -249,8 +261,8 @@ def build_mean_multi(
     any_fs = any(s.fs for s in usable)
     fig.update_layout(
         title=title,
-        template="plotly_white",
-        height=MULTI_HEIGHT,
+        template=plotly_template(theme),
+        autosize=True,
         xaxis_title="time (s)" if any_fs else "frame",
         yaxis_title=ylabel,
         margin={"l": 60, "r": 20, "t": 70, "b": 50},
@@ -258,13 +270,15 @@ def build_mean_multi(
         legend={"orientation": "v", "x": 1.02, "y": 1.0, "xanchor": "left"},
     )
     _maybe_mixed_fs_note(fig, mixed_fs=mixed_fs,
-                         show_grand_average=show_grand_average)
+                         show_grand_average=show_grand_average,
+                         theme=theme)
     if skipped:
         fig.add_annotation(
             text=f"skipped {skipped} session(s) with no trace data",
             xref="paper", yref="paper",
             x=1.0, y=1.02, xanchor="right", yanchor="bottom",
-            showarrow=False, font={"size": 10, "color": "#888"},
+            showarrow=False,
+            font={"size": 10, "color": axis_muted_color(theme)},
         )
     return fig
 
@@ -276,6 +290,8 @@ def build_roi_across_sessions(
     fov_meta: dict,
     sessions_with_rows: list[tuple[SessionTraces, int]],
     highlighted_session_id: Optional[str],
+    *,
+    theme: Optional[str] = None,
 ) -> go.Figure:
     """Overlay per-session traces of one ROI, highlighting the source session.
 
@@ -292,7 +308,9 @@ def build_roi_across_sessions(
         f"ROI traces across {len(sessions_with_rows)} session(s) · {ylabel}",
     )
     if not sessions_with_rows:
-        return _empty_fig(title, "Click an ROI in a session above to load traces.")
+        return _empty_fig(title,
+                          "Click an ROI in a session above to load traces.",
+                          theme=theme)
 
     entries_sorted = sorted(
         sessions_with_rows,
@@ -302,7 +320,8 @@ def build_roi_across_sessions(
     skipped = len(entries_sorted) - len(usable)
 
     if not usable:
-        return _empty_fig(title, "No recoverable traces for this ROI.")
+        return _empty_fig(title, "No recoverable traces for this ROI.",
+                          theme=theme)
 
     palette = session_colors(len(usable))
     sessions_only = [s for (s, _) in usable]
@@ -362,21 +381,23 @@ def build_roi_across_sessions(
     any_fs = any(s.fs for s in sessions_only)
     fig.update_layout(
         title=title,
-        template="plotly_white",
-        height=MULTI_HEIGHT,
+        template=plotly_template(theme),
+        autosize=True,
         xaxis_title="time (s)" if any_fs else "frame",
         yaxis_title=ylabel,
         margin={"l": 60, "r": 20, "t": 70, "b": 50},
         hovermode="x unified",
         legend={"orientation": "v", "x": 1.02, "y": 1.0, "xanchor": "left"},
     )
-    _maybe_mixed_fs_note(fig, mixed_fs=mixed_fs, show_grand_average=False)
+    _maybe_mixed_fs_note(fig, mixed_fs=mixed_fs, show_grand_average=False,
+                         theme=theme)
     if skipped:
         fig.add_annotation(
             text=f"skipped {skipped} session(s) with no trace data",
             xref="paper", yref="paper",
             x=1.0, y=1.02, xanchor="right", yanchor="bottom",
-            showarrow=False, font={"size": 10, "color": "#888"},
+            showarrow=False,
+            font={"size": 10, "color": axis_muted_color(theme)},
         )
     return fig
 

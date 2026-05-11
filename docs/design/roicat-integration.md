@@ -5,6 +5,11 @@
 **Date**: 2026-04-22.
 **Target ROICaT version**: 1.5.5 (installed at `/home/thejoshbq/miniconda3/envs/roigbiv/lib/python3.10/site-packages/roicat/`).
 
+> **Note**: references to `app.py` below refer to the former Streamlit UI, which
+> has been replaced by the Dash app under `roigbiv/ui/`. The Registry page
+> (`roigbiv/ui/pages/registry.py`) is the current equivalent of the Streamlit
+> registry tab; any caller-update work applies there instead.
+
 ---
 
 ## Context

@@ -1,6 +1,14 @@
 # Astrocyte Model Plan
 *roigbiv project — Otis Lab, MUSC*
 
+> **Planning document with stale script paths.** References to `run_suite2p.py`,
+> `run_inference.py`, `extract_vcorr.py`, and `build_union_rois.py` below predate
+> the sequential-pipeline migration; those scripts have been removed. When
+> executing this plan, use `roigbiv-pipeline` (Foundation already writes
+> `summary/vcorr_S.tif` and `summary/mean_M.tif`, replacing the separate Vcorr
+> extraction step). Training/eval scripts (`train.py`, `eval_model.py`) are
+> unchanged.
+
 ## Context
 
 The neuron pilot (run011, AP@0.5=0.652) demonstrated the Vcorr-channel fusion approach works. The long-term goal is astrocyte detection, where temporal features are essential: astrocytes have slow calcium dynamics (τ≈2–3s vs ~1s for neurons) and irregular star-shaped morphology (~50–80px diameter vs ~17px for neurons).

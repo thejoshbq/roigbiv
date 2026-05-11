@@ -81,17 +81,19 @@ ROI G. Biv sits at the front of the analysis pipeline: it takes raw two-photon T
 ```
 roigbiv/
 ├── roigbiv/                  # Python package (pip-installable)
-│   ├── io.py                 # TIF discovery, archive extraction, projection extraction
-│   ├── suite2p.py            # Suite2p activity + anatomy batch runner
-│   ├── match.py              # IoU matching and Hungarian assignment
-│   ├── union.py              # Union ROI building + Cellpose probability scoring
-│   └── viz.py                # ipywidgets interactive Colab viewer
-├── notebooks/
-│   └── roigbiv.ipynb         # End-to-end Google Colab notebook
-├── scripts/                  # Local development scripts (advanced use)
+│   ├── pipeline/             # Sequential subtractive pipeline (Foundation → Stage 1–4)
+│   │   └── run.py            # Pipeline + CLI entry point (roigbiv-pipeline)
+│   ├── registry/             # Cross-session FOV + cell registry (SQLAlchemy + ROICaT)
+│   ├── ui/                   # Dash + Plotly web app (roigbiv-ui)
+│   ├── cli_registry.py       # Registry CLI (roigbiv-registry)
+│   ├── cli_reingest.py       # External-mask ingest CLI (roigbiv-reingest)
+│   ├── io.py                 # TIF discovery + validation
+│   ├── suite2p.py            # Suite2p batch runner (used by Foundation)
+│   └── overlay.py            # ROI overlay rendering for reports
+├── scripts/                  # Training + data-prep utilities
 │   ├── train.py              # Cellpose fine-tuning
-│   ├── run_suite2p.py        # Suite2p runner
-│   ├── build_union_rois.py   # Union ROI building (local)
+│   ├── ingest_corrections.py # Ingest Cellpose GUI corrections
+│   ├── roigbiv_to_pynapse.py # Export traces to pynapse
 │   └── ...
 ├── configs/
 │   └── pipeline.yaml         # All tunable parameters

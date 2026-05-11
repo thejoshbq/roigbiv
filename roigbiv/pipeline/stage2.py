@@ -12,7 +12,7 @@ Design (spec §7, plan D3-D5):
      re-run Suite2p here — that would double the Foundation cost.
   2. Filter by iscell probability (cfg.iscell_threshold).
   3. Convert Suite2p's sparse stat entries → dense binary masks via
-     roigbiv.merge.stat_to_mask (existing utility).
+     the internal ``_stat_entries_to_masks`` helper (below).
   4. IoU filter against Stage 1 accept|flag ROIs: retain only masks with
      max-IoU ≤ cfg.gate2_iou_threshold (default 0.3) — these are NEW
      detections, not rediscoveries.

@@ -25,29 +25,6 @@ import numpy as np
 # Stage 2 / Gate 2
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_stat_to_mask_roundtrip():
-    """Suite2p-like stat entries → dense mask, via roigbiv.merge.stat_to_mask."""
-    from roigbiv.merge import stat_to_mask
-
-    Ly, Lx = 64, 64
-    stat = np.array([
-        {"ypix": np.array([10, 11, 12]), "xpix": np.array([20, 20, 20])},
-        {"ypix": np.array([30, 31]),      "xpix": np.array([40, 41])},
-        {"ypix": np.array([63, 64, 65]),  "xpix": np.array([10, 10, 10])},  # last two out-of-bounds
-    ], dtype=object)
-    # No iscell filter → keep all
-    labels = stat_to_mask(stat, Ly, Lx)
-    assert labels.shape == (Ly, Lx)
-    # Labels 1-indexed
-    assert labels[10, 20] == 1 and labels[11, 20] == 1 and labels[12, 20] == 1
-    assert labels[30, 40] == 2 and labels[31, 41] == 2
-    # Third entry: only ypix=63 should survive bounds check
-    assert labels[63, 10] == 3
-    # Out-of-bounds pixels not written
-    assert labels[0, 0] == 0
-    print("  [PASS] test_stat_to_mask_roundtrip")
-
-
 def test_iou_filter_against_stage1():
     """Stage 2 IoU filter: discard rediscoveries, keep novel detections."""
     from roigbiv.pipeline.stage2 import _filter_against_stage1
@@ -294,7 +271,6 @@ if __name__ == "__main__":
     import traceback
 
     tests = [
-        test_stat_to_mask_roundtrip,
         test_iou_filter_against_stage1,
         test_gate2_correlation_branches,
         test_template_bank_sanity,
