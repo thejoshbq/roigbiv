@@ -846,6 +846,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-finetune-status", "children", allow_duplicate=True),
         Output("roigbiv-finetune-log", "children"),
         Output("roigbiv-finetune-deploy", "disabled"),
+        Output("roigbiv-finetune-ingest-feedback", "children", allow_duplicate=True),
         Input("roigbiv-finetune-poll", "n_intervals"),
         prevent_initial_call=True,
     )
@@ -853,16 +854,23 @@ def register_callbacks(app: dash.Dash) -> None:
         snap = get_trainer().snapshot()
         poll_disabled = snap.state in ("idle", "done", "error")
         deploy_disabled = snap.state != "done"
-        log_div = (
-            log_stream(snap.logs, empty_hint="Waiting for activity…")
-            if snap.state != "idle"
-            else html.Div()
-        )
+        log_div = log_stream(snap.logs, empty_hint="Waiting for activity…")
+        if snap.ingest_summary:
+            if snap.state == "error" or snap.ingest_summary.startswith("Ingest failed"):
+                fb_color = "danger"
+            elif "— 0 mask(s)" in snap.ingest_summary:
+                fb_color = "warning"
+            else:
+                fb_color = "success"
+            ingest_fb = dbc.Alert(snap.ingest_summary, color=fb_color, className="mb-0 small")
+        else:
+            ingest_fb = no_update
         return (
             poll_disabled,
             _trainer_status_badge(snap.state, snap.error),
             log_div,
             deploy_disabled,
+            ingest_fb,
         )
 
     @app.callback(
@@ -904,7 +912,7 @@ def _trainer_status_badge(state: str, error: Optional[str] = None) -> html.Div:
     children: list = [dbc.Badge(label, color=color, className="me-2")]
     if state == "training":
         children.insert(0, dbc.Spinner(size="sm", color="primary",
-                                       className="me-1"))
+                                       spinner_class_name="me-1"))
     if error and state == "error":
         children.append(html.Small(error, className="text-danger"))
     return html.Div(children, className="d-flex align-items-center small")

@@ -50,6 +50,7 @@ class TrainerSnapshot:
     logs: list[str] = field(default_factory=list)
     run_id: Optional[str] = None
     error: Optional[str] = None
+    ingest_summary: Optional[str] = None
 
 
 class CellposeTrainer:
@@ -62,6 +63,7 @@ class CellposeTrainer:
         self._thread: Optional[threading.Thread] = None
         self._run_id: Optional[str] = None
         self._error: Optional[str] = None
+        self._ingest_summary: Optional[str] = None
 
     # ── GUI launch ────────────────────────────────────────────────────────────
 
@@ -134,6 +136,7 @@ class CellposeTrainer:
                 return False
             self._state = "ingesting"
             self._error = None
+            self._ingest_summary = None
         t = threading.Thread(
             target=self._run_ingest,
             args=(Path(annotated_dir), Path(masks_dir)),
@@ -185,6 +188,7 @@ class CellposeTrainer:
             tb = traceback.format_exc()
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
+                self._ingest_summary = f"Ingest failed: {type(exc).__name__}: {exc}"
                 self._state = "error"
             self._log(f"ERROR: {self._error}")
             for line in tb.strip().splitlines():
@@ -192,6 +196,7 @@ class CellposeTrainer:
             return
 
         with self._lock:
+            self._ingest_summary = f"Ingest complete — {n_done} mask(s) written to {masks_dir.name}."
             self._state = "idle"
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -309,6 +314,7 @@ class CellposeTrainer:
                 logs=list(self._logs)[-100:],
                 run_id=self._run_id,
                 error=self._error,
+                ingest_summary=self._ingest_summary,
             )
 
     def reset(self) -> None:
@@ -320,6 +326,7 @@ class CellposeTrainer:
             self._logs.clear()
             self._run_id = None
             self._error = None
+            self._ingest_summary = None
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
