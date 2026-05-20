@@ -196,6 +196,8 @@ def main():
                     help="Path to pipeline YAML config")
     ap.add_argument("--dry-run", action="store_true",
                     help="Load data, print stats, exit without training")
+    ap.add_argument("--cpu", dest="force_cpu", action="store_true", default=False,
+                    help="Force CPU-only Cellpose execution (no CUDA)")
 
     args = ap.parse_args()
     setup_logging(args.run_id)
@@ -219,8 +221,10 @@ def main():
     if not masks_dir.is_absolute():
         masks_dir = BASE_DIR / masks_dir
 
-    log.info("PyTorch CUDA: %s", torch.cuda.is_available())
-    if torch.cuda.is_available():
+    _gpu = not args.force_cpu and torch.cuda.is_available()
+    log.info("PyTorch CUDA: %s  force_cpu: %s  using_gpu: %s",
+             torch.cuda.is_available(), args.force_cpu, _gpu)
+    if _gpu:
         log.info("GPU: %s", torch.cuda.get_device_name(0))
     log.info("Run ID: %s, base model: %s, seed: %d", args.run_id, args.base_model, args.seed)
     log.info("Data dir:  %s", data_dir)
@@ -268,10 +272,10 @@ def main():
     # Initialize model
     if base_path.exists() and base_model != "cyto3":
         log.info("Loading from checkpoint: %s", base_path)
-        model = models.CellposeModel(gpu=True, pretrained_model=str(base_path))
+        model = models.CellposeModel(gpu=_gpu, pretrained_model=str(base_path))
     else:
         log.info("Using base model: %s", base_model)
-        model = models.CellposeModel(gpu=True, model_type=base_model)
+        model = models.CellposeModel(gpu=_gpu, model_type=base_model)
 
     # Train
     t0 = time.time()
@@ -309,7 +313,7 @@ def main():
 
     # Post-training AP evaluation
     log.info("AP eval using: %s", eval_path)
-    model_eval = models.CellposeModel(gpu=True, pretrained_model=eval_path)
+    model_eval = models.CellposeModel(gpu=_gpu, pretrained_model=eval_path)
     pred_masks, _, _ = model_eval.eval(
         val_imgs, diameter=args.diameter, channels=channels,
         batch_size=args.batch_size,

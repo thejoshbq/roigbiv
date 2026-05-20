@@ -1094,6 +1094,14 @@ def _run_single(
     if args.force_cpu:
         import os
         os.environ.setdefault("ROIGBIV_ROICAT_DEVICE", "cpu")
+        if not os.environ.get("ROIGBIV_ROICAT_ALIGNMENT"):
+            os.environ["ROIGBIV_ROICAT_ALIGNMENT"] = "PhaseCorrelation"
+            print(
+                "WARN: --cpu selected; registry alignment downgraded to "
+                "PhaseCorrelation (RoMa is impractical on CPU). "
+                "Set ROIGBIV_ROICAT_ALIGNMENT to override.",
+                file=sys.stderr,
+            )
 
     cfg = PipelineConfig(
         fs=args.fs,
@@ -1212,6 +1220,14 @@ def _run_workspace(
     if args.force_cpu:
         import os
         os.environ.setdefault("ROIGBIV_ROICAT_DEVICE", "cpu")
+        if not os.environ.get("ROIGBIV_ROICAT_ALIGNMENT"):
+            os.environ["ROIGBIV_ROICAT_ALIGNMENT"] = "PhaseCorrelation"
+            print(
+                "WARN: --cpu selected; registry alignment downgraded to "
+                "PhaseCorrelation (RoMa is impractical on CPU). "
+                "Set ROIGBIV_ROICAT_ALIGNMENT to override.",
+                file=sys.stderr,
+            )
 
     overrides = {
         "fs": args.fs,

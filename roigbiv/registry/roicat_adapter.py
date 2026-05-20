@@ -44,18 +44,7 @@ from scipy.ndimage import center_of_mass
 log = logging.getLogger(__name__)
 
 
-def _auto_device() -> str:
-    """Pick a torch device string: ``cuda`` when available, else ``cpu``.
-
-    Kept as a small free function (rather than inlined) so the adapter config
-    dataclass can use it via ``field(default_factory=_auto_device)`` without
-    importing torch at module-import time.
-    """
-    try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        return "cpu"
+from roigbiv.registry.config import _auto_device
 
 
 # ── RoMa native-fallback shim ──────────────────────────────────────────────

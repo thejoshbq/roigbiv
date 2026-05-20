@@ -214,9 +214,11 @@ paths:
   consensus_output: inference/consensus
 
 hardware:
-  # Informational only — not read by PipelineConfig at runtime.
-  # To force CPU execution use the --cpu CLI flag or set force_cpu=True in PipelineConfig.
-  gpu: true
+  # Pass --cpu to force CPU-only execution for all Torch/Cellpose/SVD stages.
+  # Suite2p auto-detects device; no flag needed (falls back to CPU when CUDA absent).
+  # --cpu also sets ROIGBIV_ROICAT_ALIGNMENT=PhaseCorrelation (RoMa is impractical on CPU).
+  # CPU mode is 5–10× slower for Cellpose/SVD; Suite2p batch_size 50–100 reduces peak RAM.
+  gpu: true  # informational; runtime uses PipelineConfig.force_cpu
 
   # RAM headroom: leave 3 GB free from 15 GB total
   max_ram_gb: 12

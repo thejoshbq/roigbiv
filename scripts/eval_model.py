@@ -9,6 +9,7 @@ Usage:
 import argparse, logging
 from pathlib import Path
 import numpy as np
+import torch
 from cellpose import models, metrics
 
 from config import BASE_DIR
@@ -37,6 +38,8 @@ def main():
                     help='Additional data directories (space-separated)')
     ap.add_argument('--extra_masks_dir', nargs='+', default=None,
                     help='Additional masks directories (must match --extra_data_dir)')
+    ap.add_argument('--cpu', dest='force_cpu', action='store_true', default=False,
+                    help='Force CPU-only Cellpose execution (no CUDA)')
     args = ap.parse_args()
 
     use_vcorr = args.use_vcorr and not args.no_vcorr
@@ -80,7 +83,8 @@ def main():
     log.info(f'Model:    {model_path}')
     log.info(f'Diameter: {args.diameter}  Channels: {channels}  Vcorr: {use_vcorr}')
 
-    model_eval = models.CellposeModel(gpu=True, pretrained_model=str(model_path))
+    _gpu = not args.force_cpu and torch.cuda.is_available()
+    model_eval = models.CellposeModel(gpu=_gpu, pretrained_model=str(model_path))
     pred_masks, _, _ = model_eval.eval(val_imgs, diameter=args.diameter,
                                        channels=channels, batch_size=args.batch_size)
     ap_scores, _, _, _ = metrics.average_precision(val_masks, pred_masks,
