@@ -380,8 +380,12 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-review-fov-select", "value"),
     )
     def _load_fov_options(_n, search, current):
+        state = get_app_state()
+        cfg = state.registry_config
+        if cfg is None:
+            return [], None
         try:
-            rows = list_fovs()
+            rows = list_fovs(cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             log.exception("Listing FOVs failed")
             return [], None
@@ -405,8 +409,9 @@ def register_callbacks(app: dash.Dash) -> None:
     def _load_cross_session(fov_id):
         if not fov_id:
             return [], [], {}
+        cfg = get_app_state().registry_config
         try:
-            bundle = load_cross_session_bundle(fov_id)
+            bundle = load_cross_session_bundle(fov_id, cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             log.exception("Loading cross-session bundle failed")
             return [], [], {"error": f"{type(exc).__name__}: {exc or ''}"}
@@ -431,8 +436,9 @@ def register_callbacks(app: dash.Dash) -> None:
         if not checked:
             return [], None
         fov_id = (viewer_state or {}).get("fov_id")
+        cfg = get_app_state().registry_config
         try:
-            labels = _session_labels(fov_id, checked) if fov_id else {}
+            labels = _session_labels(fov_id, checked, cfg=cfg) if fov_id else {}
         except Exception:  # noqa: BLE001
             log.exception("Resolving session labels failed")
             labels = {sid: sid[:8] for sid in checked}
@@ -450,8 +456,9 @@ def register_callbacks(app: dash.Dash) -> None:
         if not (active_session and viewer_state
                 and viewer_state.get("fov_id")):
             return None
+        cfg = get_app_state().registry_config
         try:
-            bundle = load_cross_session_bundle(viewer_state["fov_id"])
+            bundle = load_cross_session_bundle(viewer_state["fov_id"], cfg=cfg)
         except Exception:  # noqa: BLE001
             log.exception("Resolving output_dir failed")
             return None
@@ -479,8 +486,9 @@ def register_callbacks(app: dash.Dash) -> None:
             return (user_error(RuntimeError(viewer_state["error"]),
                                "Loading cross-session bundle"),
                     "Review")
+        cfg = get_app_state().registry_config
         try:
-            bundle = load_cross_session_bundle(viewer_state["fov_id"])
+            bundle = load_cross_session_bundle(viewer_state["fov_id"], cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             return (user_error(exc, "Rendering canvas"), "Review")
         if not bundle.sessions:
@@ -579,8 +587,9 @@ def register_callbacks(app: dash.Dash) -> None:
         session_id = selected.get("session_id")
         if session_id not in (viewer_state.get("session_ids") or []):
             return roi_panel(None, None)
+        cfg = get_app_state().registry_config
         try:
-            bundle = load_cross_session_bundle(viewer_state["fov_id"])
+            bundle = load_cross_session_bundle(viewer_state["fov_id"], cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             return user_error(exc, "Loading drawer contents")
         fb = bundle.bundles.get(session_id)
@@ -609,10 +618,11 @@ def register_callbacks(app: dash.Dash) -> None:
             return _placeholder_fig("Select a FOV to load traces.", theme)
         kind = kind or "dff"
         fov_id = viewer_state["fov_id"]
-        fov_meta = _lookup_fov_meta(fov_id)
+        cfg = get_app_state().registry_config
+        fov_meta = _lookup_fov_meta(fov_id, cfg=cfg)
         sel_set = set(selected_ids or [])
         try:
-            all_sessions = collect_sessions_for_fov(fov_id, kind=kind)
+            all_sessions = collect_sessions_for_fov(fov_id, kind=kind, cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             return user_error_figure(exc, "Loading FOV-level traces",
                                      theme=theme)
@@ -649,9 +659,10 @@ def register_callbacks(app: dash.Dash) -> None:
         fov_id = viewer_state["fov_id"]
         kind = kind or "dff"
         local_label_id = int(selected["local_label_id"])
-        fov_meta = _lookup_fov_meta(fov_id)
+        cfg = get_app_state().registry_config
+        fov_meta = _lookup_fov_meta(fov_id, cfg=cfg)
         try:
-            bundle = load_cross_session_bundle(fov_id)
+            bundle = load_cross_session_bundle(fov_id, cfg=cfg)
         except Exception as exc:  # noqa: BLE001
             return user_error_figure(exc, "Loading ROI traces", theme=theme)
         fb = bundle.bundles.get(session_id)
@@ -662,7 +673,7 @@ def register_callbacks(app: dash.Dash) -> None:
         gcid = _lookup_global_cell_id(fb, local_label_id)
         try:
             if gcid:
-                pairs = collect_cross_session_traces(fov_id, gcid, kind=kind)
+                pairs = collect_cross_session_traces(fov_id, gcid, kind=kind, cfg=cfg)
             else:
                 ref = next((s for s in bundle.sessions
                             if s.session_id == session_id), None)
@@ -971,10 +982,10 @@ def _session_card(sref, fb: FOVBundle, date_str: str, fig,
     ]), className=card_class)
 
 
-def _session_labels(fov_id: Optional[str], session_ids: list[str]) -> dict:
+def _session_labels(fov_id: Optional[str], session_ids: list[str], cfg=None) -> dict:
     if not fov_id:
         return {}
-    bundle = load_cross_session_bundle(fov_id)
+    bundle = load_cross_session_bundle(fov_id, cfg=cfg)
     out: dict[str, str] = {}
     for s in bundle.sessions:
         if s.session_id in session_ids:
@@ -994,9 +1005,9 @@ def _preselect_from_search(search: Optional[str]) -> Optional[str]:
     return None
 
 
-def _lookup_fov_meta(fov_id: str) -> dict:
+def _lookup_fov_meta(fov_id: str, cfg=None) -> dict:
     try:
-        rows = list_fovs()
+        rows = list_fovs(cfg=cfg)
     except Exception:  # noqa: BLE001
         log.exception("FOV meta lookup failed")
         return {"fov_id": fov_id}

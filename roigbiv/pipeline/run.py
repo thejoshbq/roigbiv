@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+from roigbiv.pipeline import fmt
 from roigbiv.pipeline.types import FOVData, PipelineConfig
 
 
@@ -122,7 +123,7 @@ def print_detection_summary(fov: FOVData) -> list[str]:
         "stage3": "Stage 3 (Template)",
         "stage4": "Stage 4 (Tonic)   ",
     }
-    print("\n=== Detection Complete ===", flush=True)
+    print(fmt.stage_header("Summary", "Detection Complete"), flush=True)
     detected_seq: list[tuple[str, int]] = []
     total_kept = 0
     for key in ("stage1", "stage2", "stage3", "stage4"):
@@ -134,15 +135,11 @@ def print_detection_summary(fov: FOVData) -> list[str]:
         flg = int(s.get("flagged", 0))
         rej = int(s.get("rejected", 0))
         detected_seq.append((key, det))
-        if key == "stage4":
-            print(f"{stage_labels[key]}: {flg} requires_review "
-                  f"(detected {det}, rejected {rej})", flush=True)
-        else:
-            print(f"{stage_labels[key]}: {acc} accepted, "
-                  f"{flg} flagged, {rej} rejected (detected {det})", flush=True)
+        n = int(key[-1])
+        print(fmt.gate_outcome(n, det, acc, flg, rej), flush=True)
         total_kept += acc + flg
 
-    print(f"Total ROIs (accept+flag): {total_kept}", flush=True)
+    print(fmt.sub_phase(f"Total ROIs (accept+flag): {total_kept}"), flush=True)
 
     # Monotonicity check — detected counts should decrease across stages
     # since each stage subtracts the strongest sources before the next runs.
@@ -162,10 +159,10 @@ def print_detection_summary(fov: FOVData) -> list[str]:
                    "across stages (Blindspot 2). Offenders: "
                    + "; ".join(violations)
                    + f"  (chain: {chain})")
-            print(f"  {msg}", flush=True)
+            print(fmt.sub_phase(f"WARNING: {msg}"), flush=True)
             warnings.append(msg)
         else:
-            print(f"Monotonicity check: {chain}  ✓", flush=True)
+            print(fmt.sub_phase(f"Monotonicity check: {chain}  ✓"), flush=True)
     return warnings
 
 
@@ -287,17 +284,20 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         fov = run_foundation(tif_path, cfg, output_dir)
         stage_timings["foundation_s"] = time.time() - t_start
         update_manifest(output_dir, "foundation", cfg, tif_path)
-        print(f"Foundation complete. k_background={fov.k_background}  "
-              f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})", flush=True)
+        print(fmt.sub_phase(
+            f"Foundation complete. k_background={fov.k_background}  "
+            f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
+        ), flush=True)
     else:
         fov = rp.fov  # populated by plan_resume from disk
-        print(f"Resume: foundation skipped "
-              f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})",
-              flush=True)
+        print(fmt.sub_phase(
+            f"Resume: foundation skipped "
+            f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
+        ), flush=True)
 
     # ── Stage 1 Cellpose detection ────────────────────────────────────────
     if rp.should_run("stage1"):
-        print("\nStage 1: Cellpose detection (dual-channel mean_S + vcorr_S)", flush=True)
+        print(fmt.stage_header(1, "Cellpose detection"), flush=True)
         t_start = time.time()
         try:
             import torch
@@ -333,9 +333,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n_accept = sum(1 for r in rois if r.gate_outcome == "accept")
         n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
         n_reject = sum(1 for r in rois if r.gate_outcome == "reject")
-        print(f"Stage 1: {n_detected} detected → "
-              f"{n_accept} accepted, {n_flag} flagged, {n_reject} rejected",
-              flush=True)
+        print(fmt.gate_outcome(1, n_detected, n_accept, n_flag, n_reject), flush=True)
 
         # Save Stage 1 mask image (accepted + flagged only — rejects not subtracted)
         stage1_mask_img = np.zeros(fov.mean_S.shape, dtype=np.uint16)
@@ -366,13 +364,14 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n_accept = int(sc.get("accepted", 0))
         n_flag = int(sc.get("flagged", 0))
         n_reject = int(sc.get("rejected", 0))
-        print(f"Resume: stage1 skipped "
-              f"({n_accept} accepted, {n_flag} flagged, {n_reject} rejected)",
-              flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage1 skipped "
+            f"({n_accept} accepted, {n_flag} flagged, {n_reject} rejected)"
+        ), flush=True)
 
     # ── Source subtraction (on accept + flag only) ────────────────────────
     if rp.should_run("stage1_subtract"):
-        print("\nSource subtraction: accept+flag ROIs only", flush=True)
+        print(fmt.stage_header("1→S", "Source subtraction"), flush=True)
         t_start = time.time()
         rois_to_subtract = [r for r in fov.rois
                             if r.source_stage == 1
@@ -399,8 +398,9 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         if rois_to_subtract:
             for roi, trace in zip(rois_to_subtract, traces):
                 roi.trace = trace
-        print(f"Source subtraction complete. Validation: "
-              f"{n_sub_pass}/{n_sub_total} passed", flush=True)
+        print(fmt.sub_phase(
+            f"Subtraction complete. Validation: {n_sub_pass}/{n_sub_total} passed"
+        ), flush=True)
 
         if n_sub_total > 0 and n_sub_pass < n_sub_total:
             warnings.append(
@@ -417,14 +417,16 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
                             and r.gate_outcome in ("accept", "flag")]
         n_sub_total = len(rois_to_subtract)
         n_sub_pass = _read_subtraction_pass_count(output_dir, 1, fallback=n_sub_total)
-        print(f"Resume: stage1 subtraction skipped "
-              f"({n_sub_pass}/{n_sub_total} previously passed)", flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage1 subtraction skipped "
+            f"({n_sub_pass}/{n_sub_total} previously passed)"
+        ), flush=True)
 
     next_label = max((r.label_id for r in fov.rois), default=0) + 1
 
     # ── Stage 2 Suite2p Temporal Detection ────────────────────────────────
     if rp.should_run("stage2") and cfg.enable_stage_2:
-        print("\nStage 2: Suite2p temporal detection", flush=True)
+        print(fmt.stage_header(2, "Suite2p temporal detection"), flush=True)
         t_start = time.time()
         with _gpu_section(gpu_lock):
             stage2_candidates = run_stage2(fov, cfg, starting_label_id=next_label)
@@ -438,8 +440,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n2_acc = sum(1 for r in stage2_rois if r.gate_outcome == "accept")
         n2_flag = sum(1 for r in stage2_rois if r.gate_outcome == "flag")
         n2_rej = sum(1 for r in stage2_rois if r.gate_outcome == "reject")
-        print(f"Stage 2: {n2_det} detected → {n2_acc} accepted, "
-              f"{n2_flag} flagged, {n2_rej} rejected", flush=True)
+        print(fmt.gate_outcome(2, n2_det, n2_acc, n2_flag, n2_rej), flush=True)
 
         # Save Stage 2 outputs
         (output_dir / "stage2").mkdir(exist_ok=True)
@@ -462,7 +463,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         }
         update_manifest(output_dir, "stage2", cfg, tif_path)
     elif rp.should_run("stage2") and not cfg.enable_stage_2:
-        print("Stage 2: skipped (disabled via cfg.enable_stage_2=False)",
+        print(fmt.sub_phase("Stage 2: skipped (disabled via cfg.enable_stage_2=False)"),
               flush=True)
         fov.stage_counts["stage2"] = {"detected": 0, "accepted": 0,
                                       "flagged": 0, "rejected": 0}
@@ -473,9 +474,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n2_acc = int(sc.get("accepted", 0))
         n2_flag = int(sc.get("flagged", 0))
         n2_rej = int(sc.get("rejected", 0))
-        print(f"Resume: stage2 skipped "
-              f"({n2_acc} accepted, {n2_flag} flagged, {n2_rej} rejected)",
-              flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage2 skipped "
+            f"({n2_acc} accepted, {n2_flag} flagged, {n2_rej} rejected)"
+        ), flush=True)
 
     # Subtract Stage 2 accept+flag from S₁ → S₂. Only runs when Stage 2
     # itself ran AND a downstream stage will read the residual.
@@ -485,7 +487,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         and rp.should_run("stage2_subtract")
     )
     if s2_should_subtract:
-        print("\nSource subtraction (Stage 2 → S₂): accept+flag ROIs only", flush=True)
+        print(fmt.stage_header("2→S", "Source subtraction"), flush=True)
         t_start = time.time()
         s2_subtract = [r for r in fov.rois
                        if r.source_stage == 2
@@ -516,7 +518,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             reason = "Stage 2 disabled"
         else:
             reason = "no downstream stage enabled"
-        print(f"Stage 2 subtraction: skipped ({reason})", flush=True)
+        print(fmt.sub_phase(f"Stage 2 subtraction: skipped ({reason})"), flush=True)
         s2_subtract = []
         n2_sub_pass = 0
         update_manifest(output_dir, "stage2_subtract", cfg, tif_path,
@@ -527,8 +529,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
                        and r.gate_outcome in ("accept", "flag")]
         n2_sub_pass = _read_subtraction_pass_count(output_dir, 2,
                                                    fallback=len(s2_subtract))
-        print(f"Resume: stage2 subtraction skipped "
-              f"({n2_sub_pass}/{len(s2_subtract)} previously passed)", flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage2 subtraction skipped "
+            f"({n2_sub_pass}/{len(s2_subtract)} previously passed)"
+        ), flush=True)
 
     # Cascade warning (Blindspot 2): Stage 2 accept > 1.5 × Stage 1 accept
     if n_accept > 0 and n2_acc > 1.5 * n_accept:
@@ -543,7 +547,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         # Stage 3 reads the latest residual on disk: S₂ if Stage 2 subtracted,
         # else S₁. _stage_input_residual handles the fallback.
         s3_input_residual = _stage_input_residual(fov, 3)
-        print(f"\nStage 3: template sweep on {s3_input_residual.name}",
+        print(fmt.stage_header(3, f"Template sweep on {s3_input_residual.name}"),
               flush=True)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
@@ -564,8 +568,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n3_acc = sum(1 for r in stage3_rois if r.gate_outcome == "accept")
         n3_flag = sum(1 for r in stage3_rois if r.gate_outcome == "flag")
         n3_rej = sum(1 for r in stage3_rois if r.gate_outcome == "reject")
-        print(f"Stage 3: {n3_det} candidates → {n3_acc} accepted, "
-              f"{n3_flag} flagged, {n3_rej} rejected", flush=True)
+        print(fmt.gate_outcome(3, n3_det, n3_acc, n3_flag, n3_rej), flush=True)
 
         # Save Stage 3 outputs
         (output_dir / "stage3").mkdir(exist_ok=True)
@@ -600,7 +603,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         }
         update_manifest(output_dir, "stage3", cfg, tif_path)
     elif rp.should_run("stage3") and not cfg.enable_stage_3:
-        print("Stage 3: skipped (disabled via cfg.enable_stage_3=False)",
+        print(fmt.sub_phase("Stage 3: skipped (disabled via cfg.enable_stage_3=False)"),
               flush=True)
         fov.stage_counts["stage3"] = {"detected": 0, "accepted": 0,
                                       "flagged": 0, "rejected": 0}
@@ -611,9 +614,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n3_acc = int(sc.get("accepted", 0))
         n3_flag = int(sc.get("flagged", 0))
         n3_rej = int(sc.get("rejected", 0))
-        print(f"Resume: stage3 skipped "
-              f"({n3_acc} accepted, {n3_flag} flagged, {n3_rej} rejected)",
-              flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage3 skipped "
+            f"({n3_acc} accepted, {n3_flag} flagged, {n3_rej} rejected)"
+        ), flush=True)
 
     # Subtract Stage 3 accept+flag from the latest residual → S₃. Only
     # runs when Stage 3 detected AND Stage 4 will consume the residual.
@@ -624,8 +628,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     )
     if s3_should_subtract:
         s3_input_residual = _stage_input_residual(fov, 3)
-        print(f"\nSource subtraction (Stage 3 → S₃) on {s3_input_residual.name}: "
-              "accept+flag ROIs only", flush=True)
+        print(fmt.stage_header("3→S", f"Source subtraction on {s3_input_residual.name}"),
+              flush=True)
         t_start = time.time()
         s3_subtract = [r for r in fov.rois
                        if r.source_stage == 3
@@ -654,7 +658,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             reason = "Stage 3 disabled"
         else:
             reason = "no downstream stage enabled"
-        print(f"Stage 3 subtraction: skipped ({reason})", flush=True)
+        print(fmt.sub_phase(f"Stage 3 subtraction: skipped ({reason})"), flush=True)
         s3_subtract = []
         n3_sub_pass = 0
         update_manifest(output_dir, "stage3_subtract", cfg, tif_path,
@@ -665,8 +669,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
                        and r.gate_outcome in ("accept", "flag")]
         n3_sub_pass = _read_subtraction_pass_count(output_dir, 3,
                                                    fallback=len(s3_subtract))
-        print(f"Resume: stage3 subtraction skipped "
-              f"({n3_sub_pass}/{len(s3_subtract)} previously passed)", flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage3 subtraction skipped "
+            f"({n3_sub_pass}/{len(s3_subtract)} previously passed)"
+        ), flush=True)
 
     # Cascade warning: Stage 3 accept > 0.5 × Stage 2 accept
     if n2_acc > 0 and n3_acc > 0.5 * n2_acc:
@@ -678,8 +684,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # ── Stage 4: Tonic Neuron Search ─────────────────────────────────────
     if rp.should_run("stage4") and cfg.enable_stage_4:
         s4_input_residual = _stage_input_residual(fov, 4)
-        print(f"\nStage 4: multi-scale bandpass + correlation contrast on "
-              f"{s4_input_residual.name}", flush=True)
+        print(fmt.stage_header(4, f"Tonic neuron search on {s4_input_residual.name}"),
+              flush=True)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
         stage4_candidates = run_stage4(s4_input_residual, fov, cfg,
@@ -699,8 +705,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n4_det = len(stage4_rois)
         n4_flag = sum(1 for r in stage4_rois if r.gate_outcome == "flag")
         n4_rej = sum(1 for r in stage4_rois if r.gate_outcome == "reject")
-        print(f"Stage 4: {n4_det} candidates → {n4_flag} requires_review, "
-              f"{n4_rej} rejected (no accept tier by design)", flush=True)
+        print(fmt.gate_outcome(4, n4_det, 0, n4_flag, n4_rej), flush=True)
 
         _write_stage4_outputs(fov, stage4_rois, cfg, output_dir)
         fov.rois.extend([r for r in stage4_rois if r.gate_outcome != "reject"])
@@ -712,7 +717,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         }
         update_manifest(output_dir, "stage4", cfg, tif_path)
     elif rp.should_run("stage4") and not cfg.enable_stage_4:
-        print("Stage 4: skipped (disabled via cfg.enable_stage_4=False)",
+        print(fmt.sub_phase("Stage 4: skipped (disabled via cfg.enable_stage_4=False)"),
               flush=True)
         fov.stage_counts["stage4"] = {"detected": 0, "accepted": 0,
                                       "flagged": 0, "rejected": 0}
@@ -722,8 +727,9 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n4_det = int(sc.get("detected", 0))
         n4_flag = int(sc.get("flagged", 0))
         n4_rej = int(sc.get("rejected", 0))
-        print(f"Resume: stage4 skipped "
-              f"({n4_flag} requires_review, {n4_rej} rejected)", flush=True)
+        print(fmt.sub_phase(
+            f"Resume: stage4 skipped ({n4_flag} requires_review, {n4_rej} rejected)"
+        ), flush=True)
 
     # Cascade warning: Stage 4 detected > Stage 3 detected is a red flag
     if n3_det > 0 and n4_det > n3_det:
@@ -758,7 +764,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # merged_masks.tif.
     fov.rois.sort(key=lambda r: int(r.label_id))
 
-    print("\nTrace extraction from registered movie (data.bin)", flush=True)
+    print(fmt.stage_header("Post", "Trace extraction + QC"), flush=True)
     t_start = time.time()
     F_raw, F_neu, F_corrected = extract_all_traces(fov, fov.rois, cfg)
     stage_timings["traces_s"] = time.time() - t_start
@@ -769,12 +775,14 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         F_corrected = correct_overlapping_traces(
             fov, fov.rois, overlap_groups, F_corrected, cfg,
         )
-        print(f"Overlap correction: re-estimated traces for "
-              f"{sum(len(g) for g in overlap_groups)} ROIs "
-              f"across {len(overlap_groups)} groups", flush=True)
+        print(fmt.sub_phase(
+            f"Overlap correction: re-estimated traces for "
+            f"{sum(len(g) for g in overlap_groups)} ROIs "
+            f"across {len(overlap_groups)} groups"
+        ), flush=True)
     stage_timings["overlap_s"] = time.time() - t_start
 
-    print("Computing unified QC features", flush=True)
+    print(fmt.sub_phase("Computing unified QC features"), flush=True)
     t_start = time.time()
     compute_all_features(fov, fov.rois, cfg, template_bank)
     stage_timings["features_s"] = time.time() - t_start
@@ -820,7 +828,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
 
     if warnings:
         for w in warnings:
-            print(f"  WARNING: {w}", flush=True)
+            print(fmt.sub_phase(f"WARNING: {w}"), flush=True)
 
     print_final_summary(fov, review_queue, output_dir)
 
@@ -1121,7 +1129,7 @@ def _run_single(
     )
 
     fov_stem = tif_path.stem.replace("_mc", "")
-    print(f"=== Running pipeline on {tif_path.name} ===", flush=True)
+    print(fmt.fov_banner(tif_path.name, 1, 1), flush=True)
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif_path, cfg)
@@ -1169,11 +1177,12 @@ def _run_single(
     for roi in fov.rois:
         counts[roi.gate_outcome] = counts.get(roi.gate_outcome, 0) + 1
 
-    print("\n=== Summary ===", flush=True)
+    print(fmt.pipeline_complete(fov_stem, duration), flush=True)
     png_name = png_path.name if png_path else "<no overlay>"
-    print(f"  {tif_path.name}: accept={counts['accept']} flag={counts['flag']} "
-          f"reject={counts['reject']}  [{fmt_duration(duration)}]  → {png_name}",
-          flush=True)
+    print(fmt.sub_phase(
+        f"{tif_path.name}: accept={counts['accept']} flag={counts['flag']} "
+        f"reject={counts['reject']}  [{fmt_duration(duration)}]  → {png_name}"
+    ), flush=True)
 
     if args.email_to and not args.no_email:
         params = EmailParams(
@@ -1271,19 +1280,21 @@ def _run_workspace(
 
     successes = [r for r in ws_results if r.error is None]
     failures = [r for r in ws_results if r.error is not None]
-    print("\n=== Summary ===", flush=True)
+    n_tifs = len(workspace.tifs)
+    print(fmt.pipeline_complete(f"{n_tifs} FOV(s)"), flush=True)
     for r in ws_results:
         if r.error is not None:
-            print(f"  {r.tif.name}: FAILED — {r.error}")
+            print(fmt.sub_phase(f"{r.tif.name}: FAILED — {r.error}"), flush=True)
         else:
             c = r.roi_counts
             png = r.png_path.name if r.png_path else "<no overlay>"
-            print(
-                f"  {r.tif.name}: accept={c.get('accept', 0)} "
+            print(fmt.sub_phase(
+                f"{r.tif.name}: accept={c.get('accept', 0)} "
                 f"flag={c.get('flag', 0)} reject={c.get('reject', 0)}  "
                 f"[{fmt_duration(r.duration_s)}]  → {png}"
-            )
-    print(f"{len(successes)} succeeded, {len(failures)} failed.", flush=True)
+            ), flush=True)
+    print(fmt.sub_phase(f"{len(successes)} succeeded, {len(failures)} failed."),
+          flush=True)
 
     if not successes:
         return 1

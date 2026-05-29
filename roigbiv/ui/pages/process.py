@@ -112,6 +112,7 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-scan-result", "children"),
         Output("roigbiv-run-btn", "disabled"),
+        Output("roigbiv-active-registry", "children"),
         Input("roigbiv-scan-btn", "n_clicks"),
         State("roigbiv-input-path", "value"),
         prevent_initial_call=True,
@@ -119,13 +120,17 @@ def register_callbacks(app: dash.Dash) -> None:
     def _on_scan(_n: int, path: Optional[str]):
         state = get_app_state()
         if not path:
-            return dbc.Alert("Enter a path first.", color="warning"), True
+            return dbc.Alert("Enter a path first.", color="warning"), True, no_update
         try:
             workspace = resolve_workspace(Path(path))
         except FileNotFoundError as exc:
-            return dbc.Alert(str(exc), color="danger"), True
+            return dbc.Alert(str(exc), color="danger"), True, no_update
         state.set_workspace(workspace)
-        return _workspace_summary(workspace), False
+        return (
+            _workspace_summary(workspace),
+            False,
+            f"registry: {workspace.db_path}",
+        )
 
     @app.callback(
         Output("roigbiv-process-tick", "disabled"),
@@ -148,8 +153,13 @@ def register_callbacks(app: dash.Dash) -> None:
             "cellpose_model": model or "models/deployed/current_model",
         }
         runner = get_pipeline_runner()
-        started = runner.start(state.workspace, overrides)
-        if not started:
+        result = runner.start(state.workspace, overrides)
+        if result == "busy":
+            return False, dbc.Alert(
+                "Pipeline is running for another session — try again shortly.",
+                color="warning",
+            )
+        if not result:
             return False, dbc.Alert(
                 "A pipeline run is already active — wait for it to finish.",
                 color="warning",

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from roigbiv.pipeline import fmt
 from roigbiv.pipeline.types import FOVData, ROI, PipelineConfig
 
 
@@ -166,7 +167,7 @@ def print_final_summary(
     p_actionable = p1 + p2 + p3
 
     stem = fov.raw_path.stem.replace("_mc", "")
-    print("\n=== ROI G. Biv — Pipeline Complete ===", flush=True)
+    print(fmt.pipeline_complete(stem), flush=True)
     print(f"FOV: {stem}", flush=True)
     print(
         f"Total ROIs: {total} "
@@ -176,9 +177,9 @@ def print_final_summary(
     )
     print(f"Review queue: {p_actionable} ROIs flagged for HITL review",
           flush=True)
-    print(f"  Priority 1 (tonic review): {p1}", flush=True)
-    print(f"  Priority 2 (flagged):      {p2}", flush=True)
-    print(f"  Priority 3 (single-event): {p3}", flush=True)
+    print(fmt.sub_phase(f"Priority 1 (tonic review): {p1}"), flush=True)
+    print(fmt.sub_phase(f"Priority 2 (flagged):      {p2}"), flush=True)
+    print(fmt.sub_phase(f"Priority 3 (single-event): {p3}"), flush=True)
     print(f"Outputs saved to: {output_dir}", flush=True)
     print(f"HITL staging ready at: {output_dir}/hitl_staging/", flush=True)
     print("\nNext step: Open merged_masks.tif in Cellpose GUI for review.",

@@ -200,7 +200,7 @@ def list_local_rois_for_session(output_dir: Path) -> list[dict]:
     return rows
 
 
-def list_global_cells_for_fov(fov_id: str) -> list[GlobalCellRow]:
+def list_global_cells_for_fov(fov_id: str, cfg=None) -> list[GlobalCellRow]:
     """Enumerate cross-session cells for a FOV (n_sessions >= 2 only).
 
     Uses the authoritative mapping in the registry DB: a cell is "cross-
@@ -208,7 +208,7 @@ def list_global_cells_for_fov(fov_id: str) -> list[GlobalCellRow]:
     """
     from roigbiv.registry import build_store
 
-    store = build_store()
+    store = build_store(cfg=cfg)
     store.ensure_schema()
     cells = store.list_cells(fov_id)
     out: list[GlobalCellRow] = []
@@ -232,6 +232,7 @@ def collect_cross_session_traces(
     fov_id: str,
     global_cell_id: str,
     kind: SignalKind,
+    cfg=None,
 ) -> list[tuple[SessionTraces, int]]:
     """Return [(SessionTraces, row_index)] for every session containing the
     given persistent cell.
@@ -242,13 +243,13 @@ def collect_cross_session_traces(
     """
     from roigbiv.registry import build_store
 
-    store = build_store()
+    store = build_store(cfg=cfg)
     store.ensure_schema()
     observations = store.list_observations_for_cell(global_cell_id)
     if not observations:
         return []
 
-    bundle: CrossSessionBundle = load_cross_session_bundle(fov_id)
+    bundle: CrossSessionBundle = load_cross_session_bundle(fov_id, cfg=cfg)
     session_meta_by_id = {s.session_id: s for s in bundle.sessions}
 
     out: list[tuple[SessionTraces, int]] = []
@@ -275,12 +276,13 @@ def collect_cross_session_traces(
 def collect_sessions_for_fov(
     fov_id: str,
     kind: SignalKind,
+    cfg=None,
 ) -> list[SessionTraces]:
     """Return every session on this FOV as :class:`SessionTraces`, ordered
     by session_date. Sessions with no ``traces/`` bundle come back with
     ``matrix=None`` and a ``note`` set — the UI decides whether to skip or
     display a placeholder."""
-    bundle: CrossSessionBundle = load_cross_session_bundle(fov_id)
+    bundle: CrossSessionBundle = load_cross_session_bundle(fov_id, cfg=cfg)
     out: list[SessionTraces] = []
     for ref in bundle.sessions:
         out.append(load_session_traces(

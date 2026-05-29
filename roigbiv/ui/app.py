@@ -21,6 +21,9 @@ on demand.
 from __future__ import annotations
 
 import os
+import secrets as _secrets
+import threading
+import time
 from pathlib import Path
 
 import dash
@@ -40,7 +43,6 @@ from roigbiv.ui.pages.review import (
     SIDEBAR_STORE_ID,
     SIDEBAR_TOGGLE_ID,
 )
-from roigbiv.ui.services.app_state import get_app_state
 
 
 # Both stylesheets are served at boot; the runtime toggle just flips
@@ -60,6 +62,36 @@ PAGES = (
 )
 
 
+_SESSION_TTL = 7200   # seconds before an idle session's state is evicted
+
+
+def _start_session_cleanup() -> None:
+    """Daemon thread that evicts stale per-session state every 30 minutes."""
+    from roigbiv.ui.services.app_state import _instances, _instances_lock
+    from roigbiv.ui.services.cellpose_trainer import _trainers, _trainers_lock
+    from roigbiv.ui.services.pipeline_runner import _runners, _runners_lock
+
+    def _loop() -> None:
+        while True:
+            time.sleep(1800)
+            cutoff = time.monotonic() - _SESSION_TTL
+            for store, lock in (
+                (_instances, _instances_lock),
+                (_runners, _runners_lock),
+                (_trainers, _trainers_lock),
+            ):
+                with lock:
+                    stale = [
+                        sid for sid, obj in store.items()
+                        if getattr(obj, "_last_accessed", 0) < cutoff
+                    ]
+                    for sid in stale:
+                        del store[sid]
+
+    threading.Thread(target=_loop, name="roigbiv-session-cleanup",
+                     daemon=True).start()
+
+
 def build_app() -> dash.Dash:
     """Create and wire the Dash app (layout + callbacks)."""
     configure_ui_logging()
@@ -74,9 +106,10 @@ def build_app() -> dash.Dash:
         suppress_callback_exceptions=True,
         assets_folder="assets",
     )
-
-    # Prime the shared app-state singleton so pages can read/write it.
-    get_app_state()
+    app.server.secret_key = os.environ.get(
+        "ROIGBIV_SECRET_KEY", _secrets.token_hex(32)
+    )
+    _start_session_cleanup()
 
     app.layout = _build_layout()
     _wire_routes(app)
@@ -136,14 +169,8 @@ def _build_layout() -> html.Div:
 
 
 def _active_registry_label() -> str:
-    """One-line human-readable description of the active registry DSN."""
-    dsn = os.environ.get("ROIGBIV_REGISTRY_DSN")
-    if dsn and dsn.startswith("sqlite:///"):
-        return f"registry: {dsn[len('sqlite:///'):]}"
-    if dsn:
-        return f"registry: {dsn}"
-    default = Path.cwd() / "inference" / "registry.db"
-    return f"registry: {default} (default — pass --workspace PATH to override)"
+    """One-line initial registry indicator shown before a workspace is scanned."""
+    return "registry: scan a workspace to begin"
 
 
 def _wire_routes(app: dash.Dash) -> None:

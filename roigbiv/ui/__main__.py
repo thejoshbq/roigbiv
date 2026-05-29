@@ -18,10 +18,9 @@ def main(argv: list[str] | None = None) -> int:
         description="ROIGBIV Dash interface — processing, registry, viewer, HITL review.",
     )
     parser.add_argument("--workspace", type=Path, default=None,
-                        help="Workspace directory to bind the UI to. "
-                             "Sets ROIGBIV_REGISTRY_DSN / BLOB_ROOT so Registry, "
-                             "Viewer, and HITL read the workspace's registry.db "
-                             "instead of the default inference/registry.db.")
+                        help="Pre-fill the Workspace field on the Process page. "
+                             "The Review tab requires an explicit Scan before it "
+                             "becomes active regardless of this flag.")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Host to bind (default: 127.0.0.1). "
                              "Use 0.0.0.0 for LAN access.")

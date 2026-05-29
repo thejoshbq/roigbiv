@@ -200,16 +200,16 @@ def _gcid_by_label_from_registry(registry: Optional[dict]) -> dict[int, str]:
 # ── Cross-session bundle ───────────────────────────────────────────────────
 
 
-def load_cross_session_bundle(fov_id: str) -> CrossSessionBundle:
+def load_cross_session_bundle(fov_id: str, cfg=None) -> CrossSessionBundle:
     """Build a :class:`CrossSessionBundle` for every session tied to ``fov_id``.
 
-    The store is opened fresh from the current env (so the workspace
-    ``ROIGBIV_REGISTRY_DSN`` is honored). Sessions with missing output
-    directories are silently dropped — same behavior as the napari viewer.
+    Pass ``cfg`` (a :class:`roigbiv.registry.config.RegistryConfig`) to read
+    from a specific registry rather than the process-level env default.
+    Sessions with missing output directories are silently dropped.
     """
     from roigbiv.registry import build_store
 
-    store = build_store()
+    store = build_store(cfg=cfg)
     store.ensure_schema()
 
     fov = store.get_fov(fov_id)

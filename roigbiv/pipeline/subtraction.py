@@ -33,6 +33,8 @@ from typing import Optional
 
 import numpy as np
 
+from roigbiv.pipeline import fmt
+from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import ROI, PipelineConfig
 
 
@@ -153,7 +155,7 @@ def solve_traces_from_chunks(
     import torch
 
     N = design.shape[1]
-    device = "cpu" if cfg.force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu" if cfg.force_cpu else ("cuda" if cuda_compute_capable() else "cpu")
 
     W_t = torch.from_numpy(design).to(device)                # (P, N)
     WtW = W_t.T @ W_t                                         # (N, N)
@@ -639,14 +641,14 @@ def run_source_subtraction(
     # Step 1: profiles
     t0 = time.time()
     profiles = estimate_spatial_profiles(profile_source, rois)
-    print(f"  profiles: {len(profiles)} ROIs in {time.time()-t0:.2f}s", flush=True)
+    print(fmt.sub_phase(f"profiles: {len(profiles)} ROIs", time.time() - t0), flush=True)
 
     # Step 2: simultaneous traces via GPU-chunked normal equations
     t0 = time.time()
     traces, _union_idx, _union_yx = estimate_traces_simultaneous(
         residual_S_path, shape, profiles, cfg,
     )
-    print(f"  traces: {traces.shape} via GPU lstsq in {time.time()-t0:.2f}s", flush=True)
+    print(fmt.sub_phase(f"traces: {traces.shape} via GPU lstsq", time.time() - t0), flush=True)
 
     # Step 3: rank-1 subtract (streaming, writes residual_out_path)
     t0 = time.time()
@@ -654,7 +656,8 @@ def run_source_subtraction(
                      chunk=cfg.reconstruct_chunk)
     meta = {"shape": list(shape), "dtype": "float32"}
     meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"  rank-1 subtract → {residual_out_path.name} in {time.time()-t0:.2f}s", flush=True)
+    print(fmt.sub_phase(f"rank-1 subtract → {residual_out_path.name}", time.time() - t0),
+          flush=True)
 
     # Step 4: validate
     t0 = time.time()
@@ -664,8 +667,10 @@ def run_source_subtraction(
     n_fail = sum(1 for v in validation.values() if not v["pass"])
     n_anticorr = sum(1 for v in validation.values()
                       if v["anticorr_max"] < cfg.subtract_anticorr_threshold)
-    print(f"  validate: {len(rois)-n_fail}/{len(rois)} passed "
-          f"({n_anticorr} anticorr flags) in {time.time()-t0:.2f}s", flush=True)
+    print(fmt.sub_phase(
+        f"validate: {len(rois)-n_fail}/{len(rois)} passed ({n_anticorr} anticorr flags)",
+        time.time() - t0,
+    ), flush=True)
 
     # Step 5: NNLS fallback on flagged ROIs if anticorrelation failure rate > threshold
     failure_frac = n_anticorr / max(len(rois), 1)
@@ -678,8 +683,10 @@ def run_source_subtraction(
 
         if flagged_indices:
             t0 = time.time()
-            print(f"  NNLS fallback on {len(flagged_indices)} anticorr-flagged ROIs "
-                  f"(failure_frac={failure_frac:.1%})", flush=True)
+            print(fmt.sub_phase(
+                f"NNLS fallback on {len(flagged_indices)} anticorr-flagged ROIs "
+                f"(failure_frac={failure_frac:.1%})"
+            ), flush=True)
             traces = _nnls_refine_flagged(
                 residual_S_path, residual_out_path, shape, rois, profiles,
                 traces, flagged_indices, cfg,
@@ -695,8 +702,10 @@ def run_source_subtraction(
             )
             validation.update(flagged_update)
             n_fail = sum(1 for v in validation.values() if not v["pass"])
-            print(f"  post-NNLS: {len(rois)-n_fail}/{len(rois)} passed "
-                  f"in {time.time()-t0:.2f}s", flush=True)
+            print(fmt.sub_phase(
+                f"post-NNLS: {len(rois)-n_fail}/{len(rois)} passed",
+                time.time() - t0,
+            ), flush=True)
 
     # Persist validation report
     report_path.write_text(json.dumps(validation, indent=2))

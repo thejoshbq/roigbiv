@@ -6,8 +6,6 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - pytorch::pytorch>=2.0
-  - pytorch::pytorch-cuda=12.8
   - numpy>=2.0
   - scipy
   - pandas
@@ -17,6 +15,9 @@ dependencies:
   - pyyaml
   - pip
   - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu126
+    - torch
+    - torchvision
     - suite2p
     - "cellpose<4.0.0"
     - streamlit

@@ -41,6 +41,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from roigbiv.io import discover_tifs, validate_tif
+from roigbiv.pipeline import fmt
 from roigbiv.pipeline.types import FOVData, PipelineConfig
 
 LogCallback = Callable[[str], None]
@@ -211,7 +212,9 @@ def run_with_workspace(
     else:
         results = []
         for idx, tif in enumerate(workspace.tifs, start=1):
-            log(f"\n[FOV {idx}/{len(workspace.tifs)}] {tif.name}")
+            if idx > 1:
+                log(fmt.fov_separator())
+            log(fmt.fov_banner(tif.name, idx, len(workspace.tifs)))
             results.append(_process_one(tif, workspace, cfg_overrides, log,
                                         skip_registry=skip_registry))
 

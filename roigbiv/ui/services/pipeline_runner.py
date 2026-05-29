@@ -4,9 +4,12 @@ Runs :func:`roigbiv.pipeline.workspace.run_with_workspace` in a daemon thread
 so the Dash callback that kicks it off returns immediately. Logs are buffered
 in a thread-safe deque that the page polls on a ``dcc.Interval``.
 
-The runner is a process-local singleton — the UI assumes at most one active
-pipeline run at a time. A second call while one is in flight is rejected
-cleanly instead of overlapping runs.
+Multi-user: each browser session gets its own :class:`PipelineRunner` keyed
+on the Flask session UUID, so logs and results are fully isolated. A
+process-level ``_pipeline_gate`` lock ensures only one pipeline run is active
+at a time (preventing concurrent ``configure_registry_env()`` env-var races in
+:mod:`roigbiv.pipeline.workspace`). Callers receive ``"busy"`` instead of a
+silent failure when another session is running.
 """
 from __future__ import annotations
 
@@ -44,7 +47,8 @@ class RunSnapshot:
 class PipelineRunner:
     """Single-slot background runner for workspace pipeline jobs."""
 
-    def __init__(self) -> None:
+    def __init__(self, gate: threading.Lock) -> None:
+        self._gate = gate
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._logs: deque[str] = deque(maxlen=_MAX_LOG_LINES)
@@ -56,17 +60,32 @@ class PipelineRunner:
         self._n_failed: int = 0
         self._error: Optional[str] = None
         self._results: list[FOVRunResult] = []
+        self._last_accessed: float = time.monotonic()
 
     # ── control ───────────────────────────────────────────────────────────
-    def start(self, workspace: WorkspacePaths, overrides: dict) -> bool:
-        """Kick off a run; returns ``False`` if one is already in flight."""
-        with self._lock:
-            if self._active:
-                return False
-            self._reset_locked()
-            self._active = True
-            self._started_at = time.time()
-            self._n_fovs = len(workspace.tifs)
+    def start(self, workspace: WorkspacePaths, overrides: dict) -> bool | str:
+        """Kick off a run.
+
+        Returns:
+          True    — run started successfully.
+          False   — this session's runner is already active (shouldn't happen
+                    if the UI disables the button, but guards re-entry).
+          "busy"  — another session's pipeline is currently running.
+        """
+        if not self._gate.acquire(blocking=False):
+            return "busy"
+        try:
+            with self._lock:
+                if self._active:
+                    self._gate.release()
+                    return False
+                self._reset_locked()
+                self._active = True
+                self._started_at = time.time()
+                self._n_fovs = len(workspace.tifs)
+        except Exception:
+            self._gate.release()
+            raise
         t = threading.Thread(
             target=self._run,
             args=(workspace, overrides),
@@ -112,24 +131,27 @@ class PipelineRunner:
 
     def _run(self, workspace: WorkspacePaths, overrides: dict) -> None:
         try:
-            results = run_with_workspace(
-                workspace, overrides, log_cb=self._append_and_tally,
-            )
-        except BaseException as exc:  # noqa: BLE001
-            tb = traceback.format_exc()
-            with self._lock:
-                self._error = f"{type(exc).__name__}: {exc}"
-                self._logs.append(f"FATAL: {self._error}")
-                for line in tb.strip().splitlines():
-                    self._logs.append(line)
-            results = []
+            try:
+                results = run_with_workspace(
+                    workspace, overrides, log_cb=self._append_and_tally,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                tb = traceback.format_exc()
+                with self._lock:
+                    self._error = f"{type(exc).__name__}: {exc}"
+                    self._logs.append(f"FATAL: {self._error}")
+                    for line in tb.strip().splitlines():
+                        self._logs.append(line)
+                results = []
 
-        with self._lock:
-            self._results = results
-            self._n_done = sum(1 for r in results if r.error is None)
-            self._n_failed = sum(1 for r in results if r.error is not None)
-            self._completed_at = time.time()
-            self._active = False
+            with self._lock:
+                self._results = results
+                self._n_done = sum(1 for r in results if r.error is None)
+                self._n_failed = sum(1 for r in results if r.error is not None)
+                self._completed_at = time.time()
+                self._active = False
+        finally:
+            self._gate.release()
 
     def _append_and_tally(self, line: str) -> None:
         """Log callback that also counts completed FOVs from ``pipeline OK``."""
@@ -157,14 +179,18 @@ class PipelineRunner:
         }
 
 
-_runner: Optional[PipelineRunner] = None
-_runner_lock = threading.Lock()
+_runners: dict[str, PipelineRunner] = {}
+_runners_lock = threading.Lock()
+_pipeline_gate = threading.Lock()
 
 
 def get_pipeline_runner() -> PipelineRunner:
-    global _runner
-    if _runner is None:
-        with _runner_lock:
-            if _runner is None:
-                _runner = PipelineRunner()
-    return _runner
+    """Return the :class:`PipelineRunner` for the current browser session."""
+    from roigbiv.ui.services.session import get_session_id
+    sid = get_session_id()
+    with _runners_lock:
+        if sid not in _runners:
+            _runners[sid] = PipelineRunner(_pipeline_gate)
+    runner = _runners[sid]
+    runner._last_accessed = time.monotonic()
+    return runner

@@ -40,6 +40,7 @@ from typing import Optional
 import numpy as np
 
 from roigbiv.pipeline.stage2 import extract_traces_from_residual
+from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import FOVData, PipelineConfig, ROI
 
 
@@ -251,7 +252,7 @@ def run_stage3(
     import torch
 
     T, H, W = fov.shape
-    device = "cpu" if cfg.force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu" if cfg.force_cpu else ("cuda" if cuda_compute_capable() else "cpu")
 
     # Pad templates, move to GPU, precompute FFTs
     templates_padded = _pad_templates(template_bank)           # (K, L_max)

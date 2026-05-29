@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +65,7 @@ class CellposeTrainer:
         self._run_id: Optional[str] = None
         self._error: Optional[str] = None
         self._ingest_summary: Optional[str] = None
+        self._last_accessed: float = time.monotonic()
 
     # ── GUI launch ────────────────────────────────────────────────────────────
 
@@ -335,18 +337,20 @@ class CellposeTrainer:
             self._logs.append(line)
 
 
-_trainer: Optional[CellposeTrainer] = None
-_trainer_lock = threading.Lock()
+_trainers: dict[str, CellposeTrainer] = {}
+_trainers_lock = threading.Lock()
 
 
 def get_trainer() -> CellposeTrainer:
-    """Return the process-local singleton :class:`CellposeTrainer`."""
-    global _trainer
-    if _trainer is None:
-        with _trainer_lock:
-            if _trainer is None:
-                _trainer = CellposeTrainer()
-    return _trainer
+    """Return the :class:`CellposeTrainer` for the current browser session."""
+    from roigbiv.ui.services.session import get_session_id
+    sid = get_session_id()
+    with _trainers_lock:
+        if sid not in _trainers:
+            _trainers[sid] = CellposeTrainer()
+    trainer = _trainers[sid]
+    trainer._last_accessed = time.monotonic()
+    return trainer
 
 
 def _prepare_staging_npy(staging_images: Path, output_dir: Path) -> None:

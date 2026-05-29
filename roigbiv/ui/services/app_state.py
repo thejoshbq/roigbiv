@@ -1,22 +1,28 @@
-"""Process-local shared state for the Dash UI.
+"""Per-session shared state for the Dash UI.
 
 Held server-side so we don't ship heavy arrays through ``dcc.Store``. Each
-Dash callback fetches the singleton via :func:`get_app_state` and reads or
-mutates it directly. Callbacks then return small serializable receipts to
-trigger UI updates on the client.
+Dash callback fetches its session's instance via :func:`get_app_state` and
+reads or mutates it directly. Callbacks then return small serializable
+receipts to trigger UI updates on the client.
 
 Thread safety: Dash callbacks run on Flask's WSGI worker pool. All mutating
 operations here take ``self._lock`` so concurrent callbacks don't corrupt
 state. Caches are opportunistic — they can be blown away without data loss.
+
+Multi-user: each browser session gets its own :class:`AppState` keyed on the
+Flask session UUID. The module-level ``_instances`` dict is the only
+shared mutable state; it is protected by ``_instances_lock``.
 """
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from roigbiv.pipeline.workspace import WorkspacePaths
+from roigbiv.registry.config import RegistryConfig
 
 
 @dataclass
@@ -28,21 +34,31 @@ class _FOVCache:
 
 @dataclass
 class AppState:
-    """Single source of truth for the Dash session.
+    """Per-session source of truth for the Dash UI.
 
     Fields are intentionally simple values (paths, dicts) so they can be
     safely handed to callbacks and templates.
     """
 
     workspace: Optional[WorkspacePaths] = None
+    registry_config: Optional[RegistryConfig] = None
     run_id: Optional[str] = None
     _fov_cache: dict[str, _FOVCache] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock)
+    _last_accessed: float = field(default_factory=time.monotonic)
 
     # ── workspace ─────────────────────────────────────────────────────────
     def set_workspace(self, workspace: WorkspacePaths) -> None:
         with self._lock:
             self.workspace = workspace
+            self.registry_config = RegistryConfig(
+                dsn=workspace.db_dsn,
+                blob_backend="local",
+                blob_root=workspace.blob_root,
+                endpoint=None,
+                api_key=None,
+                calibration_path=workspace.calibration_path,
+            )
             self._fov_cache.clear()
 
     def require_workspace(self) -> WorkspacePaths:
@@ -64,15 +80,18 @@ class AppState:
             self._fov_cache.pop(key, None)
 
 
-_instance: Optional[AppState] = None
-_instance_lock = threading.Lock()
+_instances: dict[str, AppState] = {}
+_instances_lock = threading.Lock()
 
 
 def get_app_state() -> AppState:
-    """Return the process-wide :class:`AppState` singleton."""
-    global _instance
-    if _instance is None:
-        with _instance_lock:
-            if _instance is None:
-                _instance = AppState()
-    return _instance
+    """Return the :class:`AppState` for the current browser session."""
+    from roigbiv.ui.services.session import get_session_id
+    sid = get_session_id()
+    if sid not in _instances:
+        with _instances_lock:
+            if sid not in _instances:
+                _instances[sid] = AppState()
+    inst = _instances[sid]
+    inst._last_accessed = time.monotonic()
+    return inst

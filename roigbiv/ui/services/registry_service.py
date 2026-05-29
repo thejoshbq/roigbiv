@@ -24,10 +24,10 @@ class FOVRow:
     n_sessions: int
 
 
-def list_fovs() -> list[FOVRow]:
+def list_fovs(cfg=None) -> list[FOVRow]:
     from roigbiv.registry import build_store
 
-    store = build_store()
+    store = build_store(cfg=cfg)
     store.ensure_schema()
     rows: list[FOVRow] = []
     seen: set[str] = set()

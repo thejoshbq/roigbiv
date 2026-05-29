@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 
+from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import PipelineConfig
 
 
@@ -122,10 +123,20 @@ def run_cellpose_detection(
     label_image      : (H, W) uint16 — labeled image (0 = background)
     cellprob_map     : (H, W) float32 — continuous cellpose probability map
     """
-    import torch
     from cellpose.models import CellposeModel
 
-    gpu = not cfg.force_cpu and bool(torch.cuda.is_available())
+    if cfg.force_cpu:
+        gpu = False
+    elif not cuda_compute_capable():
+        print(
+            "  WARNING: CUDA device detected but compute probe failed "
+            "(sm/CC mismatch — PyTorch build lacks kernels for this GPU); "
+            "falling back to CPU for Cellpose.",
+            flush=True,
+        )
+        gpu = False
+    else:
+        gpu = True
     model_path = _resolve_model_path(cfg.cellpose_model)
 
     # Cellpose 3.x silently constructs a default model when given a missing

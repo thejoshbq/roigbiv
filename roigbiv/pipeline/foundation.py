@@ -28,6 +28,8 @@ from typing import Optional
 import numpy as np
 import tifffile
 
+from roigbiv.pipeline import fmt
+from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import FOVData, PipelineConfig
 
 
@@ -160,7 +162,7 @@ def _binned_svd_gpu(
     """
     import torch
 
-    device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu" if force_cpu else ("cuda" if cuda_compute_capable() else "cpu")
     # torch.svd_lowrank is a randomized algorithm; without seeding the top-k
     # subspace it returns drifts run-to-run (mean principal-angle cosine ≈0.65
     # on real movies), which propagates into S → vcorr_S → Cellpose channel 2
@@ -484,25 +486,27 @@ def run_foundation(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary").mkdir(exist_ok=True)
 
-    print("Foundation: motion correction via Suite2p wrapper", flush=True)
+    print(fmt.stage_header("F", "Motion correction"), flush=True)
     ops, data_bin_path, motion_x, motion_y = run_motion_correction(tif_path, cfg, output_dir)
     Ly = int(ops["Ly"]); Lx = int(ops["Lx"])
     # Determine T from data.bin size (more reliable than ops fields across Suite2p versions)
     T = Path(data_bin_path).stat().st_size // (Ly * Lx * 2)
-    print(f"  ops: T={T}, Ly={Ly}, Lx={Lx}  (fs={cfg.fs} tau={cfg.tau} "
-          f"registration={'ON' if cfg.do_registration else 'OFF'})", flush=True)
+    print(fmt.sub_phase(
+        f"ops: T={T}, Ly={Ly}, Lx={Lx}  (fs={cfg.fs} tau={cfg.tau} "
+        f"registration={'ON' if cfg.do_registration else 'OFF'})"
+    ), flush=True)
 
     # Persist motion traces (spec §3.1 Blindspot 9 — for future Gate 4)
     np.savez(str(output_dir / "motion_trace.npz"),
              xoff=motion_x, yoff=motion_y, fs=np.float32(cfg.fs))
 
-    print(f"Foundation: L+S background separation (k_background={cfg.k_background}, "
-          f"n_svd={cfg.n_svd})", flush=True)
+    print(fmt.stage_header("F", f"L+S background separation (k={cfg.k_background}, n_svd={cfg.n_svd})"),
+          flush=True)
     residual_S_path, svd_factors_path, k_used, mean_L = compute_background_separation(
         data_bin_path, ops, cfg, output_dir,
     )
 
-    print("Foundation: summary images (mean, max, std, vcorr) on S", flush=True)
+    print(fmt.stage_header("F", "Summary images (mean, max, std, vcorr) on S"), flush=True)
     t0 = time.time()
     # Cap at 128 frames/chunk regardless of reconstruct_chunk. Each chunk
     # allocates `chunk64` (cs·Ly·Lx·8 B) plus transient `(chunk64 ** 2)` /
@@ -517,7 +521,7 @@ def run_foundation(
     max_S = summaries["max"]
     std_S = summaries["std"]
     vcorr_S = summaries["vcorr"]
-    print(f"  computed in {time.time()-t0:.1f}s", flush=True)
+    print(fmt.sub_phase("summary images", time.time() - t0), flush=True)
 
     # Raw movie mean (morphological channel for Cellpose).
     # With top-k SVD-based L, mean_S ≈ 0 because the first few components
@@ -534,7 +538,7 @@ def run_foundation(
         mean_M = (mean_M / T).astype(np.float32)
         del movie
 
-    print("Foundation: nuclear shadow (DoG) map on mean_M", flush=True)
+    print(fmt.sub_phase("DoG (nuclear shadow) map on mean_M"), flush=True)
     # DoG on mean_M (raw brightness), since mean_S is near-zero under SVD L+S.
     # The nuclear-shadow pattern is visible in the raw morphological image.
     dog_map = compute_nuclear_shadow_map(mean_M)

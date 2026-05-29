@@ -49,7 +49,7 @@ conda activate roigbiv              # always first
 pip install -e .                    # editable install (already in environment.yml)
 ```
 
-GPU: RTX 4060 8 GB. Cellpose inference is GPU; Suite2p is CPU-only.
+GPU: RTX 5080 16 GB. Cellpose inference is GPU; Suite2p is CPU-only.
 
 ## Common commands
 
