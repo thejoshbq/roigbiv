@@ -109,6 +109,14 @@ def build_app() -> dash.Dash:
     app.server.secret_key = os.environ.get(
         "ROIGBIV_SECRET_KEY", _secrets.token_hex(32)
     )
+    if not os.environ.get("ROIGBIV_SECRET_KEY"):
+        import warnings
+        warnings.warn(
+            "ROIGBIV_SECRET_KEY is not set — a random key is used. "
+            "Browser sessions will be lost on every server restart. "
+            "Set ROIGBIV_SECRET_KEY=<hex-string> for persistence.",
+            stacklevel=2,
+        )
     _start_session_cleanup()
 
     app.layout = _build_layout()

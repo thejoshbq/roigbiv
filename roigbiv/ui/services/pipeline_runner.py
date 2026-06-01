@@ -5,11 +5,14 @@ so the Dash callback that kicks it off returns immediately. Logs are buffered
 in a thread-safe deque that the page polls on a ``dcc.Interval``.
 
 Multi-user: each browser session gets its own :class:`PipelineRunner` keyed
-on the Flask session UUID, so logs and results are fully isolated. A
-process-level ``_pipeline_gate`` lock ensures only one pipeline run is active
-at a time (preventing concurrent ``configure_registry_env()`` env-var races in
-:mod:`roigbiv.pipeline.workspace`). Callers receive ``"busy"`` instead of a
-silent failure when another session is running.
+on the Flask session UUID, so logs and results are fully isolated. Each runner
+receives the session's :class:`~roigbiv.registry.config.RegistryConfig` so
+registry operations never touch ``os.environ`` and sessions can coexist safely.
+
+A process-level ``_pipeline_gate`` lock serializes pipeline runs for GPU safety:
+the RTX 5080 cannot service two concurrent pipeline jobs without CUDA OOM risk.
+Callers receive ``"busy"`` instead of a silent failure when another session is
+running.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from roigbiv.pipeline.workspace import (
     WorkspacePaths,
     run_with_workspace,
 )
+from roigbiv.registry.config import RegistryConfig
 
 _MAX_LOG_LINES = 2000
 
@@ -60,11 +64,21 @@ class PipelineRunner:
         self._n_failed: int = 0
         self._error: Optional[str] = None
         self._results: list[FOVRunResult] = []
+        self._registry_config: Optional[RegistryConfig] = None
         self._last_accessed: float = time.monotonic()
 
     # ── control ───────────────────────────────────────────────────────────
-    def start(self, workspace: WorkspacePaths, overrides: dict) -> bool | str:
+    def start(
+        self,
+        workspace: WorkspacePaths,
+        overrides: dict,
+        registry_config: Optional[RegistryConfig] = None,
+    ) -> bool | str:
         """Kick off a run.
+
+        Pass ``registry_config`` (from :attr:`AppState.registry_config`) so the
+        pipeline never reads ``os.environ`` for registry paths, enabling safe
+        concurrent sessions on different workspaces.
 
         Returns:
           True    — run started successfully.
@@ -80,6 +94,7 @@ class PipelineRunner:
                     self._gate.release()
                     return False
                 self._reset_locked()
+                self._registry_config = registry_config
                 self._active = True
                 self._started_at = time.time()
                 self._n_fovs = len(workspace.tifs)
@@ -133,7 +148,9 @@ class PipelineRunner:
         try:
             try:
                 results = run_with_workspace(
-                    workspace, overrides, log_cb=self._append_and_tally,
+                    workspace, overrides,
+                    log_cb=self._append_and_tally,
+                    registry_config=self._registry_config,
                 )
             except BaseException as exc:  # noqa: BLE001
                 tb = traceback.format_exc()

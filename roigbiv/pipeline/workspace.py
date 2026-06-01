@@ -136,6 +136,9 @@ def configure_registry_env(workspace: WorkspacePaths) -> None:
 
     Idempotent. Safe to call repeatedly. Sets only the variables this module
     owns; other ``ROIGBIV_ROICAT_*`` knobs are left to the user.
+
+    CLI use only. The Dash UI path uses :func:`_registry_config_from_workspace`
+    instead so it never mutates the process environment.
     """
     workspace.input_root.mkdir(parents=True, exist_ok=True)
     workspace.output_root.mkdir(parents=True, exist_ok=True)
@@ -144,6 +147,28 @@ def configure_registry_env(workspace: WorkspacePaths) -> None:
     os.environ["ROIGBIV_REGISTRY_DSN"] = workspace.db_dsn
     os.environ["ROIGBIV_BLOB_ROOT"] = str(workspace.blob_root)
     os.environ["ROIGBIV_CALIBRATION_PATH"] = str(workspace.calibration_path)
+
+
+def _registry_config_from_workspace(workspace: WorkspacePaths) -> "RegistryConfig":
+    """Build a RegistryConfig from workspace paths without touching os.environ.
+
+    Creates workspace directories as a side effect (same as
+    :func:`configure_registry_env`). Use this from the UI path so concurrent
+    sessions never overwrite each other's registry env vars.
+    """
+    from roigbiv.registry.config import RegistryConfig
+
+    workspace.input_root.mkdir(parents=True, exist_ok=True)
+    workspace.output_root.mkdir(parents=True, exist_ok=True)
+    workspace.blob_root.mkdir(parents=True, exist_ok=True)
+    return RegistryConfig(
+        dsn=workspace.db_dsn,
+        blob_backend="local",
+        blob_root=workspace.blob_root,
+        endpoint=None,
+        api_key=None,
+        calibration_path=workspace.calibration_path,
+    )
 
 
 @dataclass
@@ -169,6 +194,7 @@ def run_with_workspace(
     skip_backfill: bool = False,
     resume: bool = False,
     n_workers: int = 1,
+    registry_config: Optional["RegistryConfig"] = None,
 ) -> list[FOVRunResult]:
     """Run the pipeline + registry over every TIF in ``workspace``.
 
@@ -176,8 +202,12 @@ def run_with_workspace(
     pipeline calls through :func:`roigbiv.pipeline.batch.run_batch` (capped
     at 2 workers per the GPU constraint). The light post-pipeline steps
     (registry registration, traces bundle write, backfill) always run in
-    the parent process so registry env vars and SQLite writes stay
-    serialized.
+    the parent process so SQLite writes stay serialized.
+
+    When ``registry_config`` is supplied (UI path), it is used directly and
+    ``configure_registry_env`` is **not** called — the process environment is
+    never mutated, enabling safe concurrent sessions. When omitted (CLI path),
+    ``configure_registry_env`` sets the env vars as before.
 
     When ``resume=True``, each FOV's run consults its existing output
     directory and skips stages whose artifacts are already present. Refuses
@@ -188,7 +218,11 @@ def run_with_workspace(
     ``workspace.tifs``. Failed FOVs have ``error`` populated; successful ones
     have ``fov`` and ``registry``.
     """
-    configure_registry_env(workspace)
+    if registry_config is not None:
+        cfg = registry_config
+    else:
+        configure_registry_env(workspace)
+        cfg = _registry_config_from_workspace(workspace)
     log = log_cb or (lambda _msg: None)
     cfg_overrides = dict(cfg_overrides or {})
     if resume:
@@ -201,14 +235,15 @@ def run_with_workspace(
         log("Resume:    enabled (skipping completed stages per FOV)")
     log(f"Found {len(workspace.tifs)} TIF stack(s) to process.")
 
-    _ensure_registry_schema(log)
+    _ensure_registry_schema(log, cfg)
 
     parallel = n_workers > 1 and len(workspace.tifs) > 1
     if parallel:
         log(f"Parallel:  n_workers={n_workers} (capped at 2)")
         results = _run_parallel(workspace, cfg_overrides, log,
                                 skip_registry=skip_registry,
-                                n_workers=n_workers)
+                                n_workers=n_workers,
+                                registry_cfg=cfg)
     else:
         results = []
         for idx, tif in enumerate(workspace.tifs, start=1):
@@ -216,10 +251,11 @@ def run_with_workspace(
                 log(fmt.fov_separator())
             log(fmt.fov_banner(tif.name, idx, len(workspace.tifs)))
             results.append(_process_one(tif, workspace, cfg_overrides, log,
-                                        skip_registry=skip_registry))
+                                        skip_registry=skip_registry,
+                                        registry_cfg=cfg))
 
     if not skip_backfill:
-        _safety_backfill(workspace, log)
+        _safety_backfill(workspace, log, cfg)
 
     return results
 
@@ -231,6 +267,7 @@ def _run_parallel(
     *,
     skip_registry: bool,
     n_workers: int,
+    registry_cfg: "RegistryConfig",
 ) -> list[FOVRunResult]:
     """Fan pipeline calls out to ``pipeline/batch.run_batch``; do the light
     post-pipeline work (registry + traces bundle) sequentially in the parent.
@@ -316,7 +353,7 @@ def _run_parallel(
         registry: Optional[dict] = None
         if not skip_registry:
             try:
-                registry = _register_session(stem, fov, log)
+                registry = _register_session(stem, fov, log, registry_cfg)
             except Exception as exc:  # noqa: BLE001
                 log(f"  WARNING: registry call failed — "
                     f"{type(exc).__name__}: {exc}")
@@ -339,12 +376,12 @@ def _run_parallel(
 # ── internals ──────────────────────────────────────────────────────────────
 
 
-def _ensure_registry_schema(log: LogCallback) -> None:
+def _ensure_registry_schema(log: LogCallback, cfg: "RegistryConfig") -> None:
     """Open the store once so its ``ensure_schema`` runs ``alembic upgrade head``."""
     from roigbiv.registry import build_store
 
     try:
-        store = build_store()
+        store = build_store(cfg)
         store.ensure_schema()
         log("Registry schema verified (alembic head).")
     except Exception as exc:  # noqa: BLE001
@@ -358,6 +395,7 @@ def _process_one(
     log: LogCallback,
     *,
     skip_registry: bool,
+    registry_cfg: "RegistryConfig",
 ) -> FOVRunResult:
     from roigbiv.pipeline.run import run_pipeline
 
@@ -393,7 +431,7 @@ def _process_one(
     registry: Optional[dict] = None
     if not skip_registry:
         try:
-            registry = _register_session(stem, fov, log)
+            registry = _register_session(stem, fov, log, registry_cfg)
         except Exception as exc:  # noqa: BLE001
             log(f"  WARNING: registry call failed — "
                 f"{type(exc).__name__}: {exc}")
@@ -473,14 +511,15 @@ def _build_merged_masks(fov: FOVData) -> Optional[np.ndarray]:
     return label_image
 
 
-def _register_session(stem: str, fov: FOVData, log: LogCallback) -> Optional[dict]:
+def _register_session(
+    stem: str, fov: FOVData, log: LogCallback, cfg: "RegistryConfig"
+) -> Optional[dict]:
     """Mirror of ``roigbiv.pipeline.run._register_fov_after_pipeline``.
 
     Re-implemented here (rather than calling the underscore-prefixed helper)
     so the workspace runner does not depend on a private symbol of run.py.
     """
     from roigbiv.registry import (
-        RegistryConfig,
         build_adapter_config,
         build_blob_store,
         build_store,
@@ -498,7 +537,6 @@ def _register_session(stem: str, fov: FOVData, log: LogCallback) -> Optional[dic
         log("  registry: skipped (no non-rejected ROIs)")
         return None
 
-    cfg = RegistryConfig.from_env()
     store = build_store(cfg)
     blob_store = build_blob_store(cfg)
     adapter_cfg = build_adapter_config(cfg)
@@ -547,16 +585,16 @@ def _format_registry_decision(decision: str, report: dict,
     return f"  registry: {decision} ({report})"
 
 
-def _safety_backfill(workspace: WorkspacePaths, log: LogCallback) -> None:
+def _safety_backfill(
+    workspace: WorkspacePaths, log: LogCallback, cfg: "RegistryConfig"
+) -> None:
     """Idempotent sweep: register any FOV outputs not yet linked to the DB."""
     from roigbiv.registry.backfill import run_backfill
-    from roigbiv.registry.config import RegistryConfig
 
     if not workspace.output_root.exists():
         return
     log("\nBackfill sweep over output/ (idempotent safety net)")
     try:
-        cfg = RegistryConfig.from_env()
         reports = run_backfill(workspace.output_root, cfg=cfg)
     except Exception as exc:  # noqa: BLE001
         log(f"  WARNING: backfill failed — {type(exc).__name__}: {exc}")

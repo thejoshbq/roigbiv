@@ -37,6 +37,7 @@ _BASE_DIR: Path = Path(__file__).resolve().parents[3]
 _SCRIPTS_DIR: Path = _BASE_DIR / "scripts"
 _DEPLOYED_MODEL: Path = _BASE_DIR / "models" / "deployed" / "current_model"
 _CHECKPOINTS_DIR: Path = _BASE_DIR / "models" / "checkpoints" / "models"
+_deploy_lock: threading.Lock = threading.Lock()
 
 
 class CellposeNotFoundError(RuntimeError):
@@ -288,24 +289,28 @@ class CellposeTrainer:
         The existing ``current_model`` is backed up with a timestamp suffix
         before being overwritten. Returns the backup path, or ``None`` if
         there was nothing to back up.
+
+        A module-level ``_deploy_lock`` serializes concurrent calls from
+        different sessions to prevent torn copies of ``current_model``.
         """
-        src = _CHECKPOINTS_DIR / run_id
-        if not src.exists():
-            raise FileNotFoundError(
-                f"Checkpoint not found: {src}\n"
-                "Confirm training completed successfully."
-            )
+        with _deploy_lock:
+            src = _CHECKPOINTS_DIR / run_id
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"Checkpoint not found: {src}\n"
+                    "Confirm training completed successfully."
+                )
 
-        _DEPLOYED_MODEL.parent.mkdir(parents=True, exist_ok=True)
+            _DEPLOYED_MODEL.parent.mkdir(parents=True, exist_ok=True)
 
-        backup: Optional[Path] = None
-        if _DEPLOYED_MODEL.exists():
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            backup = _DEPLOYED_MODEL.parent / f"current_model_{ts}"
-            shutil.copy2(str(_DEPLOYED_MODEL), str(backup))
+            backup: Optional[Path] = None
+            if _DEPLOYED_MODEL.exists():
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                backup = _DEPLOYED_MODEL.parent / f"current_model_{ts}"
+                shutil.copy2(str(_DEPLOYED_MODEL), str(backup))
 
-        shutil.copy2(str(src), str(_DEPLOYED_MODEL))
-        return backup
+            shutil.copy2(str(src), str(_DEPLOYED_MODEL))
+            return backup
 
     # ── Query / reset ─────────────────────────────────────────────────────────
 

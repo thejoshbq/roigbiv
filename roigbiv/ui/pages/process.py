@@ -153,7 +153,8 @@ def register_callbacks(app: dash.Dash) -> None:
             "cellpose_model": model or "models/deployed/current_model",
         }
         runner = get_pipeline_runner()
-        result = runner.start(state.workspace, overrides)
+        result = runner.start(state.workspace, overrides,
+                              registry_config=state.registry_config)
         if result == "busy":
             return False, dbc.Alert(
                 "Pipeline is running for another session — try again shortly.",
