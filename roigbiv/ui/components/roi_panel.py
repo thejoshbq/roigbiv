@@ -71,7 +71,7 @@ def _render_hero(r: ROIRender) -> html.Div:
                  className="small"),
     ]
     return html.Div([
-        html.H5(f"ROI #{r.label_id}", className="mb-1"),
+        html.H5(f"ROI #{r.label_id}", className="roigbiv-roi-title text-uppercase mb-1"),
         html.Div(badges, className="mb-2"),
         html.Div(hero_rows),
     ])

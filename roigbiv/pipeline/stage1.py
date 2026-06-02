@@ -26,6 +26,8 @@ from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import PipelineConfig
 
 
+_BASE_DIR: Path = Path(__file__).resolve().parents[2]
+
 # Cellpose 3.x built-in model names. Spec strings matching one of these are
 # passed through to CellposeModel(model_type=...) without filesystem lookup.
 _CELLPOSE_BUILTINS = frozenset({
@@ -58,7 +60,7 @@ def _resolve_model_path(model_spec: str) -> str:
         candidates.append(p)
     else:
         candidates.append(Path.cwd() / p)
-        candidates.append(Path(__file__).resolve().parents[2] / p)
+        candidates.append(_BASE_DIR / p)
 
     for cand in candidates:
         resolved = cand.resolve()
@@ -72,6 +74,37 @@ def _resolve_model_path(model_spec: str) -> str:
         f"the roigbiv package root, or a Cellpose built-in name "
         f"(one of: {sorted(_CELLPOSE_BUILTINS)})."
     )
+
+
+def list_available_models() -> list[dict]:
+    """Return dbc.Select-compatible options for all available Cellpose models.
+
+    Order: deployed model first, then checkpoints (newest first), then builtins.
+    Values are strings accepted by _resolve_model_path().
+    """
+    options: list[dict] = []
+
+    deployed = _BASE_DIR / "models" / "deployed" / "current_model"
+    if deployed.exists():
+        options.append({
+            "label": "current_model (deployed)",
+            "value": "models/deployed/current_model",
+        })
+
+    checkpoints_dir = _BASE_DIR / "models" / "checkpoints" / "models"
+    if checkpoints_dir.is_dir():
+        checkpoint_files = sorted(
+            (f for f in checkpoints_dir.iterdir() if f.is_file()),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        for cf in checkpoint_files:
+            options.append({"label": cf.name, "value": str(cf.relative_to(_BASE_DIR))})
+
+    for name in sorted(_CELLPOSE_BUILTINS):
+        options.append({"label": name, "value": name})
+
+    return options
 
 
 def denoise_mean_S(mean_S: np.ndarray, gpu: bool = True) -> np.ndarray:

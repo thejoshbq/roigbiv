@@ -87,6 +87,8 @@ def user_error_figure(exc: BaseException, context: str,
         "layout": {
             "height": 420,
             "template": plotly_template(theme),
+            "paper_bgcolor": "#000000",
+            "plot_bgcolor": "#000000",
             "xaxis": {"visible": False},
             "yaxis": {"visible": False},
             "annotations": [
@@ -95,7 +97,7 @@ def user_error_figure(exc: BaseException, context: str,
                     "showarrow": False,
                     "xref": "paper", "yref": "paper",
                     "x": 0.5, "y": 0.58,
-                    "font": {"size": 14, "color": "#e74c3c"},
+                    "font": {"size": 14, "color": "#FF6B7A"},
                 },
                 {
                     "text": message,

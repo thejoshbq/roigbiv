@@ -8,8 +8,19 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import socket as _socket
 import sys
 from pathlib import Path
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return False
+        except OSError:
+            return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Enable Dash debug mode (hot-reload, dev tools).")
     args = parser.parse_args(argv)
 
+    workspace = None
     if args.workspace is not None:
         try:
             from roigbiv.pipeline.workspace import (
@@ -59,7 +71,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  ({exc})", file=sys.stderr)
         return 2
 
-    app = build_app()
+    if _port_in_use(args.host, args.port):
+        print(
+            f"ERROR: port {args.port} is already in use. "
+            f"Kill the existing process or use --port <N>.",
+            file=sys.stderr,
+        )
+        return 1
+
+    app = build_app(preset_workspace=workspace)
     print(f"ROIGBIV UI → http://{args.host}:{args.port}", flush=True)
     app.run(host=args.host, port=args.port, debug=args.debug)
     return 0

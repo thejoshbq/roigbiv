@@ -21,6 +21,7 @@ import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.io import validate_tif
+from roigbiv.pipeline.stage1 import list_available_models
 from roigbiv.pipeline.workspace import WorkspacePaths, resolve_workspace
 from roigbiv.ui.components.log_stream import log_stream
 from roigbiv.ui.services.app_state import get_app_state
@@ -51,21 +52,27 @@ def _left_column(workspace: Optional[WorkspacePaths]) -> html.Div:
                 placeholder="Path to a .tif file or a directory of stacks",
                 value=str(workspace.input_root) if workspace else "",
                 type="text",
+                readonly=workspace is not None,
             ),
             dbc.Button("Scan", id="roigbiv-scan-btn", color="primary",
-                       n_clicks=0),
+                       n_clicks=0, disabled=workspace is not None),
         ], className="mb-3"),
-        html.Div(id="roigbiv-scan-result"),
-        html.H5("Pipeline parameters", className="mt-4 mb-2"),
+        html.Div(
+            id="roigbiv-scan-result",
+            children=_workspace_summary(workspace) if workspace else None,
+        ),
+        html.Hr(className="roigbiv-h-line"),
+        html.H5("Pipeline parameters", className="mb-2"),
         _params_form(),
         dbc.Button("Run pipeline", id="roigbiv-run-btn",
-                   color="success", className="mt-3 w-100", n_clicks=0,
+                   color="primary", className="mt-3 w-100", n_clicks=0,
                    disabled=workspace is None),
     ])
 
 
 def _params_form() -> dbc.Card:
     row = lambda *children: dbc.Row(children, className="mb-2")    # noqa: E731
+    _model_opts = list_available_models()
     return dbc.Card(dbc.CardBody([
         row(
             dbc.Col(dbc.Label("fs (Hz)", html_for="roigbiv-param-fs"), md=6),
@@ -84,10 +91,16 @@ def _params_form() -> dbc.Card:
                               type="number", value=30, step=1), md=6),
         ),
         row(
-            dbc.Col(dbc.Label("Cellpose model",
-                              html_for="roigbiv-param-model"), md=6),
-            dbc.Col(dbc.Input(id="roigbiv-param-model", type="text",
-                              value="models/deployed/current_model"), md=6),
+            dbc.Col(dbc.Label("Model", html_for="roigbiv-param-model"), md=6),
+            dbc.Col(
+                dbc.Select(
+                    id="roigbiv-param-model",
+                    options=_model_opts,
+                    value=(_model_opts[0]["value"]
+                           if _model_opts else "models/deployed/current_model"),
+                ),
+                md=6,
+            ),
         ),
     ]))
 
@@ -112,7 +125,7 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-scan-result", "children"),
         Output("roigbiv-run-btn", "disabled"),
-        Output("roigbiv-active-registry", "children"),
+        Output("roigbiv-active-registry", "children", allow_duplicate=True),
         Input("roigbiv-scan-btn", "n_clicks"),
         State("roigbiv-input-path", "value"),
         prevent_initial_call=True,
@@ -131,6 +144,17 @@ def register_callbacks(app: dash.Dash) -> None:
             False,
             f"registry: {workspace.db_path}",
         )
+
+    @app.callback(
+        Output("roigbiv-active-registry", "children", allow_duplicate=True),
+        Input("roigbiv-url", "pathname"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _sync_registry_label(_pathname: str):
+        state = get_app_state()
+        if state.workspace is not None:
+            return f"registry: {state.workspace.db_path}"
+        return no_update
 
     @app.callback(
         Output("roigbiv-process-tick", "disabled"),

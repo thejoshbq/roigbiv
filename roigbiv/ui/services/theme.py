@@ -3,8 +3,12 @@
 The runtime toggle in :mod:`roigbiv.ui.app` flips ``data-bs-theme`` on
 the document root and writes the chosen theme name to a ``dcc.Store``.
 Pages thread that store value into figure callbacks; figure builders call
-:func:`plotly_template` to convert it to the Plotly template name that
-``dash-bootstrap-templates.load_figure_template`` registers.
+:func:`plotly_template` to convert it to the registered Plotly template name.
+
+FOV invariant: the mean-projection heatmap canvas is ALWAYS pure black
+(``#000000``) regardless of UI theme.  ``heatmap_colorscale`` / ``heatmap_reverse``
+/ ``figure_paper_bg`` are unconditional; they accept ``theme`` for API
+compatibility but ignore it.
 """
 from __future__ import annotations
 
@@ -13,27 +17,54 @@ from typing import Optional
 LIGHT = "light"
 DARK = "dark"
 
-LIGHT_TEMPLATE = "flatly"
-DARK_TEMPLATE = "darkly"
+_TEMPLATE = "roigbiv-reacher"
 
 
-def _register_templates() -> None:
-    """Idempotently register the bootstrap-matched Plotly templates.
-
-    Called at import time so figure builders are usable from tests and
-    scripts without booting a Dash app first.
-    """
+def _register_roigbiv_template() -> None:
+    """Register the custom REACHER Plotly template, idempotent."""
     try:
+        import plotly.graph_objects as go
         import plotly.io as pio
-        from dash_bootstrap_templates import load_figure_template
     except ImportError:
         return
-    if LIGHT_TEMPLATE in pio.templates and DARK_TEMPLATE in pio.templates:
+    if _TEMPLATE in pio.templates:
         return
-    load_figure_template([LIGHT_TEMPLATE, DARK_TEMPLATE])
+    tmpl = go.layout.Template()
+    tmpl.layout = go.Layout(
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        font=dict(family="Rajdhani, system-ui, sans-serif", color="#C8E8E8", size=12),
+        colorway=["#00E5FF", "#3498db", "#e67e22", "#9b59b6", "#f1c40f", "#2ecc71", "#e74c3c"],
+        xaxis=dict(
+            gridcolor="#0D2626",
+            zerolinecolor="#0D2626",
+            linecolor="#4A7070",
+            tickcolor="#4A7070",
+            tickfont=dict(color="#4A7070"),
+        ),
+        yaxis=dict(
+            gridcolor="#0D2626",
+            zerolinecolor="#0D2626",
+            linecolor="#4A7070",
+            tickcolor="#4A7070",
+            tickfont=dict(color="#4A7070"),
+        ),
+        hoverlabel=dict(
+            bgcolor="#0A1818",
+            bordercolor="#00E5FF",
+            font=dict(color="#C8E8E8", family="JetBrains Mono, monospace"),
+        ),
+        legend=dict(
+            bgcolor="rgba(10,24,24,0.85)",
+            bordercolor="#0D2626",
+            font=dict(color="#C8E8E8"),
+        ),
+        title=dict(font=dict(color="#00E5FF")),
+    )
+    pio.templates[_TEMPLATE] = tmpl
 
 
-_register_templates()
+_register_roigbiv_template()
 
 
 def normalize(theme: Optional[str]) -> str:
@@ -41,43 +72,35 @@ def normalize(theme: Optional[str]) -> str:
     return LIGHT if theme == LIGHT else DARK
 
 
-def plotly_template(theme: Optional[str]) -> str:
-    """Plotly template name for the given theme — safe for ``None``."""
-    return DARK_TEMPLATE if normalize(theme) == DARK else LIGHT_TEMPLATE
+def plotly_template(theme: Optional[str] = None) -> str:
+    """REACHER Plotly template name — theme arg kept for API compatibility."""
+    return _TEMPLATE
 
 
 def is_dark(theme: Optional[str]) -> bool:
     return normalize(theme) == DARK
 
 
-def axis_muted_color(theme: Optional[str]) -> str:
-    """Color for axis-margin annotations (muted, theme-aware)."""
-    return "#aaa" if is_dark(theme) else "#888"
+def axis_muted_color(theme: Optional[str] = None) -> str:
+    """Muted color for axis-margin annotations."""
+    return "#4A7070"
 
 
-def warning_color(theme: Optional[str]) -> str:
-    """Color for in-figure warning annotations (e.g. ``mixed fs``)."""
-    return "#e6b56c" if is_dark(theme) else "#c77"
+def warning_color(theme: Optional[str] = None) -> str:
+    """Warm amber — readable on pure-black background."""
+    return "#FFB454"
 
 
-def figure_paper_bg(theme: Optional[str]) -> str:
-    """Background color for figures that are layered on a card body.
-
-    Returned as a plain hex/rgb string rather than ``"transparent"`` so PNG
-    export still has a predictable background.
-    """
-    return "#222" if is_dark(theme) else "#ffffff"
+def figure_paper_bg(theme: Optional[str] = None) -> str:
+    """Always pure black — FOV canvas must never show a light background."""
+    return "#000000"
 
 
-def heatmap_colorscale(theme: Optional[str]) -> str:
-    """Colorscale for the mean-projection heatmap (per theme).
-
-    Light backgrounds want reverse-Greys (dark = high signal); dark
-    backgrounds want straight Greys (light = high signal).
-    """
-    return "Greys" if is_dark(theme) else "Greys"
+def heatmap_colorscale(theme: Optional[str] = None) -> str:
+    """Greys colorscale: 0 → black (inactive), 1 → white (active)."""
+    return "Greys"
 
 
-def heatmap_reverse(theme: Optional[str]) -> bool:
-    """Whether to reverse the heatmap colorscale for the given theme."""
-    return not is_dark(theme)
+def heatmap_reverse(theme: Optional[str] = None) -> bool:
+    """Always True — Greys runs white→black, so reverse to get black→white (0=dark, 1=bright)."""
+    return True

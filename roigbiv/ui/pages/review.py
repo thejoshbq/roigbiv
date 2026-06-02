@@ -12,7 +12,7 @@ output dir the Open / Reingest helpers target.
 """
 from __future__ import annotations
 
-from datetime import datetime
+import base64
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -41,15 +41,7 @@ from roigbiv.ui.components.trace_figure import (
 )
 from roigbiv.ui.logging import get_logger
 from roigbiv.ui.services.app_state import get_app_state
-from roigbiv.ui.services.cellpose_trainer import (
-    CellposeNotFoundError,
-    get_trainer,
-)
-from roigbiv.ui.services.external_editor import (
-    EditorNotFoundError,
-    launch_editor,
-    resolve_mask_target,
-)
+from roigbiv.ui.services.cellpose_trainer import get_trainer
 from roigbiv.ui.services.loaders import (
     CrossSessionBundle,
     FOVBundle,
@@ -94,9 +86,7 @@ def layout() -> html.Div:
         dcc.Store(id="roigbiv-review-state", storage_type="memory"),
         dcc.Store(id="roigbiv-review-selected-roi", storage_type="memory"),
         dcc.Store(id="roigbiv-review-output-dir", storage_type="memory"),
-        # Fine-tuning poll interval (disabled until ingest or training is active).
-        dcc.Interval(id="roigbiv-finetune-poll", interval=2_000,
-                     disabled=True, n_intervals=0),
+        dcc.Interval(id="roigbiv-trainer-tick", interval=2000, disabled=True),
         html.Div([
             sidebar_toggle(toggle_id=SIDEBAR_TOGGLE_ID,
                            store_id=SIDEBAR_STORE_ID),
@@ -207,164 +197,64 @@ def _roi_trace_card() -> dbc.Card:
 
 
 def _external_edit_card() -> dbc.Card:
-    """Fiji/ImageJ handoff for the active session.
+    """Browser-based ROI editor for the active session.
 
-    Drawing tools live in third-party software; this card launches the
-    user's TIFF editor on the active mask and surfaces the reingest-CLI
-    hint so they can round-trip edits through ``roigbiv-reingest``.
+    Opens the web editor in a new tab via the Flask route
+    ``/roi-editor/<stem>?dir=<b64>``.  Corrections are saved directly to
+    ``corrections/corrections.jsonl`` on the server; refresh the Review
+    page after saving to pick up the changes.
     """
     return dbc.Card(dbc.CardBody([
-        html.H6("Edit ROIs in Fiji / ImageJ", className="mb-2"),
+        html.H6("Edit ROIs in browser", className="mb-2"),
         html.P(
-            "Open the active session's mask in your TIFF editor "
-            "(Fiji / ImageJ preferred; GIMP supported), edit, save, "
-            "and run roigbiv-reingest to fold the changes into the "
-            "corrections log.",
+            "Draw, edit, or delete ROIs directly in the browser. "
+            "Changes are saved to the corrections log on the server. "
+            "Refresh this page after saving to reload the updated ROIs.",
             className="text-muted small",
         ),
-        dbc.Button(
+        html.A(
             [html.I(className="bi bi-pencil-square me-2"),
-             "Open mask in Fiji / ImageJ"],
-            id="roigbiv-review-open-folder",
-            color="primary", outline=True, size="sm",
-            className="mb-2",
-            n_clicks=0,
+             "Open ROI editor"],
+            id="roigbiv-review-open-web-editor",
+            href="#",
+            target="_blank",
+            className="btn btn-outline-primary btn-sm mb-1 w-100",
         ),
         html.Div(
             id="roigbiv-review-output-path",
-            className="text-muted small font-monospace",
-        ),
-        html.Div(
-            id="roigbiv-review-open-folder-feedback",
-            className="mt-2",
-        ),
-        html.Hr(className="my-2"),
-        html.Small("Then on the terminal:", className="text-muted d-block"),
-        html.Code(
-            "roigbiv-reingest --output-dir <path> "
-            "--new-mask edited.tif",
-            className="d-block small",
-            style={"whiteSpace": "pre-wrap", "wordBreak": "break-word"},
+            className="text-muted small font-monospace mt-1",
         ),
     ]), className="mb-3")
 
 
 def _finetune_card() -> dbc.Card:
-    """Four-step Cellpose fine-tuning workflow surfaced from the Review page.
-
-    Steps: GUI launch → ingest *_seg.npy corrections → train → deploy.
-    Paths are auto-filled from the active session's hitl_staging/ directory
-    and can be overridden by the user.
-    """
-    default_run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     return dbc.Card(dbc.CardBody([
-        html.H6("Cellpose fine-tuning", className="mb-2"),
-
-        # ── Step 1: GUI launch ──────────────────────────────────────────────
-        html.H6("1 · Cellpose GUI", className="mt-2 mb-1 small fw-semibold"),
-        html.P(
-            "Opens the active session's staging images in Cellpose GUI with "
-            "the deployed model pre-loaded. Correct masks, then save "
-            "(creates *_seg.npy).",
-            className="text-muted small",
-        ),
-        dbc.Button(
-            [html.I(className="bi bi-window me-2"), "Open in Cellpose GUI"],
-            id="roigbiv-finetune-launch-gui",
-            color="primary", outline=True, size="sm",
-            className="mb-1 w-100",
-            n_clicks=0,
-        ),
-        html.Div(id="roigbiv-finetune-gui-feedback", className="mt-1"),
-
-        html.Hr(className="my-2"),
-
-        # ── Step 2: Ingest ──────────────────────────────────────────────────
-        html.H6("2 · Ingest corrections", className="mt-2 mb-1 small fw-semibold"),
-        html.P(
-            "Convert *_seg.npy files saved by Cellpose GUI into *_masks.tif "
-            "for retraining.",
-            className="text-muted small",
-        ),
-        html.Label("Annotations dir", className="small text-muted"),
-        dbc.Input(
-            id="roigbiv-finetune-annotated-dir", type="text",
-            placeholder="auto-filled from active session",
-            size="sm", className="mb-2 font-monospace",
-        ),
-        html.Label("Masks out dir", className="small text-muted"),
-        dbc.Input(
-            id="roigbiv-finetune-masks-dir", type="text",
-            placeholder="auto-filled from active session",
-            size="sm", className="mb-2 font-monospace",
-        ),
-        dbc.Button(
-            [html.I(className="bi bi-arrow-down-circle me-2"),
-             "Ingest corrections"],
-            id="roigbiv-finetune-ingest",
-            color="secondary", outline=True, size="sm",
-            className="mb-1 w-100",
-            n_clicks=0,
-        ),
-        html.Div(id="roigbiv-finetune-ingest-feedback", className="mt-1"),
-
-        html.Hr(className="my-2"),
-
-        # ── Step 3: Training ────────────────────────────────────────────────
-        html.H6("3 · Train model", className="mt-2 mb-1 small fw-semibold"),
-        html.Label("Run ID", className="small text-muted"),
-        dbc.Input(
-            id="roigbiv-finetune-run-id", type="text",
-            value=default_run_id,
-            size="sm", className="mb-2",
-        ),
+        html.H6("Fine-tune model", className="mb-2"),
         dbc.Row([
-            dbc.Col([
-                html.Label("Epochs", className="small text-muted"),
-                dbc.Input(
-                    id="roigbiv-finetune-epochs", type="number",
-                    value=200, min=10, max=1000, step=10,
-                    size="sm",
-                ),
-            ], width=6),
-            dbc.Col([
-                html.Label("LR", className="small text-muted"),
-                dbc.Input(
-                    id="roigbiv-finetune-lr", type="number",
-                    value=0.05, min=0.001, max=0.5, step=0.001,
-                    size="sm",
-                ),
-            ], width=6),
-        ], className="mb-2"),
-        dbc.Button(
-            [html.I(className="bi bi-play-circle me-2"), "Start training"],
-            id="roigbiv-finetune-start",
-            color="success", outline=True, size="sm",
-            className="mb-2 w-100",
-            n_clicks=0,
+            dbc.Col(dbc.Label("Epochs", className="small"), width=5),
+            dbc.Col(dbc.Input(id="roigbiv-trainer-epochs", type="number",
+                              value=200, min=1, step=10, size="sm"), width=7),
+        ], className="mb-1 g-1"),
+        dbc.Row([
+            dbc.Col(dbc.Label("LR", className="small"), width=5),
+            dbc.Col(dbc.Input(id="roigbiv-trainer-lr", type="number",
+                              value=0.05, step=0.005, size="sm"), width=7),
+        ], className="mb-2 g-1"),
+        dbc.Button("Start training", id="roigbiv-trainer-train-btn",
+                   size="sm", color="warning", className="w-100 mb-2", n_clicks=0),
+        dbc.Alert(
+            "Deploy overwrites models/deployed/current_model (Git-LFS tracked). "
+            "Previous model is backed up with a timestamp suffix.",
+            color="warning", className="small py-1 px-2 mb-1",
         ),
-        html.Div(id="roigbiv-finetune-status", className="mb-2"),
-        html.Div(id="roigbiv-finetune-log"),
-
-        html.Hr(className="my-2"),
-
-        # ── Step 4: Deploy ──────────────────────────────────────────────────
-        html.H6("4 · Deploy model", className="mt-2 mb-1 small fw-semibold"),
-        html.P(
-            "Copy the trained checkpoint to models/deployed/current_model. "
-            "The existing model is auto-backed up.",
-            className="text-muted small",
-        ),
-        dbc.Button(
-            [html.I(className="bi bi-check-circle me-2"),
-             "Deploy to current_model"],
-            id="roigbiv-finetune-deploy",
-            color="warning", outline=True, size="sm",
-            className="mb-1 w-100",
-            disabled=True,
-            n_clicks=0,
-        ),
-        html.Div(id="roigbiv-finetune-deploy-feedback", className="mt-1"),
+        dbc.Button("Deploy model", id="roigbiv-trainer-deploy-btn",
+                   size="sm", color="danger", className="w-100 mb-2", n_clicks=0),
+        dbc.Button("Reset", id="roigbiv-trainer-reset-btn",
+                   size="sm", outline=True, color="secondary",
+                   className="w-100 mb-3", n_clicks=0),
+        html.Div(id="roigbiv-trainer-status"),
+        html.Div(id="roigbiv-trainer-log",
+                 children=log_stream([]), className="mt-2"),
     ]), className="mb-3")
 
 
@@ -694,239 +584,111 @@ def register_callbacks(app: dash.Dash) -> None:
                                          theme=theme)
 
     @app.callback(
+        Output("roigbiv-review-open-web-editor", "href"),
         Output("roigbiv-review-output-path", "children"),
         Input("roigbiv-review-output-dir", "data"),
     )
-    def _show_output_path(output_dir):
+    def _update_editor_link(output_dir):
         if not output_dir:
-            return "(select an active session to populate)"
-        return output_dir
+            return "#", "(select an active session to populate)"
+        stem = Path(output_dir).name
+        dir_b64 = base64.urlsafe_b64encode(output_dir.encode()).decode()
+        href = f"/roi-editor/{stem}?dir={dir_b64}"
+        return href, output_dir
 
-    # Launch the user's external TIFF editor (Fiji / ImageJ / GIMP) on the
-    # active session's mask. Server-side because the editor is spawned on
-    # whichever machine runs ``roigbiv-ui`` — for ``--host 0.0.0.0`` use,
-    # the editor still opens on the server, not the lab member's browser
-    # machine. See docs/external-editing.md for the round-trip workflow.
+    # ── Fine-tune callbacks ─────────────────────────────────────────────────
+
     @app.callback(
-        Output("roigbiv-review-open-folder-feedback", "children"),
-        Input("roigbiv-review-open-folder", "n_clicks"),
+        Output("roigbiv-trainer-tick", "disabled"),
+        Output("roigbiv-trainer-status", "children"),
+        Input("roigbiv-trainer-train-btn", "n_clicks"),
         State("roigbiv-review-output-dir", "data"),
+        State("roigbiv-trainer-epochs", "value"),
+        State("roigbiv-trainer-lr", "value"),
         prevent_initial_call=True,
     )
-    def _launch_external_editor(n_clicks, output_dir):
-        if not (n_clicks and output_dir):
-            return no_update
-        try:
-            target = resolve_mask_target(Path(output_dir))
-            editor = launch_editor(target)
-        except EditorNotFoundError as exc:
-            return user_error(exc, "No TIFF editor found",
-                              include_traceback=False)
-        except FileNotFoundError as exc:
-            return user_error(exc, "No mask file to edit",
-                              include_traceback=False)
-        except Exception as exc:  # noqa: BLE001
-            return user_error(exc, "Launching external editor failed")
-        return dbc.Alert(
-            f"Opened {target.name} in {editor.name}.",
-            color="success", className="mb-0 small",
-        )
-
-    # ── Fine-tuning callbacks ─────────────────────────────────────────────────
-
-    @app.callback(
-        Output("roigbiv-finetune-annotated-dir", "value"),
-        Output("roigbiv-finetune-masks-dir", "value"),
-        Input("roigbiv-review-output-dir", "data"),
-    )
-    def _fill_finetune_paths(output_dir):
+    def _on_train(_n, output_dir, epochs, lr):
+        import time as _time
         if not output_dir:
-            return "", ""
-        base = Path(output_dir)
-        return (
-            str(base / "hitl_staging" / "images"),
-            str(base / "hitl_staging" / "masks"),
+            return True, dbc.Alert("Select an active session first.",
+                                   color="warning", className="small py-1")
+        run_id = f"hitl_{_time.strftime('%Y%m%d_%H%M%S')}"
+        data_dir = Path(output_dir) / "hitl_staging" / "images"
+        masks_dir = Path(output_dir) / "hitl_staging" / "masks"
+        ok = get_trainer().start_training(
+            run_id, data_dir, masks_dir,
+            epochs=int(epochs or 200),
+            lr=float(lr or 0.05),
         )
+        if not ok:
+            return False, dbc.Alert("Trainer is busy.", color="warning",
+                                    className="small py-1")
+        return False, dbc.Alert(f"Training started: {run_id}", color="info",
+                                className="small py-1")
 
     @app.callback(
-        Output("roigbiv-finetune-gui-feedback", "children"),
-        Input("roigbiv-finetune-launch-gui", "n_clicks"),
-        State("roigbiv-review-output-dir", "data"),
+        Output("roigbiv-trainer-status", "children", allow_duplicate=True),
+        Input("roigbiv-trainer-deploy-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _launch_cellpose_gui(n_clicks, output_dir):
-        if not n_clicks:
-            return no_update
-        if not output_dir:
+    def _on_deploy(_n):
+        trainer = get_trainer()
+        snap = trainer.snapshot()
+        if snap.state != "done":
             return dbc.Alert(
-                "Select an active session first.",
-                color="warning", className="mb-0 small",
+                f"Cannot deploy: trainer state is '{snap.state}' (must be 'done').",
+                color="warning", className="small py-1",
             )
+        if not snap.run_id:
+            return dbc.Alert("No run_id recorded — restart training.",
+                             color="danger", className="small py-1")
         try:
-            staging_path = get_trainer().launch_gui(Path(output_dir))
-        except CellposeNotFoundError as exc:
-            return user_error(exc, "Cellpose not found", include_traceback=False)
+            backup = trainer.deploy(snap.run_id)
+            msg = f"Deployed {snap.run_id}."
+            if backup:
+                msg += f" Previous model backed up as {backup.name}."
+            return dbc.Alert(msg, color="success", className="small py-1")
         except FileNotFoundError as exc:
-            return user_error(exc, "Staging materials missing",
-                              include_traceback=False)
-        except Exception as exc:  # noqa: BLE001
-            return user_error(exc, "Launching Cellpose GUI failed")
-        return dbc.Alert(
-            [
-                html.Div("Cellpose GUI launched — staging images and masks pre-loaded.",
-                         className="fw-semibold"),
-                html.Small(
-                    f"Staging dir: {staging_path}",
-                    className="font-monospace",
-                ),
-            ],
-            color="success", className="mb-0 small",
-        )
+            return dbc.Alert(str(exc), color="danger", className="small py-1")
 
     @app.callback(
-        Output("roigbiv-finetune-poll", "disabled", allow_duplicate=True),
-        Output("roigbiv-finetune-ingest-feedback", "children"),
-        Input("roigbiv-finetune-ingest", "n_clicks"),
-        State("roigbiv-finetune-annotated-dir", "value"),
-        State("roigbiv-finetune-masks-dir", "value"),
+        Output("roigbiv-trainer-tick", "disabled", allow_duplicate=True),
+        Output("roigbiv-trainer-status", "children", allow_duplicate=True),
+        Output("roigbiv-trainer-log", "children", allow_duplicate=True),
+        Input("roigbiv-trainer-reset-btn", "n_clicks"),
         prevent_initial_call=True,
     )
-    def _start_ingest(n_clicks, annotated_dir, masks_dir):
-        if not n_clicks:
-            return no_update, no_update
-        if not annotated_dir or not masks_dir:
-            return no_update, dbc.Alert(
-                "Set annotation and masks directories first.",
-                color="warning", className="mb-0 small",
-            )
-        try:
-            ok = get_trainer().start_ingest(
-                Path(annotated_dir), Path(masks_dir),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return no_update, user_error(exc, "Starting ingest failed")
-        if not ok:
-            return no_update, dbc.Alert(
-                "A job is already running. Wait for it to finish.",
-                color="warning", className="mb-0 small",
-            )
-        return False, dbc.Alert(
-            "Ingesting corrections…", color="info", className="mb-0 small",
-        )
+    def _on_trainer_reset(_n):
+        get_trainer().reset()
+        return True, None, log_stream([])
 
     @app.callback(
-        Output("roigbiv-finetune-poll", "disabled", allow_duplicate=True),
-        Output("roigbiv-finetune-status", "children"),
-        Input("roigbiv-finetune-start", "n_clicks"),
-        State("roigbiv-finetune-run-id", "value"),
-        State("roigbiv-finetune-epochs", "value"),
-        State("roigbiv-finetune-lr", "value"),
-        State("roigbiv-finetune-annotated-dir", "value"),
-        State("roigbiv-finetune-masks-dir", "value"),
-        prevent_initial_call=True,
+        Output("roigbiv-trainer-log", "children"),
+        Output("roigbiv-trainer-status", "children", allow_duplicate=True),
+        Output("roigbiv-trainer-tick", "disabled", allow_duplicate=True),
+        Input("roigbiv-trainer-tick", "n_intervals"),
+        prevent_initial_call="initial_duplicate",
     )
-    def _start_training(n_clicks, run_id, epochs, lr, data_dir, masks_dir):
-        if not n_clicks:
-            return no_update, no_update
-        missing = [f for f, v in [("run_id", run_id), ("data_dir", data_dir),
-                                   ("masks_dir", masks_dir)] if not v]
-        if missing:
-            return no_update, dbc.Alert(
-                f"Missing required fields: {', '.join(missing)}",
-                color="warning", className="mb-0 small",
-            )
-        try:
-            ok = get_trainer().start_training(
-                run_id=str(run_id),
-                data_dir=Path(data_dir),
-                masks_dir=Path(masks_dir),
-                epochs=int(epochs or 200),
-                lr=float(lr or 0.05),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return no_update, user_error(exc, "Starting training failed")
-        if not ok:
-            return no_update, dbc.Alert(
-                "A job is already running. Wait for it to finish.",
-                color="warning", className="mb-0 small",
-            )
-        return False, _trainer_status_badge("training")
-
-    @app.callback(
-        Output("roigbiv-finetune-poll", "disabled", allow_duplicate=True),
-        Output("roigbiv-finetune-status", "children", allow_duplicate=True),
-        Output("roigbiv-finetune-log", "children"),
-        Output("roigbiv-finetune-deploy", "disabled"),
-        Output("roigbiv-finetune-ingest-feedback", "children", allow_duplicate=True),
-        Input("roigbiv-finetune-poll", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _poll_trainer(n_intervals):
+    def _trainer_tick(_n):
         snap = get_trainer().snapshot()
-        poll_disabled = snap.state in ("idle", "done", "error")
-        deploy_disabled = snap.state != "done"
-        log_div = log_stream(snap.logs, empty_hint="Waiting for activity…")
-        if snap.ingest_summary:
-            if snap.state == "error" or snap.ingest_summary.startswith("Ingest failed"):
-                fb_color = "danger"
-            elif "— 0 mask(s)" in snap.ingest_summary:
-                fb_color = "warning"
-            else:
-                fb_color = "success"
-            ingest_fb = dbc.Alert(snap.ingest_summary, color=fb_color, className="mb-0 small")
-        else:
-            ingest_fb = no_update
-        return (
-            poll_disabled,
-            _trainer_status_badge(snap.state, snap.error),
-            log_div,
-            deploy_disabled,
-            ingest_fb,
+        _COLORS = {
+            "idle": "secondary", "ingesting": "info",
+            "training": "warning", "done": "success", "error": "danger",
+        }
+        badge = dbc.Badge(
+            snap.state.upper(),
+            color=_COLORS.get(snap.state, "secondary"),
+            className="me-1",
         )
-
-    @app.callback(
-        Output("roigbiv-finetune-deploy-feedback", "children"),
-        Input("roigbiv-finetune-deploy", "n_clicks"),
-        State("roigbiv-finetune-run-id", "value"),
-        prevent_initial_call=True,
-    )
-    def _deploy_model(n_clicks, run_id):
-        if not (n_clicks and run_id):
-            return no_update
-        try:
-            backup = get_trainer().deploy(str(run_id))
-        except FileNotFoundError as exc:
-            return user_error(exc, "Checkpoint not found", include_traceback=False)
-        except Exception as exc:  # noqa: BLE001
-            return user_error(exc, "Deploying model failed")
-        msg = f"Deployed {run_id} → current_model."
-        if backup:
-            msg += f" Previous model backed up to {backup.name}."
-        return dbc.Alert(msg, color="success", className="mb-0 small")
-
+        extra = snap.ingest_summary or (f"ERROR: {snap.error}" if snap.error else "")
+        status = html.Div([badge, html.Small(extra, className="text-muted")])
+        return (
+            log_stream(snap.logs),
+            status,
+            snap.state not in ("ingesting", "training"),
+        )
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-
-_TRAINER_BADGE_COLOR = {
-    "idle": "secondary",
-    "ingesting": "info",
-    "training": "primary",
-    "done": "success",
-    "error": "danger",
-}
-
-
-def _trainer_status_badge(state: str, error: Optional[str] = None) -> html.Div:
-    color = _TRAINER_BADGE_COLOR.get(state, "secondary")
-    label = state.capitalize()
-    children: list = [dbc.Badge(label, color=color, className="me-2")]
-    if state == "training":
-        children.insert(0, dbc.Spinner(size="sm", color="primary",
-                                       spinner_class_name="me-1"))
-    if error and state == "error":
-        children.append(html.Small(error, className="text-danger"))
-    return html.Div(children, className="d-flex align-items-center small")
 
 
 _click_counter_state: dict[str, int] = {"n": 0}
@@ -1031,6 +793,8 @@ def _placeholder_fig(message: str, theme: Optional[str] = None) -> dict:
         "layout": {
             "autosize": True,
             "template": plotly_template(theme),
+            "paper_bgcolor": "#000000",
+            "plot_bgcolor": "#000000",
             "xaxis": {"visible": False},
             "yaxis": {"visible": False},
             "annotations": [{

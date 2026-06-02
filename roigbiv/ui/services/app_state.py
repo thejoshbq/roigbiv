@@ -91,7 +91,19 @@ def get_app_state() -> AppState:
     if sid not in _instances:
         with _instances_lock:
             if sid not in _instances:
-                _instances[sid] = AppState()
+                state = AppState()
+                preset = _get_preset_workspace()
+                if preset is not None:
+                    state.set_workspace(preset)
+                _instances[sid] = state
     inst = _instances[sid]
     inst._last_accessed = time.monotonic()
     return inst
+
+
+def _get_preset_workspace() -> Optional[WorkspacePaths]:
+    try:
+        from flask import current_app
+        return current_app.config.get("ROIGBIV_PRESET_WORKSPACE")
+    except RuntimeError:
+        return None

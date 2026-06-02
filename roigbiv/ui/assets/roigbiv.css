@@ -1,89 +1,444 @@
-/* ROIGBIV Dash UI — overrides on top of dbc/Bootstrap. Light/dark theme is
- * driven by `data-bs-theme` on <html>; we lean on Bootstrap 5.3's CSS vars
- * so most colors invert automatically.
+/* ROIGBIV — REACHER Suite theme.
+ * Tokens are defined on :root and [data-bs-theme="dark"] so Bootstrap 5.3
+ * components pick them up regardless of which data-bs-theme value is active.
+ * Bootstrap --bs-* vars are overridden here to retint dbc components without
+ * replacing the Bootstrap dependency.
  */
 
-:root {
-    --roigbiv-accent: #18bc9c;
-    --roigbiv-accent-soft: rgba(24, 188, 156, 0.18);
-    --roigbiv-log-bg: #2f3640;
-    --roigbiv-log-fg: #ecf0f1;
-}
+/* ── Google Fonts preconnect (served via external_stylesheets in app.py) ── */
+
+/* ── REACHER design tokens ─────────────────────────────────────────────── */
+:root,
 [data-bs-theme="dark"] {
-    --roigbiv-accent: #2ecc71;
-    --roigbiv-accent-soft: rgba(46, 204, 113, 0.20);
-    --roigbiv-log-bg: #1b1f24;
-    --roigbiv-log-fg: #ecf0f1;
+    /* Surface */
+    --roigbiv-surface:            #000000;
+    --roigbiv-panel:              #0A1818;
+    /* Accent */
+    --roigbiv-accent:             #00E5FF;
+    --roigbiv-accent-hover:       #007A8C;
+    --roigbiv-accent-contrast:    #000000;
+    --roigbiv-accent-soft:        rgba(0, 229, 255, 0.18);
+    --roigbiv-cyan-glow:          rgba(0, 229, 255, 0.15);
+    --roigbiv-cyan-glow-strong:   rgba(0, 229, 255, 0.35);
+    /* Text */
+    --roigbiv-text-primary:       #C8E8E8;
+    --roigbiv-text-secondary:     #4A7070;
+    --roigbiv-text-dim:           #285050;
+    /* Borders */
+    --roigbiv-border:             #0D2626;
+    /* Inputs */
+    --roigbiv-input-bg:           #040A0A;
+    /* Log stream */
+    --roigbiv-log-bg:             #040A0A;
+    --roigbiv-log-fg:             #C8E8E8;
+    /* Muted code */
+    --roigbiv-muted-bg:           #0A1818;
+    --roigbiv-muted-fg:           #C8E8E8;
+    /* Typography */
+    --roigbiv-font-body:          'Rajdhani', system-ui, sans-serif;
+    --roigbiv-font-mono:          'JetBrains Mono', 'Share Tech Mono', ui-monospace, monospace;
+    /* Shape */
+    --roigbiv-radius:             2px;
+
+    /* ── Bootstrap 5.3 overrides (retint dbc components automatically) ── */
+    --bs-body-bg:                 #000000;
+    --bs-body-color:              #C8E8E8;
+    --bs-body-secondary-color:    #4A7070;
+    --bs-tertiary-bg:             #0A1818;
+    --bs-secondary-bg:            #0A1818;
+    --bs-emphasis-color:          #C8E8E8;
+    --bs-card-bg:                 #0A1818;
+    --bs-card-border-color:       #0D2626;
+    --bs-border-color:            #0D2626;
+    --bs-border-color-translucent: rgba(13, 38, 38, 0.5);
+    --bs-primary:                 #00E5FF;
+    --bs-primary-rgb:             0, 229, 255;
+    --bs-link-color:              #00E5FF;
+    --bs-link-color-rgb:          0, 229, 255;
+    --bs-link-hover-color:        #007A8C;
+    --bs-form-control-bg:         #040A0A;
+    --bs-form-control-disabled-bg: #0A1818;
+    --bs-table-bg:                transparent;
+    --bs-table-striped-bg:        rgba(0, 229, 255, 0.04);
+    --bs-table-hover-bg:          rgba(0, 229, 255, 0.07);
+    --bs-table-border-color:      #0D2626;
+    --bs-nav-link-color:          #4A7070;
+    --bs-nav-link-hover-color:    #00E5FF;
+    --bs-navbar-color:            #4A7070;
+    --bs-navbar-hover-color:      #00E5FF;
+    --bs-navbar-active-color:     #00E5FF;
+    --bs-navbar-brand-color:      #00E5FF;
+    --bs-dropdown-bg:             #0A1818;
+    --bs-dropdown-border-color:   #0D2626;
+    --bs-dropdown-link-color:     #C8E8E8;
+    --bs-dropdown-link-hover-bg:  rgba(0, 229, 255, 0.1);
+    --bs-dropdown-link-active-bg: #00E5FF;
+    --bs-dropdown-link-active-color: #000000;
+    --bs-modal-bg:                #0A1818;
+    --bs-modal-border-color:      #0D2626;
+    --bs-modal-header-border-color: #0D2626;
+    --bs-input-bg:                #040A0A;
+    --bs-input-border-color:      #0D2626;
+    --bs-input-color:             #C8E8E8;
+    --bs-input-focus-border-color: #00E5FF;
+    --bs-input-focus-box-shadow:  0 0 0 0.2rem rgba(0, 229, 255, 0.18);
+    --bs-success:                 #00E5B4;
+    --bs-success-rgb:             0, 229, 180;
+    --bs-warning:                 #FFB454;
+    --bs-warning-rgb:             255, 180, 84;
+    --bs-danger:                  #FF6B7A;
+    --bs-danger-rgb:              255, 107, 122;
+    --bs-info:                    #00E5FF;
+    --bs-info-rgb:                0, 229, 255;
+    --bs-progress-bg:             #0D2626;
+    --bs-progress-bar-bg:         #00E5FF;
+    --bs-hr-color:                #0D2626;
+    --bs-hr-opacity:              1;
 }
 
-.roigbiv-brand {
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    font-size: 1.2rem;
+/* ── Base typography ───────────────────────────────────────────────────── */
+body {
+    font-family: var(--roigbiv-font-body);
+    background-color: var(--roigbiv-surface);
+    color: var(--roigbiv-text-primary);
 }
-.roigbiv-brand-accent {
-    background: linear-gradient(90deg, #e74c3c, #f39c12, #f1c40f, #2ecc71, #3498db, #9b59b6);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
+code, pre, kbd, samp,
+.font-monospace,
+.roigbiv-muted-code,
+.roigbiv-log-stream {
+    font-family: var(--roigbiv-font-mono) !important;
 }
-.roigbiv-navbar {
-    background-color: var(--bs-tertiary-bg);
-    border-bottom: 1px solid var(--bs-border-color);
-    backdrop-filter: blur(4px);
+
+/* ── Scanlines overlay (tasteful — 18% opacity, 3px step) ─────────────── */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.18) 0px,
+        rgba(0, 0, 0, 0.18) 1px,
+        transparent 1px,
+        transparent 3px
+    );
 }
-.roigbiv-theme-toggle {
-    color: var(--bs-body-color);
-    text-decoration: none;
-}
-.roigbiv-theme-toggle:hover {
-    color: var(--roigbiv-accent);
-}
-.roigbiv-card-accent {
-    border-left: 4px solid var(--roigbiv-accent);
-}
-.roigbiv-muted-code {
-    font-family: "SFMono-Regular", Menlo, Consolas, monospace;
-    font-size: 0.85rem;
-    background: var(--bs-secondary-bg);
-    color: var(--bs-body-color);
-    padding: 0.1rem 0.35rem;
+
+/* ── Custom scrollbars ─────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--roigbiv-surface); }
+::-webkit-scrollbar-thumb {
+    background: rgba(0, 229, 255, 0.20);
     border-radius: 3px;
 }
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 255, 0.40); }
+
+/* ── Branding ──────────────────────────────────────────────────────────── */
+.roigbiv-brand {
+    font-weight: 700;
+    font-size: 1.25rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    font-family: var(--roigbiv-font-body);
+    color: var(--roigbiv-text-primary);
+}
+.roigbiv-brand-accent {
+    color: var(--roigbiv-accent);
+    text-shadow: 0 0 8px var(--roigbiv-cyan-glow-strong);
+}
+.roigbiv-brand-sub {
+    font-family: var(--roigbiv-font-mono);
+    font-size: 0.55rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--roigbiv-text-dim);
+    margin-top: -2px;
+}
+
+/* ── Navbar ────────────────────────────────────────────────────────────── */
+.roigbiv-navbar {
+    background-color: rgba(10, 24, 24, 0.92) !important;
+    border-bottom: 1px solid var(--roigbiv-border);
+    backdrop-filter: blur(6px);
+}
+.roigbiv-navbar .nav-link {
+    font-family: var(--roigbiv-font-body);
+    font-weight: 600;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-size: 0.8rem;
+    color: var(--roigbiv-text-secondary) !important;
+    transition: color 0.2s;
+}
+.roigbiv-navbar .nav-link:hover,
+.roigbiv-navbar .nav-link.active {
+    color: var(--roigbiv-accent) !important;
+}
+/* Hide theme toggle — REACHER is always dark */
+.roigbiv-theme-toggle {
+    display: none !important;
+}
+
+/* ── Cards ─────────────────────────────────────────────────────────────── */
+.card {
+    background-color: var(--roigbiv-panel) !important;
+    border: 1px solid var(--roigbiv-border) !important;
+    border-radius: var(--roigbiv-radius) !important;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+    border-color: rgba(0, 229, 255, 0.25) !important;
+    box-shadow: 0 0 12px var(--roigbiv-cyan-glow);
+}
+.roigbiv-card-accent {
+    border-left: 2px solid var(--roigbiv-accent) !important;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.btn {
+    font-family: var(--roigbiv-font-body);
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    border-radius: var(--roigbiv-radius) !important;
+    transition: all 0.2s;
+}
+.btn:active { transform: translateY(1px); }
+
+.btn-primary {
+    background-color: var(--roigbiv-accent) !important;
+    border-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent-contrast) !important;
+    box-shadow: 0 0 8px var(--roigbiv-cyan-glow);
+}
+.btn-primary:hover,
+.btn-primary:focus {
+    background-color: var(--roigbiv-accent-hover) !important;
+    border-color: var(--roigbiv-accent-hover) !important;
+    box-shadow: 0 0 14px var(--roigbiv-cyan-glow-strong);
+}
+
+.btn-outline-primary {
+    border-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent) !important;
+    background-color: transparent !important;
+}
+.btn-outline-primary:hover,
+.btn-outline-primary:focus,
+.btn-outline-primary.active {
+    background-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent-contrast) !important;
+    box-shadow: 0 0 10px var(--roigbiv-cyan-glow-strong);
+}
+
+.btn-outline-secondary {
+    border-color: var(--roigbiv-border) !important;
+    color: var(--roigbiv-text-secondary) !important;
+    background-color: transparent !important;
+}
+.btn-outline-secondary:hover,
+.btn-outline-secondary:focus {
+    border-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent) !important;
+    background-color: rgba(0, 229, 255, 0.07) !important;
+}
+
+.btn-link {
+    color: var(--roigbiv-text-secondary) !important;
+    text-transform: none;
+    letter-spacing: 0;
+}
+.btn-link:hover { color: var(--roigbiv-accent) !important; }
+
+/* ── Segmented controls ────────────────────────────────────────────────── */
+.roigbiv-segmented .btn {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.6rem;
+    font-family: var(--roigbiv-font-mono);
+    font-weight: 400;
+    letter-spacing: 0.06em;
+}
+.roigbiv-segmented .btn.active {
+    background-color: var(--roigbiv-accent) !important;
+    border-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent-contrast) !important;
+    box-shadow: 0 0 8px var(--roigbiv-cyan-glow);
+}
+
+/* ── Inputs & selects ──────────────────────────────────────────────────── */
+.form-control,
+.form-select {
+    background-color: var(--roigbiv-input-bg) !important;
+    border-color: var(--roigbiv-border) !important;
+    color: var(--roigbiv-text-primary) !important;
+    border-radius: var(--roigbiv-radius) !important;
+    font-family: var(--roigbiv-font-mono);
+    font-size: 0.85rem;
+}
+.form-control:focus,
+.form-select:focus {
+    border-color: var(--roigbiv-accent) !important;
+    box-shadow: 0 0 0 0.2rem var(--roigbiv-accent-soft) !important;
+}
+.form-control::placeholder { color: var(--roigbiv-text-dim); }
+
+/* dbc.Switch / Checklist accent */
+.form-check-input:checked {
+    background-color: var(--roigbiv-accent) !important;
+    border-color: var(--roigbiv-accent) !important;
+}
+.form-switch .form-check-input:checked {
+    background-color: var(--roigbiv-accent) !important;
+    border-color: var(--roigbiv-accent) !important;
+}
+
+/* ── Code & log primitives ─────────────────────────────────────────────── */
+.roigbiv-muted-code {
+    font-size: 0.82rem;
+    background: var(--roigbiv-muted-bg);
+    color: var(--roigbiv-accent);
+    padding: 0.1rem 0.35rem;
+    border-radius: var(--roigbiv-radius);
+    border: 1px solid var(--roigbiv-border);
+}
 .roigbiv-log-stream {
-    font-family: "SFMono-Regular", Menlo, Consolas, monospace;
-    font-size: 0.80rem;
+    font-size: 0.78rem;
     background: var(--roigbiv-log-bg);
     color: var(--roigbiv-log-fg);
     padding: 0.75rem 0.9rem;
-    border-radius: 6px;
+    border-radius: var(--roigbiv-radius);
+    border: 1px solid var(--roigbiv-border);
     max-height: 18rem;
     overflow-y: auto;
     white-space: pre-wrap;
 }
-.roigbiv-segmented .btn {
-    font-size: 0.85rem;
+
+/* ── Section divider (Labrynth-style heading line) ─────────────────────── */
+.roigbiv-h-line {
+    border: none;
+    border-top: 1px solid var(--roigbiv-border);
+    margin: 1.25rem 0 1rem;
+    opacity: 1;
 }
+
+/* ── Panels ────────────────────────────────────────────────────────────── */
 .roigbiv-panel-section + .roigbiv-panel-section {
     margin-top: 1.25rem;
 }
 .roigbiv-tooltip-table td {
     padding: 0.1rem 0.5rem;
+    color: var(--roigbiv-text-primary);
+    font-family: var(--roigbiv-font-mono);
+    font-size: 0.8rem;
 }
 
-/* Review page — collapsible sidebar, active-session ring, drawer. */
+/* ── Review page — sidebars, session ring, drawer ──────────────────────── */
 .roigbiv-sidebar-toggle {
-    border: 1px solid var(--bs-border-color);
+    border: 1px solid var(--roigbiv-border) !important;
     margin-bottom: 0.5rem;
 }
 .roigbiv-active-session {
-    border: 2px solid var(--roigbiv-accent);
+    border: 2px solid var(--roigbiv-accent) !important;
     box-shadow: 0 0 0 3px var(--roigbiv-accent-soft);
 }
-.roigbiv-drawer-hero h5 {
+.roigbiv-drawer-hero h5,
+.roigbiv-roi-title {
+    color: var(--roigbiv-accent);
+    font-family: var(--roigbiv-font-body);
+    font-weight: 700;
+    letter-spacing: 0.08em;
     margin-bottom: 0.25rem;
 }
 .roigbiv-drawer-hero .badge {
-    font-size: 0.75rem;
+    font-size: 0.70rem;
     font-weight: 600;
+    font-family: var(--roigbiv-font-mono);
+    border-radius: var(--roigbiv-radius);
+    letter-spacing: 0.06em;
 }
+
+/* ── Tables ────────────────────────────────────────────────────────────── */
+.table {
+    color: var(--roigbiv-text-primary);
+    border-color: var(--roigbiv-border);
+}
+.table-striped > tbody > tr:nth-of-type(odd) > * {
+    background-color: rgba(0, 229, 255, 0.04);
+    color: var(--roigbiv-text-primary);
+}
+.table thead th {
+    font-family: var(--roigbiv-font-body);
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-size: 0.72rem;
+    color: var(--roigbiv-text-secondary);
+    border-bottom-color: var(--roigbiv-border);
+}
+
+/* ── Progress bar ──────────────────────────────────────────────────────── */
+.progress {
+    background-color: var(--roigbiv-border) !important;
+    border-radius: var(--roigbiv-radius);
+    height: 6px;
+}
+.progress-bar {
+    background-color: var(--roigbiv-accent) !important;
+    box-shadow: 0 0 6px var(--roigbiv-cyan-glow);
+}
+
+/* ── Headings ──────────────────────────────────────────────────────────── */
+h1, h2, h3, h4 {
+    font-family: var(--roigbiv-font-body);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--roigbiv-text-primary);
+}
+h5, h6 {
+    font-family: var(--roigbiv-font-body);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    color: var(--roigbiv-text-secondary);
+}
+
+/* ── Alerts ────────────────────────────────────────────────────────────── */
+.alert {
+    border-radius: var(--roigbiv-radius);
+    border-left-width: 3px;
+    font-family: var(--roigbiv-font-mono);
+    font-size: 0.85rem;
+}
+.alert-danger  { background-color: rgba(255, 107, 122, 0.10); border-color: #FF6B7A; color: #FF6B7A; }
+.alert-warning { background-color: rgba(255, 180, 84, 0.10);  border-color: #FFB454; color: #FFB454; }
+.alert-info    { background-color: rgba(0, 229, 255, 0.08);   border-color: #00E5FF; color: #00E5FF; }
+.alert-success { background-color: rgba(0, 229, 180, 0.08);   border-color: #00E5B4; color: #00E5B4; }
+
+/* ── Badges ────────────────────────────────────────────────────────────── */
+.badge {
+    border-radius: var(--roigbiv-radius);
+    font-family: var(--roigbiv-font-mono);
+}
+
+/* ── Plotly modebar ────────────────────────────────────────────────────── */
+.modebar-btn path { fill: var(--roigbiv-text-secondary) !important; }
+.modebar-btn:hover path { fill: var(--roigbiv-accent) !important; }
+.modebar { background: rgba(10, 24, 24, 0.85) !important; }
+
+/* ── HR ───────────────────────────────────────────────────────────────── */
+hr {
+    border-color: var(--roigbiv-border);
+    opacity: 1;
+}
+
+/* ── Nav pills / tabs ──────────────────────────────────────────────────── */
+.nav-pills .nav-link.active {
+    background-color: var(--roigbiv-accent) !important;
+    color: var(--roigbiv-accent-contrast) !important;
+}
+.nav-pills .nav-link {
+    color: var(--roigbiv-text-secondary);
+    border-radius: var(--roigbiv-radius);
+}
+.nav-pills .nav-link:hover { color: var(--roigbiv-accent); }

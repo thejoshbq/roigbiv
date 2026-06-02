@@ -57,3 +57,4 @@ include = ["roigbiv*"]
 
 [tool.setuptools.package-data]
 roigbiv = ["py.typed"]
+"roigbiv.registry" = ["alembic.ini", "migrations/script.py.mako"]

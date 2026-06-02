@@ -45,7 +45,7 @@ def segmented(name: str, options: list[tuple[str, str]], value: str) -> dbc.Radi
         inline=True,
         className="roigbiv-segmented",
         inputClassName="btn-check",
-        labelClassName="btn btn-sm btn-outline-secondary",
+        labelClassName="btn btn-sm btn-outline-primary",
         labelCheckedClassName="active",
     )
 
@@ -69,7 +69,7 @@ def sidebar_toggle(*, toggle_id: str, store_id: str) -> html.Div:
         dbc.Button(
             html.I(className="bi bi-chevron-double-left"),
             id=toggle_id,
-            color="light", size="sm",
+            color="link", size="sm",
             className="roigbiv-sidebar-toggle",
             n_clicks=0,
         ),

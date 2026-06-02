@@ -76,11 +76,17 @@ def build_roi_figure(
     """
     fig = go.Figure()
     if mean is not None:
+        p1 = float(np.percentile(mean, 1))
+        p99 = float(np.percentile(mean, 99.5))
+        if p99 <= p1:
+            p99 = p1 + 1.0
         fig.add_trace(
             go.Heatmap(
                 z=mean,
                 colorscale=heatmap_colorscale(theme),
                 reversescale=heatmap_reverse(theme),
+                zmin=p1,
+                zmax=p99,
                 showscale=False,
                 hoverinfo="skip",
                 name="mean_M",
@@ -119,7 +125,6 @@ def build_roi_figure(
                 )
 
     H, W = (mean.shape if mean is not None else (1, 1))
-    bg = figure_paper_bg(theme)
     fig.update_layout(
         template=plotly_template(theme),
         title=dict(text=title or "", x=0.01, xanchor="left",
@@ -134,9 +139,9 @@ def build_roi_figure(
         # Emit click events but never enter select-state: otherwise Plotly
         # dims all non-clicked ROI scatters, breaking cross-session tracking.
         clickmode="event",
-        plot_bgcolor=bg,
-        paper_bgcolor=bg,
-        hoverlabel=dict(bgcolor="rgba(44,62,80,0.92)", font_color="white"),
+        plot_bgcolor=figure_paper_bg(theme),
+        paper_bgcolor=figure_paper_bg(theme),
+        hoverlabel=dict(bgcolor="#0A1818", bordercolor="#00E5FF", font_color="#C8E8E8"),
     )
     return fig
 

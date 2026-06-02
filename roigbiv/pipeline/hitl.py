@@ -247,6 +247,6 @@ def export_hitl_package(
     # Image source: prefer mean_M (morphological), fall back to mean_S
     img = fov.mean_M if fov.mean_M is not None else fov.mean_S
     if img is not None:
-        tifffile.imwrite(str(staging / "images" / f"{stem}.tif"),
+        tifffile.imwrite(str(staging / "images" / f"{stem}_mean.tif"),
                          img.astype(np.float32))
     tifffile.imwrite(str(staging / "masks" / f"{stem}_seg.tif"), merged)

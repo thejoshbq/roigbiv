@@ -114,7 +114,7 @@ def reingest_mask(
     }
     new_masks = _split_label_image(new_labels)
 
-    matches, unmatched_current, unmatched_new = _greedy_match(
+    matches, unmatched_current, unmatched_new = greedy_match(
         current_masks, new_masks, edit_iou,
     )
 
@@ -195,7 +195,7 @@ def _split_label_image(labels: np.ndarray) -> dict[int, np.ndarray]:
     return out
 
 
-def _greedy_match(
+def greedy_match(
     current: dict[int, np.ndarray],
     new: dict[int, np.ndarray],
     iou_threshold: float,
@@ -208,18 +208,18 @@ def _greedy_match(
     pairs: list[tuple[int, int, float]] = []
     for cid, cmask in current.items():
         for nid, nmask in new.items():
-            iou = _iou(cmask, nmask)
-            if iou >= iou_threshold:
-                pairs.append((cid, nid, iou))
+            iou_val = iou(cmask, nmask)
+            if iou_val >= iou_threshold:
+                pairs.append((cid, nid, iou_val))
     pairs.sort(key=lambda t: t[2], reverse=True)
 
     used_current: set[int] = set()
     used_new: set[int] = set()
     matches: list[tuple[int, int, float]] = []
-    for cid, nid, iou in pairs:
+    for cid, nid, iou_val in pairs:
         if cid in used_current or nid in used_new:
             continue
-        matches.append((cid, nid, iou))
+        matches.append((cid, nid, iou_val))
         used_current.add(cid)
         used_new.add(nid)
 
@@ -228,7 +228,7 @@ def _greedy_match(
     return matches, unmatched_current, unmatched_new
 
 
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
+def iou(a: np.ndarray, b: np.ndarray) -> float:
     inter = int(np.logical_and(a, b).sum())
     if inter == 0:
         return 0.0

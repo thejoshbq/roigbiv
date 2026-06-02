@@ -90,8 +90,8 @@ class CellposeTrainer:
 
         if importlib.util.find_spec("cellpose.gui.gui") is None:
             raise CellposeNotFoundError(
-                "cellpose not importable in the current environment. "
-                "Activate the roigbiv conda environment and try again."
+                "cellpose GUI dependencies not importable. "
+                "Install cellpose[gui] (pyqtgraph) and try again."
             )
 
         image_tifs = sorted(staging_images.glob("*.tif"))
@@ -249,6 +249,7 @@ class CellposeTrainer:
             "--masks_dir", str(masks_dir),
             "--epochs", str(epochs),
             "--lr", str(lr),
+            "--no_vcorr",
         ]
         self._log(f"run_id={run_id}  epochs={epochs}  lr={lr}")
         self._log(f"$ {' '.join(str(c) for c in cmd)}")
@@ -344,6 +345,7 @@ class CellposeTrainer:
 
 _trainers: dict[str, CellposeTrainer] = {}
 _trainers_lock = threading.Lock()
+
 
 
 def get_trainer() -> CellposeTrainer:
