@@ -1,0 +1,16 @@
+# Large run artifacts — not committed
+runs/*.dat
+runs/*.npy
+runs/*.h5
+runs/*.mp4
+
+# Pipeline outputs during experiment runs (TIFFs, memmaps)
+runs/*/stage*/
+runs/*/summary/
+runs/*/traces/
+runs/*/classified/
+
+# CaImAn temp files
+baselines/tmp/
+baselines/*.mmap
+baselines/*.hdf5

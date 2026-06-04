@@ -1,0 +1,21 @@
+# Held-out FOV stems for eval harness (Phase 1+)
+# Val split: seed=42, val_frac=0.15 from scripts/train.py:load_dataset()
+# Total annotated FOVs: 92  |  Val count: 13
+#
+# Format: stem|movie_path|gt_masks_path
+# movie_path is relative to repo root; gt_masks_path is relative to repo root
+# All paths verified present as of 2026-06-04
+
+T1_230202_PrL-NAc-G6-6F_HI-D2_FOV2_pre-000_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230202_PrL-NAc-G6-6F_HI-D2_FOV2_pre-000_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230202_PrL-NAc-G6-6F_HI-D2_FOV2_pre-000_mc_masks.tif
+T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_BEH-001_mc|data/JOSH/ROIGBIV-DATA/PrL-NAc-G6-7F/230215_PrL-NAc-G6-7F_LOW-D1_FOV1/T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_BEH-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_BEH-001_mc_masks.tif
+T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_BEH-003_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_BEH-003_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_BEH-003_mc_masks.tif
+T1_230226_PrL-NAc-G6-7F_LOW-D10_FOV2_BEH-001_mc|data/JOSH/ROIGBIV-DATA/PrL-NAc-G6-7F/230227_PrL-NAc-G6-7F_LOW-D10_FOV2/T1_230226_PrL-NAc-G6-7F_LOW-D10_FOV2_BEH-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230226_PrL-NAc-G6-7F_LOW-D10_FOV2_BEH-001_mc_masks.tif
+T1_230116_PrL-NAc-G6-5M_EXT-D9_FOV1_EXT-D9_PRE-000_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230116_PrL-NAc-G6-5M_EXT-D9_FOV1_EXT-D9_PRE-000_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230116_PrL-NAc-G6-5M_EXT-D9_FOV1_EXT-D9_PRE-000_mc_masks.tif
+T1_230228_PrL-NAc-G6-7F_EXT-D1_FOV1_PRE-000_mc|data/JOSH/ROIGBIV-DATA/PrL-NAc-G6-7F/230228_PrL-NAc-G6-7F_EXT-D1_FOV1/PRE Files/T1_230228_PrL-NAc-G6-7F_EXT-D1_FOV1_PRE-000_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230228_PrL-NAc-G6-7F_EXT-D1_FOV1_PRE-000_mc_masks.tif
+T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_PRE-000_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_PRE-000_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_PRE-000_mc_masks.tif
+T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_BEH-001_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_BEH-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230118_PrL-NAc-G6-5M_EXT-D10_FOV2_BEH-001_mc_masks.tif
+T1_230316_PrL-NAc-G6-7F_EXT-D10_FOV2_BEH-001_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230316_PrL-NAc-G6-7F_EXT-D10_FOV2_BEH-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230316_PrL-NAc-G6-7F_EXT-D10_FOV2_BEH-001_mc_masks.tif
+T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_PRE-001_mc|data/JOSH/ROIGBIV-DATA/PrL-NAc-G6-7F/230215_PrL-NAc-G6-7F_LOW-D1_FOV1/PRE Files/T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_PRE-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230215_PrL-NAc-G6-7F_LOW-D1_FOV1_PRE-001_mc_masks.tif
+T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_PRE-000_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_PRE-000_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_230308_PrL-NAc-G6-6M_EXT-D2_FOV2_PRE-000_mc_masks.tif
+T1_PrL-NAc-G6-7F_EXT-D9_FOV1_BEH-001_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_PrL-NAc-G6-7F_EXT-D9_FOV1_BEH-001_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_PrL-NAc-G6-7F_EXT-D9_FOV1_BEH-001_mc_masks.tif
+T1_2221230_PrL-NAc-G6-5M_LOW-D9_FOV1_BEH_PT2-002_mc|data/JOSH/ROIGBIV-DATA/data/raw/T1_2221230_PrL-NAc-G6-5M_LOW-D9_FOV1_BEH_PT2-002_mc.tif|data/JOSH/ROIGBIV-DATA/cellpose_ready/masks/T1_2221230_PrL-NAc-G6-5M_LOW-D9_FOV1_BEH_PT2-002_mc_masks.tif
