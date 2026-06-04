@@ -183,27 +183,24 @@ def solve_traces_robust_irls(
     chunk_iter,
     cfg: "PipelineConfig",
 ) -> np.ndarray:
-    """One-sided Huber IRLS trace solver (config-gated alternative to ridge).
+    """One-sided Huber IRLS trace solver with negative-residual sigma estimation.
 
-    Minimises Σ_p rho(eps_p) where eps = S - W c.
-    One-sided down-weighting: positive residuals (unmodelled additive fluorescence
-    from ghosts / overlapping neighbours) receive lower weight than negative ones.
+    Weight function (one-sided Huber):
+        p(r) = 1                        if r <= 0  (negative residuals: full weight)
+               kappa_abs / max(kappa_abs, r)  if r > 0   (positive eps: down-weighted)
 
-    Weight function derived from one-sided Huber derivative:
-        p(r) = 1                          if r <= 0
-               kappa / max(kappa, |r|)    if r > 0
+    Sigma is estimated from the NEGATIVE residuals only.  Negative residuals come
+    from good pixels where the model over-predicts; they are unaffected by:
+      (a) bad-ROI artifact: negative ridge traces create eps = S + |c_bad| * W >> 0
+          (always positive), so they never appear in the negative-eps pool;
+      (b) ghost contamination: unmodelled additive fluorescence also creates eps > 0.
+    The negative-eps MAD therefore reflects the true pixel noise floor, giving a
+    tight kappa_abs that correctly flags bad-ROI pixels and ghost pixels as outliers.
 
-    Solved by IRLS: warm-start from ridge, then iterate weighted normal equations
-    (W_p.T W_p + lambda I) c = W_p.T (p * S) until convergence or max_iter cap.
-    Non-negativity applied as max(0, c) per frame after each iteration.
-
-    Parameters
-    ----------
-    design : (P, N) float32
-    T      : total frames
-    chunk_iter : yields (t0, t1, S_chunk) as in solve_traces_from_chunks
-    cfg    : PipelineConfig — uses subtract_ridge_lambda_scale, force_cpu,
-             subtract_robust_kappa, subtract_robust_max_iter
+    Unclamped: traces can go negative on real data when inter-ROI coupling
+    artifacts inflate residuals.  Clamping c >= 0 after each solve prevents
+    divergence but converts failures to mean_ratio artifacts that bypass the
+    NNLS anticorr fallback.  Current implementation is unclamped.
     """
     import torch
 
@@ -224,41 +221,46 @@ def solve_traces_robust_irls(
         cs = t1 - t0
         S_t = torch.from_numpy(np.ascontiguousarray(S_chunk.T)).to(device)  # (P, cs)
 
-        # Warm-start: one ridge solve
+        # Warm-start: unclamped ridge solve (same as solve_traces_from_chunks).
         WtW_reg = WtW + lam * torch.eye(N, device=device, dtype=WtW.dtype)
         c = torch.linalg.solve(WtW_reg, W.T @ S_t)                          # (N, cs)
-        c = torch.clamp(c, min=0.0)
+
+        # Sigma from NEGATIVE warm-start residuals only.
+        # Bad-ROI artifact always produces eps > 0, so the negative pool is clean.
+        eps_warm = (S_t - W @ c).reshape(-1)
+        eps_neg = eps_warm[eps_warm < 0]
+        if eps_neg.numel() > 10:
+            sigma_noise = (eps_neg.abs().median() / 0.6745).clamp(min=1e-3)
+        else:
+            sigma_noise = (eps_warm.abs().median() / 0.6745).clamp(min=1e-3)
+        kappa_abs = kappa * sigma_noise
 
         for _ in range(max_iter):
-            eps = S_t - W @ c                                # (P, cs) residuals
-            # One-sided weights: positive eps (excess fluorescence) down-weighted
+            eps = S_t - W @ c                                # (P, cs)
+            # One-sided Huber: down-weight positive eps (ghost / bad-ROI artifact);
+            # full weight on negative eps (model over-prediction / noise).
             p = torch.where(
                 eps > 0,
-                kappa / torch.clamp(eps.abs(), min=kappa),
+                kappa_abs / torch.clamp(eps, min=kappa_abs),
                 torch.ones_like(eps),
             )                                                # (P, cs)
 
-            # Weighted solve: build W_p per-sample and solve independently.
-            # To avoid a Python loop over cs columns, we solve the batch normal
-            # equations using broadcasting: aggregate over pixels with p weights.
-            # WpTWp[j,k] = Σ_p p[p,t] * W[p,j] * W[p,k]  — changes per column t.
-            # For typical P>>N this loop over cs is acceptable; cs ≤ chunk_frames.
+            # Weighted normal equations per temporal frame.
+            # W_p = Diag(p) @ W → W_p.T @ W = W.T Diag(p) W  (correct LHS)
+            #                      W_p.T @ S  = W.T Diag(p) S  (correct RHS)
             c_new = torch.empty_like(c)
             for col in range(cs):
                 p_col = p[:, col]                            # (P,)
-                W_p = W * p_col.unsqueeze(1)                 # (P, N) weighted
+                W_p = W * p_col.unsqueeze(1)                 # (P, N)
                 WpTWp = W_p.T @ W + lam * torch.eye(N, device=device, dtype=W.dtype)
-                rhs = W_p.T @ S_t[:, col]                    # (N,)
+                rhs = W_p.T @ S_t[:, col]
                 c_new[:, col] = torch.linalg.solve(WpTWp, rhs)
 
-            c_new = torch.clamp(c_new, min=0.0)
-
-            # Convergence check
             denom = c.norm() + 1e-8
-            if (c_new - c).norm() / denom < 1e-4:
-                c = c_new
-                break
+            delta = (c_new - c).norm() / denom
             c = c_new
+            if delta < 1e-4:
+                break
 
         traces[:, t0:t1] = c.detach().cpu().numpy().astype(np.float32)
 

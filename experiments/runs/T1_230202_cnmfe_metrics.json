@@ -1,0 +1,82 @@
+{
+  "detection": {
+    "overall": {
+      "recall": 0.0,
+      "precision": 0.0,
+      "f1": 0.0,
+      "tp": 0,
+      "fp": 6,
+      "fn": 52
+    },
+    "by_type": {
+      "ambiguous": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "phasic": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "silent": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": true
+      },
+      "sparse": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "tonic": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": true
+      },
+      "unknown": {
+        "recall": 0.0,
+        "precision": 0.0,
+        "f1": 0.0,
+        "tp": 0,
+        "fp": 6,
+        "fn": 52,
+        "lower_bound": true
+      }
+    },
+    "warnings": [
+      "No roi_metadata.json \u2014 activity-type stratification skipped."
+    ],
+    "iou_threshold": 0.3,
+    "activity_stratification": false
+  },
+  "artifact": {},
+  "counts": {
+    "gt_rois": 52,
+    "pred_rois": 6,
+    "tp": 0,
+    "fp": 6,
+    "fn": 52
+  },
+  "stem": "T1_230202_PrL-NAc-G6-6F_HI-D2_FOV2_pre-000"
+}

@@ -1,0 +1,101 @@
+{
+  "detection": {
+    "overall": {
+      "recall": 0.8269230769230769,
+      "precision": 0.7818181818181819,
+      "f1": 0.8037383177570092,
+      "tp": 43,
+      "fp": 12,
+      "fn": 9
+    },
+    "by_type": {
+      "ambiguous": {
+        "recall": 1.0,
+        "precision": 0.7096774193548387,
+        "f1": 0.8301886792452831,
+        "tp": 22,
+        "fp": 9,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "phasic": {
+        "recall": 1.0,
+        "precision": 0.8695652173913043,
+        "f1": 0.9302325581395349,
+        "tp": 20,
+        "fp": 3,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "silent": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": true
+      },
+      "sparse": {
+        "recall": 1.0,
+        "precision": 1.0,
+        "f1": 1.0,
+        "tp": 1,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": false
+      },
+      "tonic": {
+        "recall": NaN,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "lower_bound": true
+      },
+      "unknown": {
+        "recall": 0.0,
+        "precision": NaN,
+        "f1": NaN,
+        "tp": 0,
+        "fp": 0,
+        "fn": 9,
+        "lower_bound": true
+      }
+    },
+    "warnings": [],
+    "iou_threshold": 0.3,
+    "activity_stratification": true
+  },
+  "artifact": {
+    "S1": {
+      "n_rois": 55,
+      "pass_count": 18,
+      "fail_count": 37,
+      "pass_rate": 0.32727272727272727,
+      "mean_anticorr": 0.016163947202479288,
+      "std_ratio_p90": 1.9061888533505844,
+      "ring_candidates": 0,
+      "halo_candidates": 0
+    },
+    "S3": {
+      "n_rois": 1,
+      "pass_count": 0,
+      "fail_count": 1,
+      "pass_rate": 0.0,
+      "mean_anticorr": 0.25495660353978866,
+      "std_ratio_p90": 1.049275867506351,
+      "ring_candidates": 0,
+      "halo_candidates": 0
+    }
+  },
+  "counts": {
+    "gt_rois": 52,
+    "pred_rois": 55,
+    "tp": 43,
+    "fp": 12,
+    "fn": 9
+  },
+  "stem": "T1_230202_PrL-NAc-G6-6F_HI-D2_FOV2_pre-000"
+}
