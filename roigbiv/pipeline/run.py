@@ -1040,6 +1040,20 @@ def main(argv: "list[str] | None" = None) -> int:
                         help=("Run Stage 4 (tonic neuron correlation-"
                               "contrast search). Default: enabled. Pass "
                               "--no-stage-4 to skip."))
+    parser.add_argument("--subtract-solver", dest="subtract_solver",
+                        choices=("ridge", "robust"), default=None,
+                        help=("Trace-estimation solver for source subtraction. "
+                              "'ridge': GPU-chunked normal equations (default). "
+                              "'robust': one-sided Huber IRLS M-estimator "
+                              "(experimental, config-gated)."))
+    parser.add_argument("--subtract-robust-kappa", dest="subtract_robust_kappa",
+                        type=float, default=None,
+                        help=("Robustness threshold for --subtract-solver robust "
+                              "(default: 0.5 sigma units)."))
+    parser.add_argument("--subtract-robust-max-iter", dest="subtract_robust_max_iter",
+                        type=int, default=None,
+                        help=("Max IRLS iterations for --subtract-solver robust "
+                              "(default: 5)."))
     parser.add_argument("--cpu", dest="force_cpu", action="store_true",
                         default=False,
                         help=("Force CPU-only execution for all Torch and "
@@ -1111,6 +1125,15 @@ def _run_single(
                 file=sys.stderr,
             )
 
+    solver_overrides = {
+        k: v
+        for k, v in {
+            "subtract_solver": args.subtract_solver,
+            "subtract_robust_kappa": args.subtract_robust_kappa,
+            "subtract_robust_max_iter": args.subtract_robust_max_iter,
+        }.items()
+        if v is not None
+    }
     cfg = PipelineConfig(
         fs=args.fs,
         frame_averaging=args.frame_averaging,
@@ -1126,6 +1149,7 @@ def _run_single(
         resume=args.resume,
         force_cpu=args.force_cpu,
         **stage_overrides,
+        **solver_overrides,
     )
 
     fov_stem = tif_path.stem.replace("_mc", "")
@@ -1238,6 +1262,15 @@ def _run_workspace(
                 file=sys.stderr,
             )
 
+    ws_solver_overrides = {
+        k: v
+        for k, v in {
+            "subtract_solver": args.subtract_solver,
+            "subtract_robust_kappa": args.subtract_robust_kappa,
+            "subtract_robust_max_iter": args.subtract_robust_max_iter,
+        }.items()
+        if v is not None
+    }
     overrides = {
         "fs": args.fs,
         "frame_averaging": args.frame_averaging,
@@ -1252,6 +1285,7 @@ def _run_workspace(
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         **stage_overrides,
+        **ws_solver_overrides,
     }
 
     ws_results = run_with_workspace(

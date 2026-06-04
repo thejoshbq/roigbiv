@@ -221,6 +221,9 @@ class PipelineConfig:
     subtract_anticorr_threshold: float = -0.3
     subtract_anticorr_failure_fraction: float = 0.10   # trigger NNLS fallback
     subtract_nnls_fallback_max_rois: int = 30
+    subtract_solver: str = "ridge"           # "ridge" | "robust"
+    subtract_robust_kappa: float = 0.5       # one-sided Huber threshold (sigma units)
+    subtract_robust_max_iter: int = 5        # IRLS iteration cap
 
     # ── Stage 2 (Suite2p) ─────────────────────────────────────────────────
     threshold_scaling: float = 1.0          # Suite2p detection sensitivity (unused when re-reading)

@@ -177,6 +177,96 @@ def solve_traces_from_chunks(
     return traces
 
 
+def solve_traces_robust_irls(
+    design: np.ndarray,
+    T: int,
+    chunk_iter,
+    cfg: "PipelineConfig",
+) -> np.ndarray:
+    """One-sided Huber IRLS trace solver (config-gated alternative to ridge).
+
+    Minimises Σ_p rho(eps_p) where eps = S - W c.
+    One-sided down-weighting: positive residuals (unmodelled additive fluorescence
+    from ghosts / overlapping neighbours) receive lower weight than negative ones.
+
+    Weight function derived from one-sided Huber derivative:
+        p(r) = 1                          if r <= 0
+               kappa / max(kappa, |r|)    if r > 0
+
+    Solved by IRLS: warm-start from ridge, then iterate weighted normal equations
+    (W_p.T W_p + lambda I) c = W_p.T (p * S) until convergence or max_iter cap.
+    Non-negativity applied as max(0, c) per frame after each iteration.
+
+    Parameters
+    ----------
+    design : (P, N) float32
+    T      : total frames
+    chunk_iter : yields (t0, t1, S_chunk) as in solve_traces_from_chunks
+    cfg    : PipelineConfig — uses subtract_ridge_lambda_scale, force_cpu,
+             subtract_robust_kappa, subtract_robust_max_iter
+    """
+    import torch
+
+    N = design.shape[1]
+    device = "cpu" if cfg.force_cpu else ("cuda" if cuda_compute_capable() else "cpu")
+    kappa = float(cfg.subtract_robust_kappa)
+    max_iter = int(cfg.subtract_robust_max_iter)
+
+    W = torch.from_numpy(design).to(device)        # (P, N)
+    WtW = W.T @ W                                   # (N, N)
+    lam = cfg.subtract_ridge_lambda_scale * (
+        WtW.diagonal().sum().item() / max(N, 1)
+    )
+
+    traces = np.empty((N, T), dtype=np.float32)
+
+    for t0, t1, S_chunk in chunk_iter:
+        cs = t1 - t0
+        S_t = torch.from_numpy(np.ascontiguousarray(S_chunk.T)).to(device)  # (P, cs)
+
+        # Warm-start: one ridge solve
+        WtW_reg = WtW + lam * torch.eye(N, device=device, dtype=WtW.dtype)
+        c = torch.linalg.solve(WtW_reg, W.T @ S_t)                          # (N, cs)
+        c = torch.clamp(c, min=0.0)
+
+        for _ in range(max_iter):
+            eps = S_t - W @ c                                # (P, cs) residuals
+            # One-sided weights: positive eps (excess fluorescence) down-weighted
+            p = torch.where(
+                eps > 0,
+                kappa / torch.clamp(eps.abs(), min=kappa),
+                torch.ones_like(eps),
+            )                                                # (P, cs)
+
+            # Weighted solve: build W_p per-sample and solve independently.
+            # To avoid a Python loop over cs columns, we solve the batch normal
+            # equations using broadcasting: aggregate over pixels with p weights.
+            # WpTWp[j,k] = Σ_p p[p,t] * W[p,j] * W[p,k]  — changes per column t.
+            # For typical P>>N this loop over cs is acceptable; cs ≤ chunk_frames.
+            c_new = torch.empty_like(c)
+            for col in range(cs):
+                p_col = p[:, col]                            # (P,)
+                W_p = W * p_col.unsqueeze(1)                 # (P, N) weighted
+                WpTWp = W_p.T @ W + lam * torch.eye(N, device=device, dtype=W.dtype)
+                rhs = W_p.T @ S_t[:, col]                    # (N,)
+                c_new[:, col] = torch.linalg.solve(WpTWp, rhs)
+
+            c_new = torch.clamp(c_new, min=0.0)
+
+            # Convergence check
+            denom = c.norm() + 1e-8
+            if (c_new - c).norm() / denom < 1e-4:
+                c = c_new
+                break
+            c = c_new
+
+        traces[:, t0:t1] = c.detach().cpu().numpy().astype(np.float32)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return traces
+
+
 def estimate_traces_simultaneous(
     residual_S_path: Path,
     shape: tuple,
@@ -214,7 +304,10 @@ def estimate_traces_simultaneous(
             S_chunk = chunk_ram.reshape(cs, H * L)[:, union_flat_idx]
             yield t0, t1, S_chunk
 
-    traces = solve_traces_from_chunks(design, T, _iter(), cfg)
+    if getattr(cfg, "subtract_solver", "ridge") == "robust":
+        traces = solve_traces_robust_irls(design, T, _iter(), cfg)
+    else:
+        traces = solve_traces_from_chunks(design, T, _iter(), cfg)
     del S_mm
     return traces, union_flat_idx, union_yx
 
