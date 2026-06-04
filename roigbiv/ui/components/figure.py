@@ -116,7 +116,7 @@ def build_roi_figure(
                         x=xs + [xs[0]],
                         y=ys + [ys[0]],
                         mode="lines",
-                        line=dict(color=color, width=1.6),
+                        line=dict(color=color, width=3.2),
                         hovertemplate=_hover_text(render),
                         name=str(render.label_id),
                         customdata=[[render.label_id]] * (len(xs) + 1),

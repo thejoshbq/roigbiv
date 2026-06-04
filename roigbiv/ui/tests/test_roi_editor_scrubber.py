@@ -262,3 +262,63 @@ def test_projection_button_in_html(tmp_path):
     assert r.status_code == 200
     assert b"btn-proj" in r.data
     assert b"_returnToProjection" in r.data
+
+
+# ── Playback controls ─────────────────────────────────────────────────────────
+
+
+def _get_editor_html(tmp_path: Path) -> bytes:
+    out = tmp_path / "fov"
+    out.mkdir()
+    (out / "pipeline_log.json").write_text("{}")
+    _make_mean_m(out, Ly=8, Lx=8)
+    app = _app_with_routes()
+    with app.test_client() as c:
+        r = c.get(f"/roi-editor/fov?dir={_b64(out)}")
+    assert r.status_code == 200
+    return r.data
+
+
+def test_playback_controls_in_html(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"btn-play" in data
+    assert b"btn-step" in data
+    assert b"speed-select" in data
+    assert b"playback-controls" in data
+
+
+def test_play_button_unicode_icons(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert "&#x25B6;".encode() in data   # ▶ play triangle in HTML
+    assert "_togglePlay".encode() in data
+
+
+def test_speed_select_options(tmp_path):
+    data = _get_editor_html(tmp_path)
+    for opt in (b"0.25", b"0.5", b"2", b"4"):
+        assert opt in data
+    assert b'value="1" selected' in data
+
+
+def test_playback_js_globals_in_html(tmp_path):
+    data = _get_editor_html(tmp_path)
+    for sym in (b"_playing", b"_frameInFlight", b"_speedMult", b"_playTick"):
+        assert sym in data
+
+
+def test_step_frame_buttons(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"_stepFrame(-1)" in data
+    assert b"_stepFrame(1)" in data
+
+
+def test_space_key_handler_in_html(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"e.key === ' '" in data
+    assert b"_togglePlay" in data
+
+
+def test_frameinflight_guard_wired_both_directions(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"_frameInFlight = true" in data
+    assert b"_frameInFlight = false" in data

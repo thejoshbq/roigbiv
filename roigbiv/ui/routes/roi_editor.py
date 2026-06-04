@@ -257,7 +257,7 @@ _EDITOR_HTML = """\
     #btn-save { background: #0d6efd; border-color: #0d6efd; color: #fff; }
     #btn-save:hover { background: #0b5ed7; }
     #status { font-size: 11px; color: #888; margin-left: auto; min-width: 200px; text-align: right; }
-    .a9s-annotation .a9s-inner { stroke: #00d4ff !important; stroke-width: 1.5px !important;
+    .a9s-annotation .a9s-inner { stroke: #00d4ff !important; stroke-width: 3px !important;
                                   fill: rgba(0,212,255,0.12) !important; }
     .a9s-annotation.selected .a9s-inner { stroke: #ff6b6b !important;
                                            fill: rgba(255,107,107,0.18) !important; }
@@ -276,6 +276,13 @@ _EDITOR_HTML = """\
     #scrubber-thumb:active { cursor: grabbing; }
     #frame-label { min-width: 130px; text-align: right; white-space: nowrap; }
     #image-mode  { font-size: 10px; color: #555; min-width: 80px; }
+    /* ── Playback controls ───────────────────────────────────────── */
+    #playback-controls { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+    .btn-step { padding: 2px 6px; font-size: 11px; min-width: 24px; }
+    #btn-play { min-width: 28px; padding: 2px 6px; font-size: 13px; line-height: 1; }
+    #btn-play.playing { background: #0077b6; border-color: #0077b6; color: #fff; }
+    #speed-select { background: #1e2030; border: 1px solid #3d3d5e; color: #8ecae6;
+                    font-size: 10px; border-radius: 3px; padding: 2px 4px; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -308,6 +315,18 @@ _EDITOR_HTML = """\
       <button id="btn-proj" onclick="_returnToProjection()"
               title="Return to mean projection (Home)"
               style="display:none;padding:2px 7px;font-size:10px;">&#x21A9; proj</button>
+      <div id="playback-controls">
+        <button class="btn-step" title="Previous frame" onclick="_stepFrame(-1)">&#x25C4;</button>
+        <button id="btn-play" title="Play / Pause (Space)" onclick="_togglePlay()">&#x25B6;</button>
+        <button class="btn-step" title="Next frame" onclick="_stepFrame(1)">&#x25BA;</button>
+        <select id="speed-select" title="Playback speed" onchange="_onSpeedChange(this.value)">
+          <option value="0.25">0.25&#xD7;</option>
+          <option value="0.5">0.5&#xD7;</option>
+          <option value="1" selected>1&#xD7;</option>
+          <option value="2">2&#xD7;</option>
+          <option value="4">4&#xD7;</option>
+        </select>
+      </div>
       <div id="scrubber-track">
         <div id="scrubber-fill"></div>
         <div id="scrubber-thumb"></div>
@@ -356,12 +375,13 @@ viewer.addHandler('open', function() {
   anno = OpenSeadragon.Annotorious(viewer, {
     drawOnSingleClick: true,
     disableEditor: true,
+    allowEmpty: true,
     widgets: [],
   });
 
   anno.on('selectAnnotation',  (a) => { selectedAnnotation = a; setStatus('ROI selected — press Delete to remove'); });
   anno.on('cancelSelected',    ()  => { selectedAnnotation = null; setStatus('Ready'); });
-  anno.on('createAnnotation',  (a) => { setMode('select'); setStatus('ROI added — saving…'); _scheduleSave(); });
+  anno.on('createAnnotation',  (a) => { setStatus('ROI added — saving… (draw another or click Select when done)'); _scheduleSave(); });
   anno.on('updateAnnotation',  ()  => { setStatus('ROI updated — saving…'); _scheduleSave(); });
   anno.on('deleteAnnotation',  ()  => { selectedAnnotation = null; setStatus('ROI deleted — saving…'); _scheduleSave(); });
 
@@ -433,14 +453,16 @@ function _updateZoomIndicator() {
 }
 
 // ── Auto-save state ────────────────────────────────────────────────────────────
-let _saveTimer = null;
+let _saveTimer    = null;
 let _saveInFlight = false;
+let _savePending  = false;   // queued save requested while one was in-flight
 
 function _scheduleSave() {
   if (_saveTimer !== null) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
-    if (!_saveInFlight) saveAnnotations();
+    if (_saveInFlight) { _savePending = true; }
+    else { saveAnnotations(); }
   }, 800);
 }
 
@@ -448,6 +470,7 @@ function saveAnnotations() {
   if (!anno || _saveInFlight) return;
   const annotations = anno.getAnnotations();
   _saveInFlight = true;
+  _savePending  = false;
   setStatus('Saving…');
   document.getElementById('btn-save').disabled = true;
   fetch(SAVE_URL, {
@@ -470,6 +493,9 @@ function saveAnnotations() {
       _saveInFlight = false;
       document.getElementById('btn-save').disabled = false;
       setStatus('Save failed: ' + e);
+    })
+    .finally(() => {
+      if (_savePending) { _savePending = false; saveAnnotations(); }
     });
 }
 // ── Scrubber ──────────────────────────────────────────────────────────────────
@@ -477,6 +503,11 @@ let _nFrames      = 0;
 let _currentFrame = -1;   // -1 = showing mean projection
 let _currentFps   = 0;
 let _scrubDebounce = null;
+let _playing       = false;
+let _frameInFlight = false;   // true while viewer.open() is pending — prevents request stacking
+let _speedMult     = 1.0;
+let _rafId         = null;
+let _lastFrameTime = 0;
 
 function _setFrameDisplay(n) {
   const pct = _nFrames > 1 ? (n / (_nFrames - 1)) * 100 : 0;
@@ -507,6 +538,7 @@ function _scrubToFrame(n) {
 }
 
 function _returnToProjection() {
+  if (_playing) _togglePlay();
   if (_currentFrame < 0) return;
   _currentFrame = -1;
   document.getElementById('scrubber-fill').style.width = '0%';
@@ -523,6 +555,54 @@ function _returnToProjection() {
   viewer.addHandler('open', restoreVp);
   viewer.open({ type: 'image', url: IMAGE_URL });
 }
+
+function _togglePlay() {
+  if (!_nFrames) return;
+  _playing = !_playing;
+  const btn = document.getElementById('btn-play');
+  if (_playing) {
+    btn.textContent = '⏸';
+    btn.classList.add('playing');
+    if (_currentFrame < 0) _currentFrame = 0;
+    _lastFrameTime = performance.now();
+    _rafId = requestAnimationFrame(_playTick);
+  } else {
+    btn.textContent = '▶';
+    btn.classList.remove('playing');
+    if (_rafId !== null) { cancelAnimationFrame(_rafId); _rafId = null; }
+  }
+}
+
+function _playTick(ts) {
+  if (!_playing) return;
+  const effectiveFps = (_currentFps > 0 ? _currentFps : 7.5) * _speedMult;
+  const msPerFrame = 1000 / effectiveFps;
+  if (!_frameInFlight && (ts - _lastFrameTime) >= msPerFrame) {
+    _lastFrameTime = ts;
+    const next = (_currentFrame + 1) % _nFrames;
+    _currentFrame = next;
+    _setFrameDisplay(next);
+    _frameInFlight = true;
+    const savedBounds = viewer.viewport.getBounds(true);
+    const onOpen = function() {
+      viewer.viewport.fitBounds(savedBounds, true);
+      viewer.removeHandler('open', onOpen);
+      _frameInFlight = false;
+    };
+    viewer.addHandler('open', onOpen);
+    viewer.open({ type: 'image', url: FRAME_URL_BASE + '&n=' + next });
+  }
+  _rafId = requestAnimationFrame(_playTick);
+}
+
+function _stepFrame(delta) {
+  if (!_nFrames) return;
+  if (_playing) _togglePlay();
+  const next = _currentFrame < 0 ? 0 : Math.max(0, Math.min(_currentFrame + delta, _nFrames - 1));
+  _scrubToFrame(next);
+}
+
+function _onSpeedChange(val) { _speedMult = parseFloat(val) || 1.0; }
 
 function _initScrubber() {
   if (_nFrames > 0) return;
@@ -543,7 +623,9 @@ function _initScrubber() {
         return Math.round(pct * (_nFrames - 1));
       }
       track.addEventListener('pointerdown', (e) => {
-        e.preventDefault(); _dragging = true; track.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        if (_playing) _togglePlay();
+        _dragging = true; track.setPointerCapture(e.pointerId);
         _scrubToFrame(_posToFrame(e.clientX));
       });
       track.addEventListener('pointermove',   (e) => { if (_dragging) _scrubToFrame(_posToFrame(e.clientX)); });
@@ -552,9 +634,16 @@ function _initScrubber() {
 
       document.addEventListener('keydown', (e) => {
         if (!_nFrames || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.key === ' ') {
+          const tag = document.activeElement && document.activeElement.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+          e.preventDefault();
+          _togglePlay();
+          return;
+        }
         const step = e.shiftKey ? 10 : 1;
-        if (e.key === 'ArrowRight') { e.preventDefault(); _scrubToFrame(_currentFrame < 0 ? 0 : _currentFrame + step); }
-        if (e.key === 'ArrowLeft')  { e.preventDefault(); if (_currentFrame >= 0) _scrubToFrame(_currentFrame - step); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); if (_playing) _togglePlay(); _scrubToFrame(_currentFrame < 0 ? 0 : _currentFrame + step); }
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); if (_playing) _togglePlay(); if (_currentFrame >= 0) _scrubToFrame(_currentFrame - step); }
         if (e.key === 'Home')       { e.preventDefault(); _returnToProjection(); }
       });
     })
