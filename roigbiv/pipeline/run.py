@@ -339,10 +339,15 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # Frame-size sanity warn: defaults are tuned for 512×512 GRIN. On larger
     # frames (prism, 1024×1024) the GRIN diameter starves Cellpose and the
     # Gate 1 area ceiling clips real cells. Catches silent misuse at startup.
+    # The same peek captures (T, H, W) for the disk-budget preflight below.
+    _peek_shape: tuple | None = None
+    _peek_pages: int | None = None
     try:
         import tifffile as _tf
         with _tf.TiffFile(str(tif_path)) as _peek:
             _shape = _peek.pages[0].shape
+            _peek_pages = len(_peek.pages)
+        _peek_shape = _shape
         _max_dim = max(_shape[-2], _shape[-1])
         if _max_dim > 768 and cfg.diameter < 25 and not cfg.diameter_auto:
             print(
@@ -368,6 +373,39 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if rp.enabled and rp.start_stage != "foundation":
         print(f"Resume: starting from {rp.start_stage} "
               f"(prior outputs in {output_dir.name})", flush=True)
+
+    # Surface legacy dense residual_S*.dat files (pre-virtual pipeline). They
+    # are never read now but eat disk — the same full-disk condition behind the
+    # original SIGBUS. Non-destructive: warns and tells the user what to rm.
+    from roigbiv.pipeline.resume import warn_stale_dense_residuals
+    _stale = warn_stale_dense_residuals(output_dir)
+    if _stale:
+        warnings.append(_stale)
+
+    # ── Disk-budget preflight ─────────────────────────────────────────────
+    # Fail fast (or warn) on a near-full disk before Foundation spends ~20 min
+    # writing data.bin only to SIGBUS/ENOSPC. Skipped when Foundation is being
+    # resumed (data.bin already on disk) or when we couldn't peek the stack.
+    if rp.should_run("foundation") and _peek_shape is not None and _peek_pages:
+        try:
+            from roigbiv.pipeline.diskguard import preflight_disk_budget
+            _T = int(_peek_pages)
+            _H, _W = int(_peek_shape[-2]), int(_peek_shape[-1])
+            _px = _T * _H * _W
+            _stage4_temp = (2 * _px * 4) if getattr(cfg, "enable_stage_4", True) else 0
+            _warn = preflight_disk_budget(
+                output_dir,
+                data_bin_bytes=_px * 2,          # int16 Suite2p substrate
+                stage4_temp_bytes=_stage4_temp,  # detrend + bandpass float32 temps
+                label=f"pipeline run ({tif_path.name})",
+            )
+            if _warn:
+                print(f"WARN: {_warn}", flush=True)
+                warnings.append(_warn)
+        except RuntimeError:
+            raise
+        except BaseException:  # noqa: BLE001 — preflight is best-effort, never fatal-by-bug
+            pass
 
     # Locals downstream code reads regardless of whether the stage ran or
     # was skipped. Skipped-stage paths repopulate these from on-disk reports.

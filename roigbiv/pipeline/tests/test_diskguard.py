@@ -12,7 +12,10 @@ import types
 
 import pytest
 
-from roigbiv.pipeline.diskguard import ensure_free_space
+from roigbiv.pipeline.diskguard import (
+    ensure_free_space,
+    preflight_disk_budget,
+)
 
 
 def test_raises_when_insufficient_space(tmp_path, monkeypatch):
@@ -47,3 +50,39 @@ def test_message_names_label_and_sizes(tmp_path, monkeypatch):
     msg = str(exc.value)
     assert "residual_S" in msg
     assert "GB" in msg
+
+
+def _fake_statvfs(free_bytes_value):
+    return types.SimpleNamespace(f_bavail=free_bytes_value, f_frsize=1,
+                                 f_bfree=free_bytes_value)
+
+
+def test_preflight_raises_below_data_bin_floor(tmp_path, monkeypatch):
+    # Only 1 KB free, but data.bin alone needs 1 MB → hard failure, no run.
+    monkeypatch.setattr(os, "statvfs", lambda p: _fake_statvfs(1_000))
+    with pytest.raises(RuntimeError, match="Insufficient disk"):
+        preflight_disk_budget(
+            tmp_path, data_bin_bytes=1_000_000, stage4_temp_bytes=2_000_000,
+            label="unit-test",
+        )
+
+
+def test_preflight_warns_in_soft_band(tmp_path, monkeypatch):
+    # Enough for data.bin (1 MB) but not the full high-water (3 MB) → warn,
+    # no raise.
+    monkeypatch.setattr(os, "statvfs", lambda p: _fake_statvfs(1_500_000))
+    warn = preflight_disk_budget(
+        tmp_path, data_bin_bytes=1_000_000, stage4_temp_bytes=2_000_000,
+        label="unit-test",
+    )
+    assert warn is not None
+    assert "Low disk" in warn
+
+
+def test_preflight_silent_when_ample(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "statvfs", lambda p: _fake_statvfs(10_000_000))
+    warn = preflight_disk_budget(
+        tmp_path, data_bin_bytes=1_000_000, stage4_temp_bytes=2_000_000,
+        label="unit-test",
+    )
+    assert warn is None

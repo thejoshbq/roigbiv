@@ -21,6 +21,7 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
+from typing import Optional
 
 # Require a little headroom beyond the exact byte count so a write that lands
 # right at the filesystem boundary (plus FS metadata) still succeeds.
@@ -85,3 +86,59 @@ def ensure_free_space(path: Path, nbytes: int, label: str = "allocation") -> Non
         raise
     else:
         os.close(fd)
+
+
+def free_bytes(path: Path) -> int:
+    """Bytes available to an unprivileged writer at ``path``'s filesystem."""
+    parent = Path(path)
+    if not parent.is_dir():
+        parent = parent.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    st = os.statvfs(str(parent))
+    return st.f_bavail * st.f_frsize
+
+
+def preflight_disk_budget(
+    output_dir: Path,
+    *,
+    data_bin_bytes: int,
+    stage4_temp_bytes: int = 0,
+    label: str = "pipeline run",
+) -> Optional[str]:
+    """Fail-fast disk check at pipeline entry, before any minutes-long work.
+
+    Two thresholds, chosen to minimise false refusals (stages free their
+    transients between steps, so the naive sum-of-all-stages over-estimates):
+
+    * **Hard floor** — ``data_bin_bytes`` (the int16 Suite2p substrate that
+      *must* persist for the whole run). Below this the run cannot even lay
+      down its foundation; raise ``RuntimeError`` now instead of SIGBUS-ing or
+      half-writing 20 minutes in.
+    * **Soft high-water** — ``data_bin_bytes + stage4_temp_bytes`` (data.bin
+      held resident while Stage 4 writes its detrend/bandpass float32 temps).
+      Below this the run *probably* fits but could fail late; return a warning
+      string so the caller can surface it without aborting.
+
+    Returns ``None`` if there is ample space, or a human-readable warning
+    string for the soft case. Raises ``RuntimeError`` for the hard case.
+    """
+    output_dir = Path(output_dir)
+    free = free_bytes(output_dir)
+    hard = int(data_bin_bytes * _SAFETY_FACTOR)
+    soft = int((data_bin_bytes + stage4_temp_bytes) * _SAFETY_FACTOR)
+
+    if free < hard:
+        raise RuntimeError(
+            f"Insufficient disk for {label}: data.bin alone needs "
+            f"{data_bin_bytes / 1e9:.1f} GB (+5% = {hard / 1e9:.1f} GB), "
+            f"only {free / 1e9:.1f} GB free at {output_dir}. "
+            f"Free disk space and re-run."
+        )
+    if free < soft:
+        return (
+            f"Low disk for {label}: {free / 1e9:.1f} GB free at {output_dir}; "
+            f"peak transient (data.bin + Stage 4 temps) is ~{soft / 1e9:.1f} GB. "
+            f"The run may fail late in Stage 4 — free space or pass "
+            f"--no-stage-4 if you hit ENOSPC."
+        )
+    return None

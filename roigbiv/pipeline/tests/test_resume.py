@@ -584,3 +584,25 @@ def test_should_run_with_disabled_plan_runs_everything():
     plan = ResumePlan()
     for step in _ALL_STEPS:
         assert plan.should_run(step) is True
+
+
+# ── warn_stale_dense_residuals ─────────────────────────────────────────────
+
+def test_warn_stale_dense_residuals_none_when_clean(tmp_path):
+    assert resume.warn_stale_dense_residuals(tmp_path) is None
+
+
+def test_warn_stale_dense_residuals_flags_legacy_dat(tmp_path, capsys):
+    (tmp_path / "residual_S.dat").write_bytes(b"\x00" * 2048)
+    (tmp_path / "residual_S2.dat").write_bytes(b"\x00" * 1024)
+    # A non-matching file must not be flagged.
+    (tmp_path / "svd_factors.npz").write_bytes(b"\x00" * 16)
+
+    msg = resume.warn_stale_dense_residuals(tmp_path)
+    assert msg is not None
+    assert "residual_S.dat" in msg and "residual_S2.dat" in msg
+    assert "svd_factors" not in msg
+    # Non-destructive: the files are still present.
+    assert (tmp_path / "residual_S.dat").exists()
+    assert (tmp_path / "residual_S2.dat").exists()
+    assert "WARN:" in capsys.readouterr().out

@@ -268,8 +268,14 @@ def compute_background_separation(
     del M_bin  # free ~5 GB
 
     # 3. Persist SVD factors — the irreplaceable substrate for on-demand
-    #    residual reconstruction (data.bin is the other half).
+    #    residual reconstruction (data.bin is the other half). Guard the write:
+    #    np.savez surfaces ENOSPC as a catchable OSError (not a memmap SIGBUS),
+    #    but pre-checking keeps the failure mode uniform with the rest of the
+    #    pipeline and fails before the interpolation/summary work below.
+    from roigbiv.pipeline.diskguard import ensure_free_space
     svd_factors_path = output_dir / "svd_factors.npz"
+    svd_nbytes = int(U.nbytes + S.nbytes + V_bin.nbytes) + 4096  # +npz/zip overhead
+    ensure_free_space(svd_factors_path, svd_nbytes, label="svd_factors.npz")
     np.savez(str(svd_factors_path),
              U=U, S=S, V_bin=V_bin, bin_size=np.int32(bin_size), T=np.int32(T))
 

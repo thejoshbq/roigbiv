@@ -275,6 +275,35 @@ def _residual_path(output_dir: Path, stage_idx: int) -> tuple[Path, Path]:
     )
 
 
+def warn_stale_dense_residuals(output_dir: Path) -> Optional[str]:
+    """Flag legacy dense ``residual_S*.dat`` files from the pre-virtual pipeline.
+
+    The current pipeline never materializes a dense residual — it reconstructs
+    S = M − L − Σsources on demand (see ``residual.py``). A workspace carried
+    over from an older run can still hold multi-gigabyte ``residual_S{,1,2,3}.dat``
+    files that the new code path will never read, silently eating disk and
+    inflating the very full-disk condition that caused the original SIGBUS.
+
+    Returns a warning string (also printed) listing the stale files and their
+    total size, or ``None`` if there are none. Non-destructive: it never
+    deletes — it tells the user what to ``rm``.
+    """
+    output_dir = Path(output_dir)
+    stale = sorted(p for p in output_dir.glob("residual_S*.dat") if p.is_file())
+    if not stale:
+        return None
+    total = sum(p.stat().st_size for p in stale)
+    names = ", ".join(p.name for p in stale)
+    msg = (
+        f"Stale dense residual file(s) found in {output_dir} ({names}; "
+        f"{total / 1e9:.1f} GB total). The current pipeline reconstructs the "
+        f"residual virtually and never reads these — they are safe to delete: "
+        f"rm {output_dir}/residual_S*.dat"
+    )
+    print(f"WARN: {msg}", flush=True)
+    return msg
+
+
 def _verify_foundation_residual(
     meta_path: Path, svd_factors_path: Path, data_bin_path: Path,
 ) -> tuple[int, int, int]:
