@@ -18,15 +18,15 @@ Implementation notes (Plan agent A3/A4):
   - NNLS fallback runs ONLY on ROIs flagged by post-hoc validation, and
     only over their LOCAL mask pixels — this reduces each NNLS call from
     30k×150 to ~200×1.
-  - Rank-1 subtraction streams through the S memmap per temporal chunk so
-    the full (T, H, W) residual never lives in RAM.
-  - Writes a new memmap at residual_S1.dat; the original residual_S.dat is
-    preserved for validation and future re-subtraction.
+  - Rank-1 subtraction is lazy: it appends a SourceLayer to a ResidualView
+    rather than materializing a new dense residual. Reading any chunk
+    reconstructs S − Σsources on demand, so the full (T, H, W) residual never
+    lives in RAM or on disk. Only a small {output_name}.sources.npz (profiles +
+    traces) is persisted, for --resume.
 """
 from __future__ import annotations
 
 import json
-import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -270,15 +270,15 @@ def solve_traces_robust_irls(
 
 
 def estimate_traces_simultaneous(
-    residual_S_path: Path,
-    shape: tuple,
+    view,
     profiles: list[np.ndarray],
     cfg: PipelineConfig,
 ) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
     """Estimate all traces simultaneously via GPU-chunked normal equations.
 
-    Thin adapter around :func:`solve_traces_from_chunks` that reads a float32
-    (T, H, W) memmap and yields union-indexed chunks to the shared solver.
+    Thin adapter around :func:`solve_traces_from_chunks` that reconstructs the
+    residual in temporal chunks from a :class:`ResidualView` and yields
+    union-indexed chunks to the shared solver.
 
     Returns
     -------
@@ -286,23 +286,15 @@ def estimate_traces_simultaneous(
     union_flat_idx  : (P,) int64 for downstream subtraction
     union_yx        : (union_y, union_x) for downstream subtraction
     """
-    T, H, L = shape
+    T, H, L = view.shape
     design, union_flat_idx, union_yx = _build_union_design(profiles)
-
-    S_mm = np.memmap(str(residual_S_path), dtype=np.float32, mode="r",
-                     shape=(T, H, L))
     chunk = int(cfg.subtract_chunk_frames)
 
     def _iter():
         for t0 in range(0, T, chunk):
             t1 = min(t0 + chunk, T)
             cs = t1 - t0
-            # Materialize the chunk in RAM first (one sequential read),
-            # THEN fancy-index. np.asarray on a matching-dtype memmap returns
-            # the memmap view, so the original `[:, union_flat_idx]` was doing
-            # random-access reads on the file — disastrous on slow/external
-            # storage. Same memmap-view pitfall as the Phase C validator.
-            chunk_ram = np.array(S_mm[t0:t1], dtype=np.float32, copy=True)
+            chunk_ram = view.read_chunk(t0, t1)
             S_chunk = chunk_ram.reshape(cs, H * L)[:, union_flat_idx]
             yield t0, t1, S_chunk
 
@@ -310,7 +302,6 @@ def estimate_traces_simultaneous(
         traces = solve_traces_robust_irls(design, T, _iter(), cfg)
     else:
         traces = solve_traces_from_chunks(design, T, _iter(), cfg)
-    del S_mm
     return traces, union_flat_idx, union_yx
 
 
@@ -319,65 +310,38 @@ def estimate_traces_simultaneous(
 # ─────────────────────────────────────────────────────────────────────────
 
 def subtract_sources(
-    residual_S_path: Path,
-    residual_out_path: Path,
-    shape: tuple,
+    view,
     profiles: list[np.ndarray],
     traces: np.ndarray,
-    chunk: int = 500,
-) -> None:
-    """Stream rank-1 subtraction from residual_S_path into residual_out_path.
+    stage_idx: int = 0,
+):
+    """Append a rank-1 subtraction layer to a :class:`ResidualView`.
 
-    For each temporal chunk t in [t0, t1):
-        residual_out[t] = residual_S[t] - Σ_i w_i[y_i, x_i] * c_i[t]   at mask_i pixels
+    Instead of materializing a new dense residual on disk, this records the
+    subtraction as a :class:`~roigbiv.pipeline.residual.SourceLayer` and returns
+    an advanced view. Reading any chunk of the returned view yields
 
-    We compute this over the union of all ROI pixels in one batched operation
-    per chunk using np.einsum over (N_rois, P_union) × (N_rois, cs) → (P_union, cs).
+        S_new(p, t) = S_in(p, t) − Σ_i w_i(p) · c_i(t)   for p in the union pixels
+
+    — exactly the arithmetic the old streaming write produced (``ResidualView``
+    applies ``out[:, union] -= traces.T @ W_design`` per chunk), so reconstructed
+    values match the previously-materialized ``.dat`` within float32 tolerance.
 
     Parameters
     ----------
-    residual_S_path   : input memmap path (float32, shape)
-    residual_out_path : output memmap path (will be created, float32, same shape)
-    profiles          : list of N (H, W) float32 profile maps
-    traces            : (N, T) float32
+    view     : input ResidualView (stage n)
+    profiles : list of N (H, W) float32 profile maps
+    traces   : (N, T) float32
+    stage_idx: detection stage producing this layer (provenance only)
+
+    Returns
+    -------
+    ResidualView advanced to stage n+1.
     """
-    T, H, W = shape
-    S_in = np.memmap(str(residual_S_path), dtype=np.float32, mode="r", shape=(T, H, W))
-
-    # Create output fresh (no copyfile). On slow drives the previous design
-    # spent 8.6 GB of extra write just to copy the input, then did an
-    # in-place read-modify-write over the memmap union indices on top — ~34
-    # GB of I/O to produce an 8.6 GB output. Stream-read → subtract in RAM →
-    # stream-write instead: exactly one 8.6 GB sequential read + one 8.6 GB
-    # sequential write per call.
-    S_out = np.memmap(str(residual_out_path), dtype=np.float32, mode="w+", shape=(T, H, W))
-
-    # Stack profile weights over union of ALL ROI pixels
-    union_mask = np.zeros((H, W), dtype=bool)
-    for p in profiles:
-        union_mask |= (p > 0)
-    union_flat = np.flatnonzero(union_mask.ravel())  # (P,)
-    P_union = union_flat.size
-    N = len(profiles)
-
-    W_design = np.zeros((N, P_union), dtype=np.float32)
-    for i, p in enumerate(profiles):
-        W_design[i] = p.ravel()[union_flat]
-
-    for t0 in range(0, T, chunk):
-        t1 = min(t0 + chunk, T)
-        cs = t1 - t0
-        # Materialize chunk in RAM (sequential read from S_in), modify in
-        # place, write sequentially to S_out. Matches the same memmap-copy
-        # pattern that fixed _validate_streaming and estimate_traces_*.
-        chunk_ram = np.array(S_in[t0:t1], dtype=np.float32, copy=True)
-        flat = chunk_ram.reshape(cs, H * W)
-        sub = W_design.T @ traces[:, t0:t1]                       # (P_union, cs)
-        flat[:, union_flat] -= sub.T
-        S_out[t0:t1] = chunk_ram
-
-    S_out.flush()
-    del S_in, S_out
+    # Union of ALL ROI pixels + per-ROI weight design (N, P).
+    design, union_flat, _union_yx = _build_union_design(profiles)
+    W_design = np.ascontiguousarray(design.T)   # (N, P)
+    return view.with_source(union_flat, W_design, traces, stage_idx=stage_idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -398,8 +362,7 @@ def _compute_surround_mask(mask: np.ndarray, inner: int, outer: int,
 
 
 def _validate_streaming(
-    residual_after_path: Path,
-    shape: tuple,
+    view_after,
     rois: list[ROI],
     traces: np.ndarray,
     cfg: PipelineConfig,
@@ -408,10 +371,9 @@ def _validate_streaming(
     """Single streaming-pass validator (Phase C.1).
 
     Replaces the 5N-memmap-scan hotpath of the original ``validate_subtraction``
-    with one temporal pass over ``(T, H, W)`` that accumulates float64 moments
-    for every ROI simultaneously. Disk reads drop from 5N·(T·n_pix) to one
-    sequential pass of the full (T, H, W) float32 memmap; this is the phase
-    C.1 win documented in the plan.
+    with one temporal pass over the post-subtraction residual view that
+    accumulates float64 moments for every ROI simultaneously. Each chunk is
+    reconstructed on demand from ``view_after``.
 
     When ``subset_indices`` is provided, only those ROIs (indices into
     ``rois``/``traces``) are validated — used by the post-NNLS re-validate so
@@ -421,7 +383,7 @@ def _validate_streaming(
     -------
     dict {roi_label_id: {mean_ratio, std_ratio, anticorr_max, pass}}
     """
-    T, H, W = shape
+    T, H, W = view_after.shape
     N = len(rois)
     if N == 0 or T <= 0:
         return {}
@@ -481,19 +443,14 @@ def _validate_streaming(
     sum_a2 = {i: 0.0 for i in indices}
     sum_ab = {i: 0.0 for i in indices}
 
-    S_mm = np.memmap(str(residual_after_path), dtype=np.float32, mode="r",
-                     shape=(T, H, W))
     chunk = max(int(cfg.subtract_chunk_frames), 1)
-    try:
-        for t0 in range(0, T, chunk):
-            t1 = min(t0 + chunk, T)
-            cs = t1 - t0
-            # Force a contiguous in-RAM copy. np.asarray / np.array with
-            # copy=False would keep flat as a memmap view, so every
-            # flat[:, mask_flat[i]] fancy-index below would re-read disk —
-            # defeating the whole point of streaming.
-            flat = np.array(S_mm[t0:t1], dtype=np.float32, copy=True).reshape(cs, H * W)
-            for i in indices:
+    for t0 in range(0, T, chunk):
+        t1 = min(t0 + chunk, T)
+        cs = t1 - t0
+        # Reconstruct the chunk in RAM (contiguous) so the per-ROI
+        # flat[:, mask_flat[i]] fancy-indexes below are pure in-memory ops.
+        flat = view_after.read_chunk(t0, t1).reshape(cs, H * W)
+        for i in indices:
                 if i in empty_mask:
                     continue
                 mvals = flat[:, mask_flat[i]].astype(np.float64, copy=False)
@@ -511,8 +468,6 @@ def _validate_streaming(
                     svals = flat[:, sf].astype(np.float64, copy=False)
                     sum_s[i] += float(svals.sum())
                     sumsq_s[i] += float((svals * svals).sum())
-    finally:
-        del S_mm
 
     report: dict = {}
     T_f = float(T)
@@ -578,9 +533,7 @@ def _validate_streaming(
 
 
 def validate_subtraction(
-    residual_before_path: Path,
-    residual_after_path: Path,
-    shape: tuple,
+    view_after,
     rois: list[ROI],
     traces: np.ndarray,
     cfg: PipelineConfig,
@@ -599,9 +552,7 @@ def validate_subtraction(
     -------
     dict {roi_label_id: {mean_ratio, std_ratio, anticorr_max, pass}}
     """
-    # `residual_before_path` is in the signature for API stability but neither
-    # the current streaming implementation nor the prior per-ROI loop reads it.
-    return _validate_streaming(residual_after_path, shape, rois, traces, cfg)
+    return _validate_streaming(view_after, rois, traces, cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -609,9 +560,7 @@ def validate_subtraction(
 # ─────────────────────────────────────────────────────────────────────────
 
 def _nnls_refine_flagged(
-    residual_before_path: Path,
-    residual_after_path: Path,
-    shape: tuple,
+    view_before,
     rois: list[ROI],
     profiles: list[np.ndarray],
     traces: np.ndarray,
@@ -621,7 +570,7 @@ def _nnls_refine_flagged(
     """Re-estimate traces for flagged ROIs only, over their LOCAL pixel support.
 
     For each flagged ROI i:
-      - pull S_before at mask_i pixels: shape (T, P_i) where P_i ≈ 100-300
+      - reconstruct S_before at mask_i pixels: shape (T, P_i) where P_i ≈ 100-300
       - solve NNLS per frame: profile_i[mask_i] × c_i(t) ≈ S(mask_i, t)
         (single-variable NNLS reduces to max(0, lstsq(w, s)))
       - replace traces[i] with the refined trace
@@ -629,12 +578,6 @@ def _nnls_refine_flagged(
 
     Returns updated traces (N, T).
     """
-    from scipy.optimize import nnls
-
-    T, H, W = shape
-    S_before = np.memmap(str(residual_before_path), dtype=np.float32, mode="r",
-                         shape=(T, H, W))
-
     traces_refined = traces.copy()
     for idx in flagged_indices:
         roi = rois[idx]
@@ -647,11 +590,10 @@ def _nnls_refine_flagged(
         # Single-variable NNLS with design vector w has closed form:
         #   c(t) = max(0, (w.T @ s_t) / (w.T @ w))
         wtw = float(w @ w)
-        S_local = S_before[:, ys, xs]  # (T, P_i)
+        S_local = view_before.read_pixels(ys, xs)  # (T, P_i)
         c_raw = (S_local @ w) / wtw
         traces_refined[idx] = np.maximum(c_raw, 0.0).astype(np.float32)
 
-    del S_before
     return traces_refined
 
 
@@ -660,78 +602,86 @@ def _nnls_refine_flagged(
 # ─────────────────────────────────────────────────────────────────────────
 
 def compute_std_map(
-    residual_path: Path,
-    shape: tuple,
+    view,
     chunk: int = 500,
 ) -> np.ndarray:
-    """Per-pixel std of a (T, H, W) float32 memmap, streamed in temporal chunks.
+    """Per-pixel std of a residual view, reconstructed in temporal chunks.
 
     Used as the profile_source for Stage 2+ subtractions. After earlier stages
     have subtracted their detected neurons, the surviving per-pixel variance
     highlights the neurons that THIS stage will discover — so we must
     recompute, not reuse std from the original residual (see D2 in the plan).
     """
-    T, H, W = shape
-    mm = np.memmap(str(residual_path), dtype=np.float32, mode="r", shape=(T, H, W))
+    T, H, W = view.shape
     sum_ = np.zeros((H, W), dtype=np.float64)
     sumsq = np.zeros((H, W), dtype=np.float64)
     for t0 in range(0, T, chunk):
         t1 = min(t0 + chunk, T)
-        c = np.asarray(mm[t0:t1], dtype=np.float64)
+        c = view.read_chunk(t0, t1).astype(np.float64)
         sum_ += c.sum(axis=0)
         sumsq += (c ** 2).sum(axis=0)
-    del mm
     mean = sum_ / T
     var = np.maximum(sumsq / T - mean ** 2, 0.0)
     return np.sqrt(var).astype(np.float32)
 
 
 def run_source_subtraction(
-    residual_S_path: Path,
-    shape: tuple,
+    view_in,
     profile_source: np.ndarray,
     rois: list[ROI],
     output_dir: Path,
     cfg: PipelineConfig,
+    *,
+    stage_idx: int,
     output_name: str = "residual_S1",
-    delete_input: bool = False,
-) -> tuple[Path, dict, np.ndarray]:
+) -> tuple[object, dict, np.ndarray]:
     """Full subtraction pipeline: profiles → traces → subtract → validate → NNLS fallback.
+
+    Records the subtraction as a new :class:`~roigbiv.pipeline.residual.SourceLayer`
+    on a lazily-advanced :class:`ResidualView` — nothing is materialized to disk.
+    The new layer is persisted to ``{output_name}.sources.npz`` (a few MB) plus a
+    ``{output_name}.meta.json`` sidecar so ``--resume`` can rebuild the chain.
 
     Parameters
     ----------
-    residual_S_path : input residual (T, H, W) float32 memmap
-    shape           : (T, H, W)
-    profile_source  : (H, W) spatial activity map for profile estimation
-                      (typically std_S; see estimate_spatial_profiles docstring)
-    rois            : ROIs to subtract (typically accepted + flagged from Gate 1)
-    output_dir      : where to write outputs
-    cfg             : PipelineConfig
-    output_name     : base name for output files. Default 'residual_S1' preserves
-                      Phase 1B behavior; pass 'residual_S2' / 'residual_S3' for
-                      subsequent stages to avoid filename collisions.
-    delete_input    : if True, unlink residual_S_path after validation + NNLS
-                      complete successfully. The caller is responsible for
-                      ensuring nothing downstream still references the input.
+    view_in        : input residual view (stage n)
+    profile_source : (H, W) spatial activity map for profile estimation
+                     (typically std_S; see estimate_spatial_profiles docstring)
+    rois           : ROIs to subtract (typically accepted + flagged from Gate)
+    output_dir     : where to write the sources/report sidecars
+    cfg            : PipelineConfig
+    stage_idx      : detection stage producing this layer (provenance)
+    output_name    : base name for sidecars ('residual_S1' / 'residual_S2' / ...)
 
     Returns
     -------
-    residual_out_path   : Path to (T, H, W) float32 memmap of post-subtraction residual
-    validation_report   : dict keyed by ROI label_id
-    traces              : (N, T) float32 — estimated traces (for roi.trace population)
+    view_out          : ResidualView advanced to stage n+1 (== view_in if no ROIs)
+    validation_report : dict keyed by ROI label_id
+    traces            : (N, T) float32 — estimated traces (for roi.trace population)
     """
-    residual_out_path = output_dir / f"{output_name}.dat"
+    from roigbiv.pipeline.diskguard import ensure_free_space
+
+    shape = view_in.shape
     meta_path = output_dir / f"{output_name}.meta.json"
+    sources_path = output_dir / f"{output_name}.sources.npz"
     report_path = output_dir / f"subtraction_report_{output_name}.json"
 
     if not rois:
-        # No ROIs to subtract; copy input → output unchanged
-        shutil.copyfile(str(residual_S_path), str(residual_out_path))
-        meta = {"shape": list(shape), "dtype": "float32"}
+        # No ROIs to subtract; the residual is unchanged. Record an empty
+        # (identity) layer so resume sees the stage as complete.
+        from roigbiv.pipeline.residual import SourceLayer
+        empty = SourceLayer(
+            flat_idx=np.empty(0, dtype=np.int64),
+            W_design=np.zeros((0, 0), dtype=np.float32),
+            traces=np.zeros((0, shape[0]), dtype=np.float32),
+            stage_idx=int(stage_idx),
+        )
+        empty.save(sources_path)
+        meta = {"shape": list(shape), "dtype": "float32", "kind": "virtual",
+                "stage_idx": int(stage_idx), "n_sources": 0}
         meta_path.write_text(json.dumps(meta, indent=2))
-        if delete_input:
-            Path(residual_S_path).unlink(missing_ok=True)
-        return residual_out_path, {}, np.zeros((0, shape[0]), dtype=np.float32)
+        report_path.write_text(json.dumps({}, indent=2))
+        return view_in, {}, np.zeros((0, shape[0]), dtype=np.float32)
 
     # Step 1: profiles
     t0 = time.time()
@@ -741,24 +691,19 @@ def run_source_subtraction(
     # Step 2: simultaneous traces via GPU-chunked normal equations
     t0 = time.time()
     traces, _union_idx, _union_yx = estimate_traces_simultaneous(
-        residual_S_path, shape, profiles, cfg,
+        view_in, profiles, cfg,
     )
     print(fmt.sub_phase(f"traces: {traces.shape} via GPU lstsq", time.time() - t0), flush=True)
 
-    # Step 3: rank-1 subtract (streaming, writes residual_out_path)
+    # Step 3: rank-1 subtract (lazy — append a source layer)
     t0 = time.time()
-    subtract_sources(residual_S_path, residual_out_path, shape, profiles, traces,
-                     chunk=cfg.reconstruct_chunk)
-    meta = {"shape": list(shape), "dtype": "float32"}
-    meta_path.write_text(json.dumps(meta, indent=2))
-    print(fmt.sub_phase(f"rank-1 subtract → {residual_out_path.name}", time.time() - t0),
+    view_out = subtract_sources(view_in, profiles, traces, stage_idx=stage_idx)
+    print(fmt.sub_phase(f"rank-1 subtract → {output_name} (virtual)", time.time() - t0),
           flush=True)
 
     # Step 4: validate
     t0 = time.time()
-    validation = validate_subtraction(
-        residual_S_path, residual_out_path, shape, rois, traces, cfg,
-    )
+    validation = validate_subtraction(view_out, rois, traces, cfg)
     n_fail = sum(1 for v in validation.values() if not v["pass"])
     n_anticorr = sum(1 for v in validation.values()
                       if v["anticorr_max"] < cfg.subtract_anticorr_threshold)
@@ -783,16 +728,14 @@ def run_source_subtraction(
                 f"(failure_frac={failure_frac:.1%})"
             ), flush=True)
             traces = _nnls_refine_flagged(
-                residual_S_path, residual_out_path, shape, rois, profiles,
-                traces, flagged_indices, cfg,
+                view_in, rois, profiles, traces, flagged_indices, cfg,
             )
-            # Re-subtract with refined traces
-            subtract_sources(residual_S_path, residual_out_path, shape, profiles, traces,
-                             chunk=cfg.reconstruct_chunk)
+            # Re-subtract with refined traces (rebuild the layer on view_in).
+            view_out = subtract_sources(view_in, profiles, traces, stage_idx=stage_idx)
             # Only flagged ROIs' traces changed, so re-validate just those and
             # merge into the first-pass dict. Unflagged entries remain correct.
             flagged_update = _validate_streaming(
-                residual_out_path, shape, rois, traces, cfg,
+                view_out, rois, traces, cfg,
                 subset_indices=flagged_indices,
             )
             validation.update(flagged_update)
@@ -802,12 +745,14 @@ def run_source_subtraction(
                 time.time() - t0,
             ), flush=True)
 
-    # Persist validation report
+    # Persist the new source layer (+ meta + validation report) for resume.
+    layer = view_out.sources[-1]
+    nbytes = (layer.flat_idx.nbytes + layer.W_design.nbytes + layer.traces.nbytes)
+    ensure_free_space(sources_path, nbytes, label=f"{output_name}.sources.npz")
+    layer.save(sources_path)
+    meta = {"shape": list(shape), "dtype": "float32", "kind": "virtual",
+            "stage_idx": int(stage_idx), "n_sources": int(layer.traces.shape[0])}
+    meta_path.write_text(json.dumps(meta, indent=2))
     report_path.write_text(json.dumps(validation, indent=2))
 
-    # Drop the input residual now that all passes that needed it (validation,
-    # NNLS fallback, re-subtract) are complete. Keeps disk at ~1 residual.
-    if delete_input:
-        Path(residual_S_path).unlink(missing_ok=True)
-
-    return residual_out_path, validation, traces
+    return view_out, validation, traces

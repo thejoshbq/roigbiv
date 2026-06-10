@@ -116,11 +116,12 @@ class FOVData:
     data_bin_path: Path                     # int16 memmap of registered movie
     shape: tuple                            # (T, Ly, Lx)
 
-    residual_S_path: Path                   # float32 (T, Ly, Lx) memmap on disk
-    residual_S1_path: Optional[Path] = None # populated after Stage 1 subtraction
-    residual_S2_path: Optional[Path] = None # populated after Stage 2 subtraction
-    residual_S3_path: Optional[Path] = None # populated after Stage 3 subtraction (Stage 4 reads this)
-    residual_S4_path: Optional[Path] = None # reserved — Phase 1E does not subtract after Stage 4
+    # Lazy virtual residual. A single live view accumulates one SourceLayer per
+    # subtraction stage; it reconstructs S = M − L − Σsources on demand from
+    # data.bin + svd_factors.npz (no dense .dat on disk). Replaces the former
+    # residual_S{,1,2,3}_path memmap chain. See roigbiv/pipeline/residual.py.
+    residual_view: object = None            # ResidualView (forward ref to avoid import cycle)
+    residual_S_path: Optional[Path] = None  # deprecated — kept None; nothing materializes
 
     # Summary images in RAM (H, W float32)
     mean_M: Optional[np.ndarray] = None      # raw registered movie mean (morphological channel)
@@ -176,8 +177,12 @@ class PipelineConfig:
     # ── Stage 1 (Cellpose) ────────────────────────────────────────────────
     cellpose_model: str = _DEFAULT_CELLPOSE_MODEL
     diameter: int = 12
+    # When True, Stage 1 runs a calibration Cellpose pass with diameter=None
+    # on the downsampled mean_M and uses Cellpose's SizeModel estimate as the
+    # effective diameter. Overrides `diameter` when the estimator succeeds.
+    diameter_auto: bool = False
     cellprob_threshold: float = -2.0
-    flow_threshold: float = 0.6
+    flow_threshold: float = 0.4
     channels: tuple = (1, 2)
     tile_norm_blocksize: int = 128
     use_denoise: bool = True                # Cellpose3 denoise_cyto3
@@ -236,7 +241,8 @@ class PipelineConfig:
     gate2_spatial_radius: int = 20          # px — neighborhood for correlation check
     gate2_min_area: int = 60                # relaxed vs Gate 1 (Suite2p footprints are noisier)
     gate2_max_area: int = 400
-    gate2_min_solidity: float = 0.4         # relaxed vs Gate 1
+    gate2_min_solidity: float = 0.4         # relaxed vs Gate 1 — Suite2p footprints are noisier than Cellpose
+    gate2_max_eccentricity: float = 0.85   # rejects fiber/axon shapes (no Gate 1 equivalent)
     gate2_near_distance: int = 5            # px — centroid distance triggering near-duplicate check
     gate2_near_corr_threshold: float = 0.5  # |r| above which near-duplicate rejects
     gate2_flag_corr_threshold: float = 0.5  # |r| above which to FLAG rather than ACCEPT
@@ -253,6 +259,7 @@ class PipelineConfig:
     cluster_distance: int = 12              # px — fcluster threshold for event accumulation
     min_event_separation: float = 2.0       # seconds — temporal-independence cutoff
     stage3_pixel_chunk_rows: int = 8        # rows of the (T,H,W) memmap per chunk → 4096 px on 512×512
+    stage3_chunk_budget_bytes: int = 1_073_741_824   # 1 GB cap on the per-chunk float32 working set
     stage3_sigma_window_frames: int = 500   # sliding MAD window for per-pixel noise
     stage3_max_events: int = 2_000_000      # hard cap — if exceeded, raise threshold adaptively
 

@@ -18,11 +18,18 @@ Algorithm:
      build a disk mask, extract the cluster's trace from S₂.
   5. Return as candidate ROI objects (gate_outcome=provisional, Gate 3 fills in).
 
-Memory strategy (plan D7):
-  - NEVER materialize the dense score array (N_pix × T = 18 GB for typical FOVs).
-  - Per chunk reads `mm[:, y0:y1, :]` — one contiguous I/O over T frames.
-  - The only persistent state is the Python list of suprathreshold events
-    (~40 B each, typical count 1e3 – 1e5 → < 5 MB).
+Memory strategy:
+  - The CPU staging buffer `chunk_pixels` of shape (rows_per_chunk*W, T) float32
+    is pre-allocated ONCE outside the chunk loop and reused via np.copyto.
+    The previous per-iteration `np.ascontiguousarray(... .reshape(...))` form
+    leaked anonymous heap (a strong reference somewhere across the
+    torch.from_numpy().to(device) hop prevented refcount-GC), accumulating
+    `chunk_pixels.nbytes` per iteration — for a 27k-frame 1024² FOV that
+    grew to 114 GB and tripped the kernel OOM-killer.
+  - `rows_per_chunk` auto-scales via cfg.stage3_chunk_budget_bytes so the
+    per-chunk float32 working set never exceeds the budget (default 1 GB).
+  - GPU buffers inside _process_chunk are managed by PyTorch's CUDA caching
+    allocator — same-shape allocations are reused across iterations.
 
 Spec deviation (documented in pipeline log):
   σ is computed as per-pixel GLOBAL MAD rather than the sliding-window
@@ -62,6 +69,31 @@ def _disk_mask(cy: float, cx: float, radius: int, H: int, W: int) -> np.ndarray:
     """Filled circular disk, clipped to image bounds."""
     ys, xs = np.ogrid[:H, :W]
     return ((ys - cy) ** 2 + (xs - cx) ** 2) <= radius ** 2
+
+
+def _resolve_rows_per_chunk(cfg: PipelineConfig, T: int, W: int, n_fft: int) -> int:
+    """Cap rows_per_chunk so the peak per-chunk working set fits the budget.
+
+    Accounts for all dominant allocations in _process_chunk (per pixel row):
+      chunk_pixels (CPU staging) : W * T * 4          float32
+      x_freq (rfft output)       : W * (n_fft//2+1)*8  complex64
+      score_max                  : W * T * 4          float32
+      xcorr_k (irfft, full n_fft): W * n_fft * 4     float32  ← dominates for large n_fft
+
+    Always returns ≥ 1.
+    """
+    requested = int(getattr(cfg, "stage3_pixel_chunk_rows", 8))
+    budget = int(getattr(cfg, "stage3_chunk_budget_bytes", 1_073_741_824))
+    n_rfft = n_fft // 2 + 1
+    per_row_bytes = max(
+        1,
+        W * T * 4          # chunk_pixels
+        + W * n_rfft * 8   # x_freq (complex64)
+        + W * T * 4        # score_max
+        + W * n_fft * 4    # xcorr_k irfft output (pre-slice)
+    )
+    max_rows_by_budget = max(1, budget // per_row_bytes)
+    return max(1, min(requested, max_rows_by_budget))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -228,7 +260,7 @@ def _count_temporally_independent(
 # ─────────────────────────────────────────────────────────────────────────
 
 def run_stage3(
-    residual_path: Path,
+    residual_view,
     fov: FOVData,
     template_bank: list[tuple[str, np.ndarray]],
     cfg: PipelineConfig,
@@ -238,7 +270,7 @@ def run_stage3(
 
     Parameters
     ----------
-    residual_path : Path to (T, H, W) float32 memmap (typically S₂)
+    residual_view : ResidualView reconstructing the (T, H, W) residual (typically S₂)
     fov           : FOVData (uses .shape, .mean_M)
     template_bank : output of stage3_templates.build_template_bank
     cfg           : PipelineConfig
@@ -263,9 +295,6 @@ def run_stage3(
     tmpl_tensor = torch.from_numpy(templates_padded).to(device)
     template_freqs = torch.fft.rfft(tmpl_tensor, n=n_fft, dim=1)  # (K, n_rfft)
 
-    # Open residual memmap
-    mm = np.memmap(str(residual_path), dtype=np.float32, mode="r", shape=(T, H, W))
-
     # Collect events across spatial chunks
     all_y: list[np.ndarray] = []
     all_x: list[np.ndarray] = []
@@ -273,23 +302,35 @@ def run_stage3(
     all_score: list[np.ndarray] = []
     all_tmpl: list[np.ndarray] = []
 
-    rows_per_chunk = int(cfg.stage3_pixel_chunk_rows)
+    rows_per_chunk = _resolve_rows_per_chunk(cfg, T=T, W=W, n_fft=n_fft)
+    if rows_per_chunk != int(cfg.stage3_pixel_chunk_rows):
+        print(
+            f"  rows_per_chunk auto-scaled "
+            f"{cfg.stage3_pixel_chunk_rows} → {rows_per_chunk} "
+            f"(budget {cfg.stage3_chunk_budget_bytes/1e9:.2f} GB, T={T}, W={W})",
+            flush=True,
+        )
+
+    # Pre-allocate the CPU staging buffer ONCE; reused across all chunks. The
+    # last chunk may be smaller — it writes into chunk_pixels[:n_pix].
+    chunk_pixels = np.empty((rows_per_chunk * W, T), dtype=np.float32)
+
     t_fft_total = 0.0
     for y0 in range(0, H, rows_per_chunk):
         y1 = min(y0 + rows_per_chunk, H)
         chunk_rows = y1 - y0
-        # Read (chunk_rows, W, T) spatial rectangle. memmap access pattern:
-        # mm[:, y0:y1, :] is one large contiguous read in (T, H, W) layout.
+        n_pix = chunk_rows * W
         t0 = time.time()
-        chunk_data = np.asarray(mm[:, y0:y1, :], dtype=np.float32)  # (T, chunk_rows, W)
-        # Transpose to (chunk_rows, W, T) → (n_pix, T)
-        chunk_pixels = np.ascontiguousarray(
-            chunk_data.transpose(1, 2, 0).reshape(chunk_rows * W, T)
-        )
-        del chunk_data
+        # Fill the pre-allocated buffer in place. The memmap-slice transpose
+        # is a non-contiguous view (zero allocation); np.copyto handles the
+        # strided read into our contiguous destination buffer without
+        # materializing an intermediate. This is what kills the per-iteration
+        # anonymous-heap accumulation that previously caused the OOM.
+        src_view = residual_view.read_rows(y0, y1).transpose(1, 2, 0)  # (chunk_rows, W, T)
+        np.copyto(chunk_pixels[:n_pix].reshape(chunk_rows, W, T), src_view)
 
         pixel_idx, times, scores, tmpl_idx = _process_chunk(
-            chunk_pixels, template_freqs, n_fft, T,
+            chunk_pixels[:n_pix], template_freqs, n_fft, T,
             threshold=cfg.template_threshold,
             device=device,
         )
@@ -305,7 +346,7 @@ def run_stage3(
             all_score.append(scores)
             all_tmpl.append(tmpl_idx)
 
-    del mm, tmpl_tensor, template_freqs
+    del tmpl_tensor, template_freqs, chunk_pixels
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -388,7 +429,7 @@ def run_stage3(
         for c in candidate_info
     ]
     traces = extract_traces_from_residual(
-        residual_path, fov.shape, disk_masks, chunk=cfg.reconstruct_chunk,
+        residual_view, disk_masks, chunk=cfg.reconstruct_chunk,
     )
     print(f"  extracted {len(disk_masks)} candidate traces "
           f"in {time.time()-t0:.2f}s", flush=True)

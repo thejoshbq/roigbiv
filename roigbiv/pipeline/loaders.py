@@ -108,7 +108,6 @@ def load_fov_from_output_dir(
         output_dir=output_dir,
         data_bin_path=output_dir / "suite2p" / "plane0" / "data.bin",
         shape=shape,
-        residual_S_path=output_dir / "residual_S.dat",
         mean_M=mean_M,
         mean_S=mean_S,
         mean_L=mean_L,

@@ -219,7 +219,7 @@ def compute_background_separation(
     ops: dict,
     cfg: PipelineConfig,
     output_dir: Path,
-) -> tuple[Path, Path, int, np.ndarray]:
+):
     """L+S background separation via binned truncated SVD.
 
     Algorithm (spec §3.3):
@@ -227,20 +227,25 @@ def compute_background_separation(
       2. Temporally bin to ~5000 frames → (T_bin, N_pix) float32.
       3. Compute top-n_svd SVD on the binned movie.
       4. Interpolate V_bin → V_full (T, n_svd).
-      5. Stream per-chunk:
-           L_chunk = U_k @ diag(S_k) @ V_full[t0:t1].T      (using k = k_background)
-           S_chunk = M_chunk - L_chunk
-         Write S_chunk to disk memmap at residual_S.dat.
-         Accumulate mean(L) during the same pass.
-      6. Persist all n_svd SVD factors to svd_factors.npz (for future Stage 2/4 reuse).
+      5. Persist all n_svd SVD factors to svd_factors.npz.
+
+    The residual S = M − L is **not** materialized to disk. Instead a
+    :class:`~roigbiv.pipeline.residual.ResidualView` is returned that
+    reconstructs any chunk on demand from ``data.bin`` + the SVD factors (the
+    same arithmetic the old streaming write used, ``S_chunk = M − L``). This
+    eliminates the ~10-19 GB ``residual_S.dat`` write that silently crashed the
+    process (SIGBUS) on a full disk. ``mean_L`` is computed in closed form:
+    ``mean_t L = US_k @ mean_t(V_k_full)``.
 
     Returns
     -------
-    residual_S_path  : Path to (T, Ly, Lx) float32 memmap
+    residual_view    : ResidualView reconstructing S = M − L on demand
     svd_factors_path : Path to .npz with U, S, V_bin (full n_svd components)
     k_used           : int (= cfg.k_background)
-    mean_L           : (Ly, Lx) float32 — accumulated mean of L during reconstruction
+    mean_L           : (Ly, Lx) float32 — mean of L over time
     """
+    from roigbiv.pipeline.residual import ResidualView
+
     Ly = int(ops["Ly"])
     Lx = int(ops["Lx"])
     N_pix = Ly * Lx
@@ -262,81 +267,55 @@ def compute_background_separation(
     print(f"  SVD top-{n_svd} on binned movie in {time.time()-t0:.1f}s", flush=True)
     del M_bin  # free ~5 GB
 
-    # 3. Persist SVD factors
+    # 3. Persist SVD factors — the irreplaceable substrate for on-demand
+    #    residual reconstruction (data.bin is the other half).
     svd_factors_path = output_dir / "svd_factors.npz"
     np.savez(str(svd_factors_path),
              U=U, S=S, V_bin=V_bin, bin_size=np.int32(bin_size), T=np.int32(T))
 
-    # 4. Upsample V for reconstruction
-    V_full = _upsample_V(V_bin, bin_size, T)
-
-    # 5. Stream L + S per chunk, accumulate mean(L)
+    # 4. Build the lazy residual view and the closed-form mean(L).
     k = min(int(cfg.k_background), n_svd)
-    U_k = U[:, :k]                            # (N_pix, k)
-    S_k = S[:k]                               # (k,)
-    V_k_full = V_full[:, :k]                  # (T, k)
+    V_full = _upsample_V(V_bin, bin_size, T)
+    US_k = (U[:, :k] * S[:k][np.newaxis, :]).astype(np.float32)
+    V_k_full = V_full[:, :k]
+    # mean_t L[t] = US_k @ mean_t(V_k_full) — exact, no streaming pass needed.
+    mean_L = (US_k @ V_k_full.mean(axis=0)).reshape(Ly, Lx).astype(np.float32)
 
-    US = U_k * S_k[np.newaxis, :]             # (N_pix, k) — precompute U @ diag(S)
+    residual_view = ResidualView.from_factors(
+        data_bin_path, U, S, V_bin, bin_size, (T, Ly, Lx), k,
+    )
 
-    residual_S_path = output_dir / "residual_S.dat"
-    S_mm = np.memmap(str(residual_S_path), dtype=np.float32, mode="w+",
-                     shape=(T, Ly, Lx))
-
-    mean_L = np.zeros((Ly, Lx), dtype=np.float64)  # accumulator
-    chunk = int(cfg.reconstruct_chunk)
-    t0 = time.time()
-    for t_start in range(0, T, chunk):
-        t_end = min(t_start + chunk, T)
-        cs = t_end - t_start
-        # L_chunk (N_pix, cs) = US @ V_k_full[t_start:t_end].T
-        L_flat = US @ V_k_full[t_start:t_end].T   # (N_pix, cs)
-        L_chunk = L_flat.T.reshape(cs, Ly, Lx)    # (cs, Ly, Lx)
-        # M_chunk (cs, Ly, Lx) float32
-        M_chunk = np.asarray(movie[t_start:t_end], dtype=np.float32)
-        # S_chunk = M - L
-        S_mm[t_start:t_end] = M_chunk - L_chunk
-        mean_L += L_chunk.sum(axis=0, dtype=np.float64)
-        del L_flat, L_chunk, M_chunk
-    S_mm.flush()
-    del S_mm
-    mean_L = (mean_L / T).astype(np.float32)
-    print(f"  L+S reconstruction streamed to {residual_S_path.name} "
-          f"({T*Ly*Lx*4/1e9:.1f} GB) in {time.time()-t0:.1f}s", flush=True)
-
-    # Write memmap metadata for future readers
-    meta = {"shape": [int(T), int(Ly), int(Lx)], "dtype": "float32"}
+    # Virtual-residual sidecar so resume can detect a complete foundation
+    # without a dense .dat. ``kind: virtual`` signals "reconstruct, don't read".
+    meta = {"shape": [int(T), int(Ly), int(Lx)], "dtype": "float32",
+            "kind": "virtual", "svd_factors": "svd_factors.npz"}
     (output_dir / "residual_S.meta.json").write_text(json.dumps(meta, indent=2))
 
-    return residual_S_path, svd_factors_path, k, mean_L
+    return residual_view, svd_factors_path, k, mean_L
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Summary images on S
 # ─────────────────────────────────────────────────────────────────────────
 
-def _iter_S_chunks(residual_S_path: Path, shape: tuple, chunk: int = 500):
+def _iter_S_chunks(residual_view, chunk: int = 500):
     """Generator yielding (t0, t1, S_chunk) — S_chunk is (cs, Ly, Lx) float32."""
-    T, Ly, Lx = shape
-    S_mm = np.memmap(str(residual_S_path), dtype=np.float32, mode="r", shape=(T, Ly, Lx))
-    for t0 in range(0, T, chunk):
-        t1 = min(t0 + chunk, T)
-        yield t0, t1, np.asarray(S_mm[t0:t1])  # copy chunk out so memmap can advance
-    del S_mm
+    yield from residual_view.iter_chunks(chunk)
 
 
 def generate_summary_images(
-    residual_S_path: Path,
-    shape: tuple,
+    residual_view,
     chunk: int = 500,
 ) -> dict:
     """Compute mean, max, std, and 8-neighbor Vcorr projections of residual S.
 
-    All accumulators run in a single pass through S_mm. Memory per projection
-    is ~1 MB (H,W float64/32). Vcorr needs 5 accumulators × 8 neighbors ≈ 40 MB.
+    All accumulators run in a single pass through the residual view (each chunk
+    reconstructed on demand). Memory per projection is ~1 MB (H,W float64/32).
+    Vcorr needs 5 accumulators × 8 neighbors ≈ 40 MB.
 
     Returns dict with keys 'mean', 'max', 'std', 'vcorr', each a (Ly, Lx) float32.
     """
-    T, Ly, Lx = shape
+    T, Ly, Lx = residual_view.shape
 
     # First pass: running sum, sum-of-squares, max
     sum_ = np.zeros((Ly, Lx), dtype=np.float64)
@@ -365,7 +344,7 @@ def generate_summary_images(
     }
 
     t_total = 0
-    for t0, t1, chunk_arr in _iter_S_chunks(residual_S_path, shape, chunk):
+    for t0, t1, chunk_arr in _iter_S_chunks(residual_view, chunk):
         cs = t1 - t0
         t_total += cs
 
@@ -475,11 +454,11 @@ def run_foundation(
 
     Writes to {output_dir}:
       suite2p/plane0/{ops.npy, data.bin, ...}
-      svd_factors.npz, residual_S.dat (+ .meta.json), motion_trace.npz
+      svd_factors.npz, residual_S.meta.json (virtual — no dense .dat), motion_trace.npz
       summary/{mean_S,max_S,std_S,vcorr_S,mean_L,dog_map}.tif
 
-    Returns a populated FOVData with summary images in RAM and paths to
-    heavy arrays on disk.
+    Returns a populated FOVData with summary images in RAM and a lazy
+    ResidualView (reconstructs S = M − L on demand from data.bin + SVD factors).
     """
     tif_path = Path(tif_path)
     output_dir = Path(output_dir)
@@ -502,7 +481,7 @@ def run_foundation(
 
     print(fmt.stage_header("F", f"L+S background separation (k={cfg.k_background}, n_svd={cfg.n_svd})"),
           flush=True)
-    residual_S_path, svd_factors_path, k_used, mean_L = compute_background_separation(
+    residual_view, svd_factors_path, k_used, mean_L = compute_background_separation(
         data_bin_path, ops, cfg, output_dir,
     )
 
@@ -513,10 +492,9 @@ def run_foundation(
     # per-offset temporaries of the same size; with cs=500 on a 505×493 FOV
     # that's ~2 GB peak, which swaps on RAM-constrained hosts and stalls for
     # >10 min. cs=128 caps peak at ~500 MB — comfortable on 16 GB systems
-    # and still a single sequential pass through the residual memmap.
+    # and still a single reconstruction pass through the residual view.
     summary_chunk = min(128, int(cfg.reconstruct_chunk))
-    summaries = generate_summary_images(residual_S_path, (T, Ly, Lx),
-                                        chunk=summary_chunk)
+    summaries = generate_summary_images(residual_view, chunk=summary_chunk)
     mean_S = summaries["mean"]
     max_S = summaries["max"]
     std_S = summaries["std"]
@@ -559,7 +537,7 @@ def run_foundation(
         output_dir=output_dir,
         data_bin_path=data_bin_path,
         shape=(T, Ly, Lx),
-        residual_S_path=residual_S_path,
+        residual_view=residual_view,
         mean_M=mean_M,
         mean_S=mean_S,
         max_S=max_S,

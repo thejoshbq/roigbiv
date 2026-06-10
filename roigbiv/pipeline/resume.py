@@ -5,9 +5,9 @@ reconstructs the in-memory :class:`FOVData` needed to skip past them, and
 validates that on-disk artifacts are consistent with the supplied config.
 
 Authoritative on-disk state is the JSON reports
-(``stage{N}/stage{N}_report.json``) and the residual memmaps
-(``residual_S{N}.dat`` + sidecar ``.meta.json``). The advisory manifest at
-``{output_dir}/.roigbiv_manifest.json`` records the config + input
+(``stage{N}/stage{N}_report.json``) and the virtual-residual source sidecars
+(``residual_S{N}.sources.npz`` + ``residual_S{N}.meta.json``). The advisory
+manifest at ``{output_dir}/.roigbiv_manifest.json`` records the config + input
 fingerprint and per-step completion timestamps; it is never the source of
 truth for ROI content.
 
@@ -19,11 +19,14 @@ Constraints
   ROIs — see ``run.py:259-264``). Rejected ROIs are dropped on resume; they
   are never consumed downstream of Stage 1 anyway (gates 2/3/4 filter to
   accept+flag at the call sites).
-- The residual chain is destructive (``run_source_subtraction`` with
-  ``delete_input=True``). A stage is fully complete only when both its
-  report exists AND the next-stage residual exists. "report present,
-  next-stage residual missing, prior residual still present" is treated as
-  "subtraction was interrupted" and resume re-runs only that subtraction.
+- The residual chain is **virtual and non-destructive**. The irreplaceable
+  substrate is ``svd_factors.npz`` + Suite2p ``data.bin`` (from which S = M − L
+  is reconstructed); each subtraction stage adds an independent, never-deleted
+  ``residual_S{N}.sources.npz`` (mask pixels, weights, traces). A stage is
+  complete when both its report AND its ``sources.npz`` exist. "report present,
+  sources.npz missing" means the subtraction was interrupted and resume re-runs
+  only that subtraction (the prior view is always rebuildable from the
+  substrate + earlier sources files).
 """
 from __future__ import annotations
 
@@ -246,7 +249,7 @@ def _foundation_paths(output_dir: Path) -> dict:
     return {
         "data_bin":   output_dir / "suite2p" / "plane0" / "data.bin",
         "ops":        output_dir / "suite2p" / "plane0" / "ops.npy",
-        "residual_S": output_dir / "residual_S.dat",
+        "svd_factors": output_dir / "svd_factors.npz",
         "residual_meta": output_dir / "residual_S.meta.json",
         "motion_trace": output_dir / "motion_trace.npz",
     }
@@ -264,35 +267,61 @@ def _foundation_complete(output_dir: Path) -> bool:
 
 
 def _residual_path(output_dir: Path, stage_idx: int) -> tuple[Path, Path]:
+    """Return ``(meta_path, sources_path)`` for stage ``stage_idx``'s virtual residual."""
     output_dir = Path(output_dir)
     return (
-        output_dir / f"residual_S{stage_idx}.dat",
         output_dir / f"residual_S{stage_idx}.meta.json",
+        output_dir / f"residual_S{stage_idx}.sources.npz",
     )
 
 
-def _verify_residual(dat_path: Path, meta_path: Path) -> tuple[int, int, int]:
-    """Validate a residual memmap against its meta sidecar.
+def _verify_foundation_residual(
+    meta_path: Path, svd_factors_path: Path, data_bin_path: Path,
+) -> tuple[int, int, int]:
+    """Validate the virtual foundation residual against its substrate.
 
-    Returns ``(T, Ly, Lx)``. Raises :class:`ResumeError` if the file size
-    doesn't match the declared shape (truncated/partial write).
+    Returns ``(T, Ly, Lx)``. Raises :class:`ResumeError` if the meta is
+    malformed or ``data.bin`` is inconsistent with the declared shape. The
+    ``svd_factors.npz`` + ``data.bin`` pair is the irreplaceable substrate for
+    on-demand reconstruction — both must exist.
     """
     meta = json.loads(meta_path.read_text())
     shape = tuple(int(s) for s in meta["shape"])
     if len(shape) != 3:
-        raise ResumeError(
-            f"resume: {meta_path.name} has unexpected shape {shape!r}"
-        )
+        raise ResumeError(f"resume: {meta_path.name} has unexpected shape {shape!r}")
     T, Ly, Lx = shape
-    expected = T * Ly * Lx * 4  # float32
-    actual = dat_path.stat().st_size
+    if not Path(svd_factors_path).exists():
+        raise ResumeError(
+            f"resume: {Path(svd_factors_path).name} missing — cannot reconstruct "
+            f"the residual. Re-run without --resume."
+        )
+    expected = T * Ly * Lx * 2  # int16 data.bin
+    actual = Path(data_bin_path).stat().st_size
     if actual != expected:
         raise ResumeError(
-            f"resume: {dat_path.name} is {actual} bytes but meta declares "
-            f"{expected} ({T}x{Ly}x{Lx} float32). Likely a truncated write. "
-            f"Re-run without --resume to regenerate."
+            f"resume: data.bin is {actual} bytes but meta declares "
+            f"{expected} ({T}x{Ly}x{Lx} int16). Re-run without --resume."
         )
     return T, Ly, Lx
+
+
+def _verify_sources(sources_path: Path, T: int) -> None:
+    """Validate a stage's source sidecar (catches truncated/partial writes)."""
+    z = np.load(str(sources_path))
+    flat_idx = z["flat_idx"]
+    W_design = z["W_design"]
+    traces = z["traces"]
+    if traces.ndim != 2 or (traces.shape[1] != T and traces.shape[0] != 0):
+        raise ResumeError(
+            f"resume: {Path(sources_path).name} traces shape {traces.shape} "
+            f"inconsistent with T={T}. Re-run without --resume."
+        )
+    if W_design.shape[1] != flat_idx.size:
+        raise ResumeError(
+            f"resume: {Path(sources_path).name} W_design cols "
+            f"{W_design.shape[1]} != |flat_idx| {flat_idx.size}. "
+            f"Likely a truncated write. Re-run without --resume."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -314,24 +343,34 @@ def _load_fov_after_foundation(
     """Build an FOVData equivalent to ``run_foundation``'s return.
 
     Reads summary images from ``summary/*.tif``, motion traces from
-    ``motion_trace.npz``, and shape from ``residual_S.meta.json``. The
+    ``motion_trace.npz``, and shape from ``residual_S.meta.json``. Builds the
+    lazy :class:`ResidualView` from ``svd_factors.npz`` + ``data.bin``. The
     Suite2p ops dict is left as ``None`` because (i) ``run_pipeline`` does
     not consume it after Foundation, and (ii) re-loading ``ops.npy`` pulls
     in the full Suite2p import path on every resume.
     """
+    from roigbiv.pipeline.residual import ResidualView
+
     paths = _foundation_paths(output_dir)
-    T, Ly, Lx = _verify_residual(paths["residual_S"], paths["residual_meta"])
+    T, Ly, Lx = _verify_foundation_residual(
+        paths["residual_meta"], paths["svd_factors"], paths["data_bin"],
+    )
 
     motion = np.load(str(paths["motion_trace"]))
     motion_x = np.asarray(motion["xoff"], dtype=np.float32)
     motion_y = np.asarray(motion["yoff"], dtype=np.float32)
+
+    residual_view = ResidualView.from_foundation(
+        paths["data_bin"], paths["svd_factors"], (T, Ly, Lx),
+        int(cfg.k_background),
+    )
 
     return FOVData(
         raw_path=Path(tif_path),
         output_dir=Path(output_dir),
         data_bin_path=paths["data_bin"],
         shape=(T, Ly, Lx),
-        residual_S_path=paths["residual_S"],
+        residual_view=residual_view,
         mean_M=_load_summary(output_dir, "mean_M"),
         mean_S=_load_summary(output_dir, "mean_S"),
         max_S=_load_summary(output_dir, "max_S"),
@@ -422,10 +461,9 @@ def plan_resume(
     Raises
     ------
     ResumeError
-        If the on-disk state is internally inconsistent (e.g.
-        ``stage2_report.json`` exists but neither ``residual_S2.dat`` nor
-        ``residual_S1.dat`` is present), or if the cached fingerprint
-        mismatches.
+        If the on-disk state is internally inconsistent (e.g. the manifest
+        claims a stage completed but its report or ``sources.npz`` is missing),
+        or if the cached fingerprint mismatches.
     """
     output_dir = Path(output_dir)
     fingerprint = compute_cfg_fingerprint(cfg, Path(tif_path))
@@ -455,8 +493,9 @@ def plan_resume(
         if "foundation" in manifest_stages:
             raise ResumeError(
                 "resume: manifest claims foundation completed but its "
-                "artifacts (summary/, data.bin, residual_S.dat, motion_trace) "
-                "are not all present. Re-run without --resume."
+                "artifacts (summary/, data.bin, svd_factors.npz, "
+                "residual_S.meta.json, motion_trace) are not all present. "
+                "Re-run without --resume."
             )
         return ResumePlan(start_stage="foundation",
                           cfg_fingerprint=fingerprint,
@@ -510,13 +549,21 @@ def plan_resume(
             start_stage = "post_detection"
             break
 
-        # Subtraction step for stages 1-3.
-        out_residual, out_meta = _residual_path(output_dir, stage_idx)
+        # Subtraction step for stages 1-3 (virtual: a sources sidecar).
+        out_meta, sources_path = _residual_path(output_dir, stage_idx)
         subtract_step = f"stage{stage_idx}_subtract"
 
-        if out_residual.exists() and out_meta.exists():
-            _verify_residual(out_residual, out_meta)
-            setattr(fov, f"residual_S{stage_idx}_path", out_residual)
+        if out_meta.exists() and sources_path.exists():
+            # Completed subtraction: rebuild the layer onto the live view.
+            from roigbiv.pipeline.residual import SourceLayer
+            _verify_sources(sources_path, fov.shape[0])
+            layer = SourceLayer.load(sources_path)
+            if layer.traces.shape[0] > 0:
+                fov.residual_view = fov.residual_view.with_source(
+                    layer.flat_idx, layer.W_design, layer.traces,
+                    stage_idx=layer.stage_idx,
+                )
+            # else: empty (no-ROI) layer — view unchanged, stage still complete.
             continue
 
         # Subtraction's output is missing. Check the manifest to decide
@@ -527,27 +574,19 @@ def plan_resume(
         if subtract_status == "completed":
             raise ResumeError(
                 f"resume: manifest claims {subtract_step} completed but "
-                f"residual_S{stage_idx}.dat is missing. Re-run without --resume."
+                f"residual_S{stage_idx}.sources.npz is missing. "
+                f"Re-run without --resume."
             )
         if subtract_status == "skipped":
-            # Subtraction was intentionally bypassed (no downstream consumer
-            # in the prior run). Leave fov.residual_S{stage_idx}_path as
-            # None; run.py's _stage_input_residual will walk back the chain
-            # to find the latest residual that does exist on disk.
+            # Subtraction was intentionally bypassed (no downstream consumer in
+            # the prior run). The live view already reflects the deepest applied
+            # subtraction; nothing to append.
             continue
 
-        # Genuinely interrupted subtraction. Verify the prior residual is
-        # still on disk so we can replay just the subtraction step.
-        if stage_idx == 1:
-            prior_residual = output_dir / "residual_S.dat"
-        else:
-            prior_residual = output_dir / f"residual_S{stage_idx - 1}.dat"
-        if not prior_residual.exists():
-            raise ResumeError(
-                f"resume: stage{stage_idx} report exists but neither "
-                f"residual_S{stage_idx}.dat nor {prior_residual.name} is "
-                f"present; cannot replay subtraction. Re-run without --resume."
-            )
+        # Genuinely interrupted subtraction. The substrate (svd_factors.npz +
+        # data.bin) is guaranteed present (foundation completeness was checked
+        # above) and earlier stages' sources files are never deleted, so the
+        # input view is always rebuildable — replay just this subtraction.
         start_stage = subtract_step
         break
 

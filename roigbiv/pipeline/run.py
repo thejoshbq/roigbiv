@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -25,6 +27,99 @@ import tifffile
 
 from roigbiv.pipeline import fmt
 from roigbiv.pipeline.types import FOVData, PipelineConfig
+
+
+_GATE2_MIN_SCALE = 3 / 4   # gate2_min_area / gate1_min_area at GRIN defaults (60/80)
+_GATE2_MAX_SCALE = 2 / 3   # gate2_max_area / gate1_max_area at GRIN defaults (400/600)
+
+
+def _build_gate2_overrides(args: "argparse.Namespace") -> dict:
+    """Derive Gate 2 area bounds from Gate 1 when the user sets --min/max-area.
+
+    Priority: explicit --gate2-* flag > proportional scale from Gate 1 > nothing
+    (PipelineConfig defaults remain when neither is set).
+
+    Suite2p footprints run ~0.75× the Cellpose footprint area at the same
+    cell scale; the scale factors preserve that ratio from the GRIN defaults.
+    """
+    out: dict = {}
+    g2_min = getattr(args, "gate2_min_area", None)
+    g2_max = getattr(args, "gate2_max_area", None)
+    g1_min = getattr(args, "min_area", None)
+    g1_max = getattr(args, "max_area", None)
+    if g2_min is None and g1_min is not None:
+        g2_min = max(1, round(g1_min * _GATE2_MIN_SCALE))
+    if g2_max is None and g1_max is not None:
+        g2_max = max(1, round(g1_max * _GATE2_MAX_SCALE))
+    if g2_min is not None:
+        out["gate2_min_area"] = g2_min
+    if g2_max is not None:
+        out["gate2_max_area"] = g2_max
+    return out
+
+
+def _mem_snapshot(label: str) -> None:
+    """Print a one-line process-memory snapshot, tagged with ``label``.
+
+    Reads /proc/self/status (Linux only); silently no-ops elsewhere. Splits
+    out anonymous-heap vs file-backed resident, because only anonymous-rss
+    is non-reclaimable and drives the kernel OOM-killer. Useful for tracking
+    down anon-rss leaks across stage boundaries.
+    """
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            d = {}
+            for line in f:
+                for k in ("VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSize"):
+                    if line.startswith(k + ":"):
+                        d[k] = int(line.split()[1]) / 1024  # MB
+        print(
+            f"  [mem] {label:<28s} "
+            f"anon={d.get('RssAnon', 0):>7.0f} MB  "
+            f"file={d.get('RssFile', 0):>7.0f} MB  "
+            f"total={d.get('VmRSS', 0):>7.0f} MB  "
+            f"vsz={d.get('VmSize', 0):>7.0f} MB",
+            flush=True,
+        )
+    except (OSError, KeyError, ValueError):
+        pass
+
+
+def _summarize_cellpose_probs(probs: list[float]) -> str:
+    """Compact one-line summary of Cellpose cellprob distribution.
+
+    When Cellpose returns very few candidates (e.g. on optics the model
+    wasn't trained on), this lets the user see at a glance whether the
+    detector is finding *nothing* (low probs) vs. finding things that
+    Gate 1 then rejects (high probs, see Gate 1 reasons).
+    """
+    if not probs:
+        return "no candidates"
+    arr = np.asarray(probs, dtype=np.float32)
+    return (
+        f"n={len(arr)} "
+        f"prob min={arr.min():.2f} med={float(np.median(arr)):.2f} "
+        f"max={arr.max():.2f}"
+    )
+
+
+def _gate_reject_histogram(rois) -> str:
+    """Histogram (top 5) of rejection reasons across a ROI list.
+
+    Reads each ROI's ``gate_reasons`` list (populated by gate evaluators)
+    and counts the unique reason prefixes. When everything is rejected,
+    this surfaces *why* — e.g. "area_low:80 solidity:31 contrast:5".
+    """
+    counter: Counter = Counter()
+    for r in rois:
+        if getattr(r, "gate_outcome", None) != "reject":
+            continue
+        for reason in getattr(r, "gate_reasons", []) or []:
+            head = str(reason).split(":", 1)[0]
+            counter[head] += 1
+    if not counter:
+        return "(no reasons recorded)"
+    return " ".join(f"{k}:{v}" for k, v in counter.most_common(5))
 
 
 def _gpu_section(gpu_lock):
@@ -50,26 +145,6 @@ def _any_downstream_enabled(cfg: PipelineConfig, after_stage: int) -> bool:
         if getattr(cfg, f"enable_stage_{k}", False):
             return True
     return False
-
-
-def _stage_input_residual(fov: FOVData, stage_idx: int) -> Path:
-    """Return the latest residual path to feed into Stage ``stage_idx``.
-
-    When intermediate stages are disabled (``cfg.enable_stage_N=False``),
-    their subtraction step does not run, so ``fov.residual_S{N}_path`` stays
-    ``None``. This walks the chain backward and returns the deepest residual
-    that actually exists on disk. Fallback order for Stage 3 is S2 → S1 → S
-    (Foundation); for Stage 4 it is S3 → S2 → S1 → S.
-    """
-    for i in range(stage_idx - 1, 0, -1):
-        path = getattr(fov, f"residual_S{i}_path", None)
-        if path and Path(path).exists():
-            return Path(path)
-    if fov.residual_S_path and Path(fov.residual_S_path).exists():
-        return Path(fov.residual_S_path)
-    raise RuntimeError(
-        f"_stage_input_residual: no residual on disk for stage {stage_idx}"
-    )
 
 
 def _read_subtraction_pass_count(
@@ -253,6 +328,35 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     tif_path = Path(tif_path).resolve()
     if cfg.output_dir is None:
         cfg.output_dir = _default_output_dir(tif_path)
+
+    # Enable motion correction for stacks that aren't pre-corrected.
+    # Pre-corrected stacks carry the _mc suffix convention; everything else needs
+    # Suite2p registration. This makes the _mc flag the canonical signal rather
+    # than requiring callers to know about do_registration.
+    if "_mc" not in tif_path.stem:
+        cfg.do_registration = True
+
+    # Frame-size sanity warn: defaults are tuned for 512×512 GRIN. On larger
+    # frames (prism, 1024×1024) the GRIN diameter starves Cellpose and the
+    # Gate 1 area ceiling clips real cells. Catches silent misuse at startup.
+    try:
+        import tifffile as _tf
+        with _tf.TiffFile(str(tif_path)) as _peek:
+            _shape = _peek.pages[0].shape
+        _max_dim = max(_shape[-2], _shape[-1])
+        if _max_dim > 768 and cfg.diameter < 25 and not cfg.diameter_auto:
+            print(
+                f"WARN: frame size {_shape[-2]}×{_shape[-1]} with "
+                f"diameter={cfg.diameter}. Defaults are tuned for 512×512 "
+                f"GRIN imaging; on larger frames cells will be undersegmented "
+                f"and rejected by Gate 1. Consider --diameter-auto, an "
+                f"explicit --diameter (target ~50 for 1024×1024 prism), or "
+                f"raise --max-area above the configured default.",
+                flush=True,
+            )
+    except BaseException:  # noqa: BLE001
+        pass
+
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,6 +382,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     s3_subtract: list = []
     n3_sub_pass = 0
 
+    _mem_snapshot("pre-foundation")
+
     # ── Foundation ────────────────────────────────────────────────────────
     if rp.should_run("foundation"):
         t_start = time.time()
@@ -288,6 +394,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"Foundation complete. k_background={fov.k_background}  "
             f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
         ), flush=True)
+        _mem_snapshot("post-foundation")
     else:
         fov = rp.fov  # populated by plan_resume from disk
         print(fmt.sub_phase(
@@ -315,6 +422,9 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             )
         stage_timings["stage1_detect_s"] = time.time() - t_start
         n_detected = len(candidates)
+        print(fmt.sub_phase(
+            f"Cellpose: {_summarize_cellpose_probs(probs)}"
+        ), flush=True)
 
         # Save raw Stage 1 outputs (pre-gate)
         (output_dir / "stage1").mkdir(exist_ok=True)
@@ -334,6 +444,11 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
         n_reject = sum(1 for r in rois if r.gate_outcome == "reject")
         print(fmt.gate_outcome(1, n_detected, n_accept, n_flag, n_reject), flush=True)
+        if n_reject:
+            print(fmt.sub_phase(
+                f"Gate 1 reject reasons: {_gate_reject_histogram(rois)}"
+            ), flush=True)
+        _mem_snapshot("post-stage1+gate1")
 
         # Save Stage 1 mask image (accepted + flagged only — rejects not subtracted)
         stage1_mask_img = np.zeros(fov.mean_S.shape, dtype=np.uint16)
@@ -369,6 +484,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"({n_accept} accepted, {n_flag} flagged, {n_reject} rejected)"
         ), flush=True)
 
+    _mem_snapshot("pre-stage1-subtract")
+
     # ── Source subtraction (on accept + flag only) ────────────────────────
     if rp.should_run("stage1_subtract"):
         print(fmt.stage_header("1→S", "Source subtraction"), flush=True)
@@ -381,17 +498,17 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         # represent the neuron's spatial activity pattern. std_S = rms(S)
         # preserves it. See subtraction.estimate_spatial_profiles docstring.
         with _gpu_section(gpu_lock):
-            residual_S1_path, validation, traces = run_source_subtraction(
-                fov.residual_S_path,
-                fov.shape,
+            view_s1, validation, traces = run_source_subtraction(
+                fov.residual_view,
                 fov.std_S,
                 rois_to_subtract,
                 output_dir,
                 cfg,
-                delete_input=True,
+                stage_idx=1,
+                output_name="residual_S1",
             )
         stage_timings["subtraction_s"] = time.time() - t_start
-        fov.residual_S1_path = residual_S1_path
+        fov.residual_view = view_s1
 
         n_sub_pass = sum(1 for v in validation.values() if v.get("pass"))
         n_sub_total = len(validation)
@@ -411,7 +528,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             )
         update_manifest(output_dir, "stage1_subtract", cfg, tif_path)
     else:
-        # plan_resume already attached fov.residual_S1_path and validated it.
+        # plan_resume already rebuilt fov.residual_view with the Stage 1 layer.
         rois_to_subtract = [r for r in fov.rois
                             if r.source_stage == 1
                             and r.gate_outcome in ("accept", "flag")]
@@ -424,12 +541,15 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
 
     next_label = max((r.label_id for r in fov.rois), default=0) + 1
 
+    _mem_snapshot("pre-stage2")
+
     # ── Stage 2 Suite2p Temporal Detection ────────────────────────────────
     if rp.should_run("stage2") and cfg.enable_stage_2:
         print(fmt.stage_header(2, "Suite2p temporal detection"), flush=True)
         t_start = time.time()
         with _gpu_section(gpu_lock):
             stage2_candidates = run_stage2(fov, cfg, starting_label_id=next_label)
+        _mem_snapshot("stage2 post-run_stage2")
         stage1_for_gate2 = [r for r in fov.rois
                             if r.source_stage == 1
                             and r.gate_outcome in ("accept", "flag")]
@@ -441,6 +561,11 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         n2_flag = sum(1 for r in stage2_rois if r.gate_outcome == "flag")
         n2_rej = sum(1 for r in stage2_rois if r.gate_outcome == "reject")
         print(fmt.gate_outcome(2, n2_det, n2_acc, n2_flag, n2_rej), flush=True)
+        if n2_rej:
+            print(fmt.sub_phase(
+                f"Gate 2 reject reasons: {_gate_reject_histogram(stage2_rois)}"
+            ), flush=True)
+        _mem_snapshot("post-stage2+gate2")
 
         # Save Stage 2 outputs
         (output_dir / "stage2").mkdir(exist_ok=True)
@@ -493,27 +618,26 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
                        if r.source_stage == 2
                        and r.gate_outcome in ("accept", "flag")]
         if s2_subtract:
-            std_S1 = compute_std_map(fov.residual_S1_path, fov.shape,
-                                     chunk=cfg.reconstruct_chunk)
+            std_S1 = compute_std_map(fov.residual_view, chunk=cfg.reconstruct_chunk)
         else:
             std_S1 = fov.std_S  # unused when no ROIs, but pass something valid
         with _gpu_section(gpu_lock):
-            residual_S2_path, validation2, traces2 = run_source_subtraction(
-                fov.residual_S1_path, fov.shape, std_S1, s2_subtract,
+            view_s2, validation2, traces2 = run_source_subtraction(
+                fov.residual_view, std_S1, s2_subtract,
                 output_dir, cfg,
+                stage_idx=2,
                 output_name="residual_S2",
-                delete_input=True,
             )
         stage_timings["stage2_subtract_s"] = time.time() - t_start
-        fov.residual_S2_path = residual_S2_path
+        fov.residual_view = view_s2
         if s2_subtract:
             for roi, tr in zip(s2_subtract, traces2):
                 roi.trace = tr
         n2_sub_pass = sum(1 for v in validation2.values() if v.get("pass"))
         update_manifest(output_dir, "stage2_subtract", cfg, tif_path)
     elif rp.should_run("stage2_subtract"):
-        # No downstream consumer (or Stage 2 disabled). Stage 3+ readers will
-        # fall back to residual_S1 via _stage_input_residual; nothing to do.
+        # No downstream consumer (or Stage 2 disabled). The live residual view
+        # already represents the deepest subtraction applied; nothing to do.
         if not cfg.enable_stage_2:
             reason = "Stage 2 disabled"
         else:
@@ -541,26 +665,26 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"May indicate anti-correlation artifacts; review stage2_report.json."
         )
 
+    _mem_snapshot("pre-stage3")
+
     # ── Stage 3 Template Sweep ────────────────────────────────────────────
     template_bank = build_template_bank(cfg.fs, cfg.tau)
     if rp.should_run("stage3") and cfg.enable_stage_3:
-        # Stage 3 reads the latest residual on disk: S₂ if Stage 2 subtracted,
-        # else S₁. _stage_input_residual handles the fallback.
-        s3_input_residual = _stage_input_residual(fov, 3)
-        print(fmt.stage_header(3, f"Template sweep on {s3_input_residual.name}"),
-              flush=True)
+        # Stage 3 reads the live residual view (deepest subtraction applied:
+        # S₂ if Stage 2 subtracted, else S₁, else S — the view tracks this).
+        print(fmt.stage_header(3, "Template sweep on residual view"), flush=True)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
         with _gpu_section(gpu_lock):
             stage3_candidates = run_stage3(
-                s3_input_residual, fov, template_bank, cfg,
+                fov.residual_view, fov, template_bank, cfg,
                 starting_label_id=next_label,
             )
+        _mem_snapshot("post-stage3 run")
         prior_for_gate3 = [r for r in fov.rois
                            if r.gate_outcome in ("accept", "flag")]
         stage3_rois = evaluate_gate3(
-            stage3_candidates, prior_for_gate3, s3_input_residual,
-            fov.shape, template_bank, cfg,
+            stage3_candidates, prior_for_gate3, template_bank, cfg,
         )
         stage_timings["stage3_detect_s"] = time.time() - t_start
 
@@ -627,27 +751,25 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         and rp.should_run("stage3_subtract")
     )
     if s3_should_subtract:
-        s3_input_residual = _stage_input_residual(fov, 3)
-        print(fmt.stage_header("3→S", f"Source subtraction on {s3_input_residual.name}"),
+        print(fmt.stage_header("3→S", "Source subtraction on residual view"),
               flush=True)
         t_start = time.time()
         s3_subtract = [r for r in fov.rois
                        if r.source_stage == 3
                        and r.gate_outcome in ("accept", "flag")]
         if s3_subtract:
-            std_in = compute_std_map(s3_input_residual, fov.shape,
-                                     chunk=cfg.reconstruct_chunk)
+            std_in = compute_std_map(fov.residual_view, chunk=cfg.reconstruct_chunk)
         else:
             std_in = fov.std_S
         with _gpu_section(gpu_lock):
-            residual_S3_path, validation3, traces3 = run_source_subtraction(
-                s3_input_residual, fov.shape, std_in, s3_subtract,
+            view_s3, validation3, traces3 = run_source_subtraction(
+                fov.residual_view, std_in, s3_subtract,
                 output_dir, cfg,
+                stage_idx=3,
                 output_name="residual_S3",
-                delete_input=True,
             )
         stage_timings["stage3_subtract_s"] = time.time() - t_start
-        fov.residual_S3_path = residual_S3_path
+        fov.residual_view = view_s3
         if s3_subtract:
             for roi, tr in zip(s3_subtract, traces3):
                 roi.trace = tr
@@ -683,12 +805,11 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
 
     # ── Stage 4: Tonic Neuron Search ─────────────────────────────────────
     if rp.should_run("stage4") and cfg.enable_stage_4:
-        s4_input_residual = _stage_input_residual(fov, 4)
-        print(fmt.stage_header(4, f"Tonic neuron search on {s4_input_residual.name}"),
+        print(fmt.stage_header(4, "Tonic neuron search on residual view"),
               flush=True)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
-        stage4_candidates = run_stage4(s4_input_residual, fov, cfg,
+        stage4_candidates = run_stage4(fov.residual_view, fov, cfg,
                                        starting_label_id=next_label)
         prior_for_gate4 = [r for r in fov.rois
                            if r.gate_outcome in ("accept", "flag")]
@@ -743,19 +864,9 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     summary_warnings = print_detection_summary(fov)
     warnings.extend(summary_warnings)
 
-    # Drop the final residual — extract_all_traces reads data.bin (not any
-    # residual), so nothing downstream needs it. The deepest residual on disk
-    # depends on which stages ran (Stage N's subtraction deletes its input,
-    # so only one residual remains).
-    for residual_attr in ("residual_S3_path", "residual_S2_path",
-                          "residual_S1_path"):
-        p = getattr(fov, residual_attr, None)
-        if p and Path(p).exists():
-            Path(p).unlink()
-            meta = Path(p).with_suffix(".meta.json")
-            if meta.exists():
-                meta.unlink()
-            break
+    # No residual cleanup needed — the residual chain is virtual (no dense
+    # .dat files). The small *.sources.npz sidecars are retained so a later
+    # --resume can rebuild the view; extract_all_traces reads data.bin.
 
     # ── Post-detection: traces, overlap correction, features, classify,
     #    dF/F, deconvolution, HITL, final outputs ─────────────────────────
@@ -970,6 +1081,12 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="Indicator decay constant (default: 1.0, GCaMP6s).")
     parser.add_argument("--diameter", type=int, default=12,
                         help="Cellpose diameter (default 12).")
+    parser.add_argument("--diameter-auto", dest="diameter_auto",
+                        action="store_true", default=False,
+                        help=("Override --diameter with an image-based "
+                              "estimate (DoG peaks + Otsu sizing on mean_M) "
+                              "computed at the start of Stage 1. Use when "
+                              "frame size or cell scale is unknown."))
     parser.add_argument("--cellprob-threshold", dest="cellprob_threshold",
                         type=float, default=-2.0,
                         help="Cellpose cell-probability threshold (default -2.0).")
@@ -978,6 +1095,18 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="Cellpose flow threshold (default 0.6).")
     parser.add_argument("--channels", type=_parse_channels, default=(1, 2),
                         help="Cellpose channels as 'cyto,nucleus' (default 1,2).")
+    parser.add_argument("--min-area", dest="min_area", type=int, default=None,
+                        help=("Gate 1 minimum ROI area in px² (default 80, "
+                              "tuned for 512×512 GRIN). Raise for prism / "
+                              "1024×1024 imaging."))
+    parser.add_argument("--max-area", dest="max_area", type=int, default=None,
+                        help=("Gate 1 maximum ROI area in px² (default 600, "
+                              "tuned for 512×512 GRIN). Raise for prism / "
+                              "1024×1024 imaging."))
+    parser.add_argument("--tile-norm-blocksize", dest="tile_norm_blocksize",
+                        type=int, default=None,
+                        help=("Cellpose tile-norm blocksize in px (default "
+                              "128). Roughly double for 1024×1024 inputs."))
     parser.add_argument("--k", type=int, default=30,
                         help="Background components for L+S separation (default 30).")
     parser.add_argument("--output-dir", type=Path, default=None,
@@ -1060,6 +1189,35 @@ def main(argv: "list[str] | None" = None) -> int:
                               "Cellpose operations. Overrides CUDA "
                               "auto-detection. Useful on non-CUDA machines "
                               "or when GPU memory is unavailable."))
+    # Gate 2 area overrides — escape hatch only; the common case derives
+    # Gate 2 bounds automatically from --min-area / --max-area (×0.75 / ×0.667).
+    parser.add_argument("--gate2-min-area", dest="gate2_min_area", type=int,
+                        default=None,
+                        help=("Gate 2 minimum ROI area in px² (default: "
+                              "0.75 × --min-area when --min-area is set, else "
+                              "PipelineConfig default of 60). Override only "
+                              "when Suite2p footprints differ significantly "
+                              "from Cellpose footprints."))
+    parser.add_argument("--gate2-max-area", dest="gate2_max_area", type=int,
+                        default=None,
+                        help=("Gate 2 maximum ROI area in px² (default: "
+                              "0.667 × --max-area when --max-area is set, "
+                              "else PipelineConfig default of 400)."))
+    # Stage 3 memory budget — the primary knob; pixel-chunk-rows is derived.
+    parser.add_argument("--stage3-chunk-budget-gb", dest="stage3_chunk_budget_gb",
+                        type=float, default=None,
+                        help=("Stage 3 per-chunk peak-memory budget in GB "
+                              "(default 1.0). The spatial chunk-row count is "
+                              "auto-derived from this budget, T, W, and "
+                              "n_fft. Raise on high-RAM machines to speed up "
+                              "Stage 3; lower to protect against OOM on "
+                              "memory-constrained hosts."))
+    parser.add_argument("--stage3-pixel-chunk-rows", dest="stage3_pixel_chunk_rows",
+                        type=int, default=None,
+                        help=("Stage 3 spatial chunk size in rows (default "
+                              "auto from --stage3-chunk-budget-gb). Set "
+                              "explicitly only to override the budget "
+                              "formula."))
 
     args = parser.parse_args(argv)
 
@@ -1134,6 +1292,27 @@ def _run_single(
         }.items()
         if v is not None
     }
+    stage1_overrides = {
+        k: v
+        for k, v in {
+            "min_area": args.min_area,
+            "max_area": args.max_area,
+            "tile_norm_blocksize": args.tile_norm_blocksize,
+        }.items()
+        if v is not None
+    }
+    gate2_overrides = _build_gate2_overrides(args)
+    stage3_overrides = {
+        k: v
+        for k, v in {
+            "stage3_chunk_budget_bytes": (
+                int(args.stage3_chunk_budget_gb * 1e9)
+                if args.stage3_chunk_budget_gb is not None else None
+            ),
+            "stage3_pixel_chunk_rows": args.stage3_pixel_chunk_rows,
+        }.items()
+        if v is not None
+    }
     cfg = PipelineConfig(
         fs=args.fs,
         frame_averaging=args.frame_averaging,
@@ -1141,6 +1320,7 @@ def _run_single(
         k_background=args.k,
         cellpose_model=args.model,
         diameter=args.diameter,
+        diameter_auto=args.diameter_auto,
         cellprob_threshold=args.cellprob_threshold,
         flow_threshold=args.flow_threshold,
         channels=args.channels,
@@ -1150,6 +1330,9 @@ def _run_single(
         force_cpu=args.force_cpu,
         **stage_overrides,
         **solver_overrides,
+        **stage1_overrides,
+        **gate2_overrides,
+        **stage3_overrides,
     )
 
     fov_stem = tif_path.stem.replace("_mc", "")
@@ -1271,6 +1454,27 @@ def _run_workspace(
         }.items()
         if v is not None
     }
+    ws_stage1_overrides = {
+        k: v
+        for k, v in {
+            "min_area": args.min_area,
+            "max_area": args.max_area,
+            "tile_norm_blocksize": args.tile_norm_blocksize,
+        }.items()
+        if v is not None
+    }
+    ws_gate2_overrides = _build_gate2_overrides(args)
+    ws_stage3_overrides = {
+        k: v
+        for k, v in {
+            "stage3_chunk_budget_bytes": (
+                int(args.stage3_chunk_budget_gb * 1e9)
+                if args.stage3_chunk_budget_gb is not None else None
+            ),
+            "stage3_pixel_chunk_rows": args.stage3_pixel_chunk_rows,
+        }.items()
+        if v is not None
+    }
     overrides = {
         "fs": args.fs,
         "frame_averaging": args.frame_averaging,
@@ -1278,6 +1482,7 @@ def _run_workspace(
         "k_background": args.k,
         "cellpose_model": args.model,
         "diameter": args.diameter,
+        "diameter_auto": args.diameter_auto,
         "cellprob_threshold": args.cellprob_threshold,
         "flow_threshold": args.flow_threshold,
         "channels": args.channels,
@@ -1286,6 +1491,9 @@ def _run_workspace(
         "force_cpu": args.force_cpu,
         **stage_overrides,
         **ws_solver_overrides,
+        **ws_stage1_overrides,
+        **ws_gate2_overrides,
+        **ws_stage3_overrides,
     }
 
     ws_results = run_with_workspace(

@@ -36,29 +36,26 @@ from roigbiv.pipeline.types import FOVData, PipelineConfig, ROI
 # ─────────────────────────────────────────────────────────────────────────
 
 def extract_traces_from_residual(
-    residual_path: Path,
-    shape: tuple,
+    view,
     masks: list[np.ndarray],
     chunk: int = 500,
 ) -> np.ndarray:
     """For each mask, return the mean trace across mask pixels over time.
 
-    Streams the (T, H, W) memmap in temporal chunks. Per chunk, reads all
-    pixels into RAM (~500 MB for a 500-frame slice of 512×512 float32) and
-    computes `traces[:, t0:t1] = (masks @ chunk.reshape(cs, H*W).T) / mask_sizes`.
+    Reconstructs the residual view in temporal chunks. Per chunk, computes
+    `traces[:, t0:t1] = (masks @ chunk.reshape(cs, H*W).T) / mask_sizes`.
 
     Parameters
     ----------
-    residual_path : Path to the (T, H, W) float32 memmap
-    shape         : (T, H, W)
-    masks         : list of N (H, W) bool arrays
-    chunk         : frames per temporal chunk
+    view  : ResidualView (reconstructs the (T, H, W) residual on demand)
+    masks : list of N (H, W) bool arrays
+    chunk : frames per temporal chunk
 
     Returns
     -------
     traces : (N, T) float32 — mean fluorescence per mask per frame
     """
-    T, H, W = shape
+    T, H, W = view.shape
     N = len(masks)
     if N == 0:
         return np.zeros((0, T), dtype=np.float32)
@@ -75,14 +72,12 @@ def extract_traces_from_residual(
     mask_sizes[mask_sizes == 0] = 1.0  # guard division
 
     traces = np.empty((N, T), dtype=np.float32)
-    mm = np.memmap(str(residual_path), dtype=np.float32, mode="r", shape=(T, H, W))
     for t0 in range(0, T, chunk):
         t1 = min(t0 + chunk, T)
         cs = t1 - t0
-        flat_chunk = np.asarray(mm[t0:t1], dtype=np.float32).reshape(cs, H * W)
+        flat_chunk = view.read_chunk(t0, t1).reshape(cs, H * W)
         # (N, H*W) @ (H*W, cs) → (N, cs), then divide by per-mask pixel counts
         traces[:, t0:t1] = (M @ flat_chunk.T) / mask_sizes[:, None]
-    del mm
     return traces
 
 
@@ -196,7 +191,7 @@ def run_stage2(
 
     Parameters
     ----------
-    fov               : FOVData with data_bin_path, residual_S1_path, shape, rois
+    fov               : FOVData with data_bin_path, residual_view, shape, rois
                          (Stage 1 ROIs expected to be populated on fov.rois)
     cfg               : PipelineConfig
     starting_label_id : int — first label to assign to Stage 2 ROIs
@@ -233,14 +228,13 @@ def run_stage2(
     if not kept:
         return []
 
-    # 4. Extract traces from S₁
+    # 4. Extract traces from S₁ (the live view already carries the Stage 1
+    #    subtraction layer; if Stage 1 subtracted nothing it's identical to S).
     t0 = time.time()
     masks_only = [m for _, m, _ in kept]
-    # Prefer residual_S1; fall back to residual_S if Stage 1 was skipped (no ROIs subtracted)
-    trace_src = fov.residual_S1_path if fov.residual_S1_path is not None else fov.residual_S_path
-    traces = extract_traces_from_residual(trace_src, fov.shape, masks_only,
+    traces = extract_traces_from_residual(fov.residual_view, masks_only,
                                           chunk=cfg.reconstruct_chunk)
-    print(f"  extracted {len(kept)} traces from {trace_src.name} in {time.time()-t0:.2f}s",
+    print(f"  extracted {len(kept)} traces from residual view in {time.time()-t0:.2f}s",
           flush=True)
 
     # 5. Package as ROI objects — Gate 2 fills in spatial features later

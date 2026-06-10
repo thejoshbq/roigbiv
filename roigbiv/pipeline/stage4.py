@@ -54,28 +54,32 @@ from roigbiv.pipeline.types import ROI, FOVData, PipelineConfig
 # ─────────────────────────────────────────────────────────────────────────
 
 def detrend_to_memmap(
-    in_path: Path,
+    view_in,
     out_path: Path,
     shape: tuple,
     chunk_rows: int = 16,
 ) -> None:
-    """Per-pixel linear detrend on a (T, H, W) memmap.
+    """Per-pixel linear detrend of a residual view into a (T, H, W) memmap.
 
     Vectorized OLS: subtract slope*t + intercept from each pixel's timecourse.
-    Streams spatial chunks so RAM stays bounded regardless of T.
+    Streams spatial bands (reconstructed on demand from the view) so RAM stays
+    bounded regardless of T.
 
-    Writes a new float32 memmap at `out_path`. Does NOT modify input.
+    Writes a new float32 memmap at `out_path` (disk-guarded). Reads the input
+    via the lazy residual view; nothing is modified in place.
     """
+    from roigbiv.pipeline.diskguard import ensure_free_space
+
     T, H, W = shape
     t_c = np.arange(T, dtype=np.float32) - (T - 1) / 2.0
     denom = float((t_c ** 2).sum())
 
-    in_mm = np.memmap(str(in_path), dtype=np.float32, mode="r", shape=shape)
-    out_mm = np.memmap(str(out_path), dtype=np.float32, mode="w+", shape=shape)
+    ensure_free_space(out_path, T * H * W * 4, label="stage4 detrend")
+    out_mm = np.memmap(str(out_path), dtype=np.float32, mode="r+", shape=shape)
 
     for y0 in range(0, H, chunk_rows):
         y1 = min(y0 + chunk_rows, H)
-        chunk = np.asarray(in_mm[:, y0:y1, :], dtype=np.float32)     # (T, h, W)
+        chunk = view_in.read_rows(y0, y1)                             # (T, h, W)
         intercept = chunk.mean(axis=0)                                # (h, W)
         slope = np.tensordot(t_c, chunk, axes=(0, 0)) / denom         # (h, W)
         out_mm[:, y0:y1, :] = (
@@ -84,7 +88,7 @@ def detrend_to_memmap(
         ).astype(np.float32)
 
     out_mm.flush()
-    del out_mm, in_mm
+    del out_mm
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -112,8 +116,10 @@ def bandpass_to_memmap(
         raise ValueError(f"Invalid bandpass: [{low}, {high}] Hz with fs={fs}")
     sos = butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
 
+    from roigbiv.pipeline.diskguard import ensure_free_space
+    ensure_free_space(out_path, T * H * W * 4, label=f"stage4 bandpass {low}-{high}Hz")
     in_mm = np.memmap(str(in_path), dtype=np.float32, mode="r", shape=shape)
-    out_mm = np.memmap(str(out_path), dtype=np.float32, mode="w+", shape=shape)
+    out_mm = np.memmap(str(out_path), dtype=np.float32, mode="r+", shape=shape)
 
     for y0 in range(0, H, chunk_rows):
         y1 = min(y0 + chunk_rows, H)
@@ -429,7 +435,7 @@ def _run_one_window(
 # ─────────────────────────────────────────────────────────────────────────
 
 def run_stage4(
-    residual_S3_path: Path,
+    residual_view,
     fov: FOVData,
     cfg: PipelineConfig,
     starting_label_id: int = 1,
@@ -453,9 +459,8 @@ def run_stage4(
     """
     T, H, W = fov.shape
 
-    # Open S₃ read-only to verify existence
-    if not Path(residual_S3_path).exists():
-        raise FileNotFoundError(f"Stage 4 needs residual_S3 at {residual_S3_path}")
+    if residual_view is None:
+        raise ValueError("Stage 4 needs a residual view (S₃)")
 
     fov.corr_contrast_maps = {}
     candidates_per_window: list[list[dict]] = []
@@ -466,7 +471,7 @@ def run_stage4(
         detrended_path = tmp / "S3_detrended.dat"
 
         print(f"Stage 4: detrending S₃ (T={T}, H={H}, W={W})", flush=True)
-        detrend_to_memmap(residual_S3_path, detrended_path,
+        detrend_to_memmap(residual_view, detrended_path,
                           fov.shape, chunk_rows=cfg.stage4_pixel_chunk_rows)
 
         n_windows = len(cfg.bandpass_windows)
@@ -513,7 +518,7 @@ def run_stage4(
         # Extract traces from S₃ for surviving candidates
         if merged:
             masks = [c["mask"] for c in merged]
-            traces = extract_traces_from_residual(residual_S3_path, fov.shape, masks,
+            traces = extract_traces_from_residual(residual_view, masks,
                                                   chunk=cfg.reconstruct_chunk)
         else:
             traces = np.zeros((0, T), dtype=np.float32)

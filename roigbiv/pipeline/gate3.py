@@ -25,7 +25,6 @@ from pathlib import Path
 import numpy as np
 from skimage.measure import regionprops
 
-from roigbiv.pipeline.stage2 import extract_traces_from_residual
 from roigbiv.pipeline.types import ROI, PipelineConfig
 
 
@@ -184,8 +183,6 @@ def _pearson_row(a: np.ndarray, B: np.ndarray) -> np.ndarray:
 def evaluate_gate3(
     candidates: list[ROI],
     prior_rois: list[ROI],
-    residual_path: Path,
-    shape: tuple,
     template_bank: list[tuple[str, np.ndarray]],
     cfg: PipelineConfig,
 ) -> list[ROI]:
