@@ -130,6 +130,7 @@ def test_stage3_synthetic_event_detection():
     Stage 3 recovers most of them via FFT template matching."""
     from roigbiv.pipeline.stage3 import run_stage3
     from roigbiv.pipeline.stage3_templates import build_template_bank
+    from roigbiv.pipeline.residual import ResidualView
     from roigbiv.pipeline.types import FOVData, PipelineConfig
 
     T, H, W = 400, 64, 64
@@ -159,11 +160,7 @@ def test_stage3_synthetic_event_detection():
                     residual[t0:end, y, x] += amp * tmpl[: end - t0]
 
     with tempfile.TemporaryDirectory() as td:
-        rpath = Path(td) / "test_residual.dat"
-        mm = np.memmap(str(rpath), dtype=np.float32, mode="w+", shape=(T, H, W))
-        mm[:] = residual
-        mm.flush()
-        del mm
+        view = ResidualView.from_dense(residual)
 
         cfg = PipelineConfig(
             fs=fs, tau=tau, reconstruct_chunk=200,
@@ -179,7 +176,7 @@ def test_stage3_synthetic_event_detection():
             output_dir=Path(td),
             data_bin_path=Path(td) / "data.bin",
             shape=(T, H, W),
-            residual_S_path=rpath,
+            residual_view=view,
             mean_M=np.zeros((H, W), dtype=np.float32),
             mean_S=np.zeros((H, W), dtype=np.float32),
             max_S=np.zeros((H, W), dtype=np.float32),
@@ -189,7 +186,7 @@ def test_stage3_synthetic_event_detection():
             mean_L=np.zeros((H, W), dtype=np.float32),
             k_background=30,
         )
-        rois = run_stage3(rpath, fov, bank, cfg, starting_label_id=1)
+        rois = run_stage3(view, fov, bank, cfg, starting_label_id=1)
 
     assert len(rois) >= 2, f"expected ≥ 2 candidates, got {len(rois)}"
     # Match each truth event to the nearest recovered centroid

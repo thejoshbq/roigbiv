@@ -31,6 +31,7 @@ import numpy as np
 def test_detrend_removes_linear_drift():
     """Per-pixel linear detrend: a pure ramp becomes near-zero."""
     from roigbiv.pipeline.stage4 import detrend_to_memmap
+    from roigbiv.pipeline.residual import ResidualView
 
     T, H, W = 200, 16, 16
     # Each pixel has a linear drift plus pixel-specific offset
@@ -40,13 +41,10 @@ def test_detrend_removes_linear_drift():
     data = drift + offsets[None, :, :]
 
     with tempfile.TemporaryDirectory() as td:
-        in_p = Path(td) / "in.dat"
         out_p = Path(td) / "out.dat"
-        mm = np.memmap(str(in_p), dtype=np.float32, mode="w+", shape=(T, H, W))
-        mm[:] = data.astype(np.float32)
-        mm.flush(); del mm
+        view = ResidualView.from_dense(data.astype(np.float32))
 
-        detrend_to_memmap(in_p, out_p, (T, H, W), chunk_rows=4)
+        detrend_to_memmap(view, out_p, (T, H, W), chunk_rows=4)
         out = np.memmap(str(out_p), dtype=np.float32, mode="r", shape=(T, H, W))
         resid = np.asarray(out)
     max_abs = float(np.max(np.abs(resid)))

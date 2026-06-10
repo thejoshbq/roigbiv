@@ -1,13 +1,13 @@
 """
 Scoped end-to-end test of Stages 2 + 3 on an existing Phase 1B output directory.
 
-Approach:
-  1. Reconstruct FOVData from the previous session's pipeline outputs
-     (residual_S1.dat + summary TIFs + roi_metadata.json + stage1_masks.tif).
-  2. Re-extract Stage 1 traces from residual_S.dat using each mask (proxy for
-     the in-memory traces that weren't persisted by to_serializable).
-  3. Run Stage 2 → Gate 2 → subtract → residual_S2.dat.
-  4. Run Stage 3 → Gate 3 → subtract → residual_S3.dat.
+Approach (virtual-residual model — no dense .dat files):
+  1. Rebuild the foundation residual view from svd_factors.npz + data.bin, plus
+     summary TIFs + roi_metadata.json + stage1_masks.tif.
+  2. Re-extract Stage 1 traces from the foundation view using each mask (proxy
+     for the in-memory traces that weren't persisted by to_serializable).
+  3. Run Stage 2 → Gate 2 → subtract (append S₂ layer to the view).
+  4. Run Stage 3 → Gate 3 → subtract (append S₃ layer to the view).
   5. Report counts, timing, and validation stats.
 
 Run:
@@ -47,14 +47,13 @@ def _load_shape() -> tuple:
 def _reconstruct_stage1_rois(
     roi_meta_path: Path,
     stage1_masks_path: Path,
-    residual_S_path: Path,
-    shape: tuple,
+    view,
     chunk: int = 500,
 ) -> list[ROI]:
     """Rebuild ROI objects from on-disk metadata + labeled mask image.
 
-    Re-extract traces from residual_S.dat (pre-Stage-1 subtraction) since
-    traces were stripped by to_serializable during Phase 1B.
+    Re-extract traces from the foundation residual view (pre-Stage-1
+    subtraction) since traces were stripped by to_serializable during Phase 1B.
     """
     roi_meta = json.loads(roi_meta_path.read_text())
     labels = tifffile.imread(str(stage1_masks_path))
@@ -88,11 +87,9 @@ def _reconstruct_stage1_rois(
 
     if masks_for_trace:
         print(f"  re-extracting {len(masks_for_trace)} Stage 1 traces "
-              f"from {residual_S_path.name} ...", flush=True)
+              f"from foundation residual view ...", flush=True)
         t0 = time.time()
-        traces = extract_traces_from_residual(
-            residual_S_path, shape, masks_for_trace, chunk=chunk,
-        )
+        traces = extract_traces_from_residual(view, masks_for_trace, chunk=chunk)
         print(f"    done in {time.time()-t0:.1f}s", flush=True)
         for idx, tr in zip(masks_idx, traces):
             rois[idx].trace = tr
@@ -100,6 +97,8 @@ def _reconstruct_stage1_rois(
 
 
 def main():
+    from roigbiv.pipeline.residual import ResidualView, SourceLayer
+
     print(f"[harness] Loading Phase 1B state from {OUTPUT_DIR}", flush=True)
     shape = _load_shape()
     T, H, W = shape
@@ -118,28 +117,37 @@ def main():
     data_bin_path = OUTPUT_DIR / stem / "suite2p" / "plane0" / "data.bin"
     assert data_bin_path.exists(), f"missing data.bin at {data_bin_path}"
 
-    residual_S_path = OUTPUT_DIR / "residual_S.dat"
-    residual_S1_path = OUTPUT_DIR / "residual_S1.dat"
+    # Foundation residual view (S, pre-Stage-1 subtraction).
+    foundation_view = ResidualView.from_foundation(
+        data_bin_path, OUTPUT_DIR / "svd_factors.npz", shape, k_background=30,
+    )
 
-    # Reconstruct Stage 1 ROIs with freshly-extracted traces
+    # Reconstruct Stage 1 ROIs with freshly-extracted traces (from S).
     rois = _reconstruct_stage1_rois(
         OUTPUT_DIR / "roi_metadata.json",
         OUTPUT_DIR / "stage1" / "stage1_masks.tif",
-        residual_S_path,
-        shape,
+        foundation_view,
     )
     n_accept = sum(1 for r in rois if r.gate_outcome == "accept")
     n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
     print(f"  loaded {len(rois)} Stage 1 ROIs "
           f"({n_accept} accepted + {n_flag} flagged with traces)", flush=True)
 
+    # S₁ view: foundation + the persisted Stage 1 subtraction layer.
+    s1_view = foundation_view
+    s1_sources = OUTPUT_DIR / "residual_S1.sources.npz"
+    if s1_sources.exists():
+        layer = SourceLayer.load(s1_sources)
+        if layer.traces.shape[0] > 0:
+            s1_view = foundation_view.with_source(
+                layer.flat_idx, layer.W_design, layer.traces, stage_idx=1)
+
     fov = FOVData(
         raw_path=Path("data/raw/T1_230201_PrL-NAc-G6-6F_HI-D1_FOV1_PRE-000_mc.tif"),
         output_dir=OUTPUT_DIR,
         data_bin_path=data_bin_path,
         shape=shape,
-        residual_S_path=residual_S_path,
-        residual_S1_path=residual_S1_path,
+        residual_view=s1_view,
         mean_M=mean_M, mean_S=mean_S, max_S=max_S, std_S=std_S,
         vcorr_S=vcorr_S, dog_map=dog_map, mean_L=mean_L,
         k_background=30,
@@ -147,13 +155,6 @@ def main():
     )
 
     cfg = PipelineConfig(fs=30.0, tau=1.0)
-
-    # FREE DISK: once traces are reconstructed, we can drop residual_S.dat
-    # (Stage 1 is done; it's no longer needed)
-    print(f"[harness] Freeing disk: deleting residual_S.dat "
-          f"({residual_S_path.stat().st_size / 1e9:.2f} GB)", flush=True)
-    residual_S_path.unlink()
-    fov.residual_S_path = residual_S1_path  # point to what's still on disk
 
     # ── Stage 2 ───────────────────────────────────────────────────────────
     print("\n[harness] Stage 2: Suite2p temporal detection", flush=True)
@@ -170,29 +171,24 @@ def main():
     print(f"  Stage 2: {n2_det} detected → {n2_acc} acc, {n2_flag} flag, {n2_rej} rej "
           f"in {time.time()-t0:.1f}s", flush=True)
 
-    # Subtract Stage 2 → S₂
+    # Subtract Stage 2 → S₂ (virtual — appends a layer to the view)
     print("\n[harness] Source subtraction (Stage 2 → S₂)", flush=True)
     t0 = time.time()
     s2_subtract = [r for r in stage2_rois if r.gate_outcome in ("accept", "flag")]
     if s2_subtract:
-        std_S1 = compute_std_map(residual_S1_path, shape, chunk=500)
-        residual_S2_path, val2, traces2 = run_source_subtraction(
-            residual_S1_path, shape, std_S1, s2_subtract, OUTPUT_DIR, cfg,
-            output_name="residual_S2",
+        std_S1 = compute_std_map(fov.residual_view, chunk=500)
+        view_s2, val2, traces2 = run_source_subtraction(
+            fov.residual_view, std_S1, s2_subtract, OUTPUT_DIR, cfg,
+            stage_idx=2, output_name="residual_S2",
         )
+        fov.residual_view = view_s2
         for roi, tr in zip(s2_subtract, traces2):
             roi.trace = tr
         n2_pass = sum(1 for v in val2.values() if v.get("pass"))
-        print(f"  S₂ written; {n2_pass}/{len(s2_subtract)} subtraction passes "
+        print(f"  S₂ layer written; {n2_pass}/{len(s2_subtract)} subtraction passes "
               f"in {time.time()-t0:.1f}s", flush=True)
-        fov.residual_S2_path = residual_S2_path
-        # FREE DISK: S1 no longer needed after S2 is written
-        print(f"  freeing disk: deleting residual_S1.dat", flush=True)
-        residual_S1_path.unlink()
     else:
         print("  no accept/flag ROIs to subtract; skipping", flush=True)
-        residual_S2_path = residual_S1_path
-        fov.residual_S2_path = residual_S2_path
 
     fov.rois.extend([r for r in stage2_rois if r.gate_outcome != "reject"])
 
@@ -202,12 +198,11 @@ def main():
     template_bank = build_template_bank(cfg.fs, cfg.tau)
     next_label = max((r.label_id for r in fov.rois), default=0) + 1
     stage3_candidates = run_stage3(
-        fov.residual_S2_path, fov, template_bank, cfg, starting_label_id=next_label,
+        fov.residual_view, fov, template_bank, cfg, starting_label_id=next_label,
     )
     prior_for_gate3 = [r for r in fov.rois if r.gate_outcome in ("accept", "flag")]
     stage3_rois = evaluate_gate3(
-        stage3_candidates, prior_for_gate3, fov.residual_S2_path, shape,
-        template_bank, cfg,
+        stage3_candidates, prior_for_gate3, template_bank, cfg,
     )
     n3_det = len(stage3_rois)
     n3_acc = sum(1 for r in stage3_rois if r.gate_outcome == "accept")
@@ -216,22 +211,20 @@ def main():
     print(f"  Stage 3: {n3_det} candidates → {n3_acc} acc, {n3_flag} flag, {n3_rej} rej "
           f"in {time.time()-t0:.1f}s", flush=True)
 
-    # Subtract Stage 3 → S₃
+    # Subtract Stage 3 → S₃ (virtual)
     print("\n[harness] Source subtraction (Stage 3 → S₃)", flush=True)
     t0 = time.time()
     s3_subtract = [r for r in stage3_rois if r.gate_outcome in ("accept", "flag")]
     if s3_subtract:
-        std_S2 = compute_std_map(fov.residual_S2_path, shape, chunk=500)
-        residual_S3_path, val3, traces3 = run_source_subtraction(
-            fov.residual_S2_path, shape, std_S2, s3_subtract, OUTPUT_DIR, cfg,
-            output_name="residual_S3",
+        std_S2 = compute_std_map(fov.residual_view, chunk=500)
+        view_s3, val3, traces3 = run_source_subtraction(
+            fov.residual_view, std_S2, s3_subtract, OUTPUT_DIR, cfg,
+            stage_idx=3, output_name="residual_S3",
         )
+        fov.residual_view = view_s3
         n3_pass = sum(1 for v in val3.values() if v.get("pass"))
-        print(f"  S₃ written; {n3_pass}/{len(s3_subtract)} subtraction passes "
+        print(f"  S₃ layer written; {n3_pass}/{len(s3_subtract)} subtraction passes "
               f"in {time.time()-t0:.1f}s", flush=True)
-        # FREE: S2 no longer needed
-        print(f"  freeing disk: deleting residual_S2.dat", flush=True)
-        fov.residual_S2_path.unlink()
     else:
         print("  no accept/flag ROIs to subtract; skipping", flush=True)
 

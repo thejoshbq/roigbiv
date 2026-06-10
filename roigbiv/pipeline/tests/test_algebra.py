@@ -124,6 +124,7 @@ def test_svd_deterministic():
 
 def test_summary_images():
     from roigbiv.pipeline.foundation import generate_summary_images
+    from roigbiv.pipeline.residual import ResidualView
 
     T, H, W = 200, 64, 64
     rng = np.random.RandomState(0)
@@ -138,14 +139,7 @@ def test_summary_images():
         # Add rank-1 outer product
         S += trace[:, None, None].astype(np.float32) * blob[None, :, :]
 
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "S.dat"
-        S_mm = np.memmap(str(path), dtype=np.float32, mode="w+", shape=(T, H, W))
-        S_mm[:] = S
-        S_mm.flush()
-        del S_mm
-
-        summaries = generate_summary_images(path, (T, H, W), chunk=50)
+    summaries = generate_summary_images(ResidualView.from_dense(S), chunk=50)
 
     mean_expected = S.mean(axis=0)
     std_expected = S.std(axis=0)
@@ -181,6 +175,7 @@ def test_subtraction_recovery():
         subtract_sources,
         validate_subtraction,
     )
+    from roigbiv.pipeline.residual import ResidualView
     from roigbiv.pipeline.types import ROI, PipelineConfig
 
     T, H, W = 500, 64, 64
@@ -209,46 +204,38 @@ def test_subtraction_recovery():
     for prof, trace in zip(profiles_true, true_traces):
         S += trace[:, None, None].astype(np.float32) * prof[None, :, :]
 
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        path_in = td / "S.dat"
-        mm = np.memmap(str(path_in), dtype=np.float32, mode="w+", shape=(T, H, W))
-        mm[:] = S
-        mm.flush()
-        del mm
+    view_in = ResidualView.from_dense(S)
 
-        rois = [
-            ROI(mask=m, label_id=i + 1, source_stage=1, confidence="high",
-                gate_outcome="accept")
-            for i, m in enumerate(masks)
-        ]
-        mean_S = S.mean(axis=0)
+    rois = [
+        ROI(mask=m, label_id=i + 1, source_stage=1, confidence="high",
+            gate_outcome="accept")
+        for i, m in enumerate(masks)
+    ]
+    mean_S = S.mean(axis=0)
 
-        profiles = estimate_spatial_profiles(mean_S, rois)
+    profiles = estimate_spatial_profiles(mean_S, rois)
 
-        cfg = PipelineConfig(fs=30, subtract_chunk_frames=200)
-        traces_est, _, _ = estimate_traces_simultaneous(path_in, (T, H, W), profiles, cfg)
+    cfg = PipelineConfig(fs=30, subtract_chunk_frames=200)
+    traces_est, _, _ = estimate_traces_simultaneous(view_in, profiles, cfg)
 
-        # Check trace recovery (correlation with true)
-        for i, (est, true) in enumerate(zip(traces_est, true_traces)):
-            corr = np.corrcoef(est, true)[0, 1]
-            assert corr > 0.95, f"ROI {i} trace recovery corr = {corr:.3f}"
+    # Check trace recovery (correlation with true)
+    for i, (est, true) in enumerate(zip(traces_est, true_traces)):
+        corr = np.corrcoef(est, true)[0, 1]
+        assert corr > 0.95, f"ROI {i} trace recovery corr = {corr:.3f}"
 
-        # Subtract and check residual RMS matches noise level
-        path_out = td / "S1.dat"
-        subtract_sources(path_in, path_out, (T, H, W), profiles, traces_est, chunk=100)
+    # Subtract (lazy) and check residual RMS matches noise level
+    view_out = subtract_sources(view_in, profiles, traces_est, stage_idx=1)
 
-        S1 = np.memmap(str(path_out), dtype=np.float32, mode="r", shape=(T, H, W))
-        for i, m in enumerate(masks):
-            rms_mask = S1[:, m].std()
-            # Residual at mask should be within 5x the injected noise level
-            assert rms_mask < 1.5, f"ROI {i} residual RMS at mask = {rms_mask:.3f} (expected near noise ~0.3)"
+    S1 = view_out.read_chunk(0, T)
+    for i, m in enumerate(masks):
+        rms_mask = S1[:, m].std()
+        # Residual at mask should be within 5x the injected noise level
+        assert rms_mask < 1.5, f"ROI {i} residual RMS at mask = {rms_mask:.3f} (expected near noise ~0.3)"
 
-        # Validation
-        validation = validate_subtraction(path_in, path_out, (T, H, W), rois, traces_est, cfg)
-        n_pass = sum(1 for v in validation.values() if v["pass"])
-        assert n_pass == len(rois), f"Only {n_pass}/{len(rois)} ROIs passed validation"
-        del S1
+    # Validation
+    validation = validate_subtraction(view_out, rois, traces_est, cfg)
+    n_pass = sum(1 for v in validation.values() if v["pass"])
+    assert n_pass == len(rois), f"Only {n_pass}/{len(rois)} ROIs passed validation"
 
     print(f"  ✓ Subtraction recovers {len(rois)} known traces (all corr > 0.95, "
           f"validation pass {n_pass}/{len(rois)})")

@@ -62,12 +62,19 @@ def _make_foundation(output_dir: Path) -> None:
     np.save(str(output_dir / "suite2p" / "plane0" / "ops.npy"),
             np.array({"Ly": H, "Lx": W}, dtype=object), allow_pickle=True)
 
-    # residual_S.dat + meta
-    np.zeros((T, H, W), dtype=np.float32).tofile(
-        str(output_dir / "residual_S.dat")
+    # svd_factors.npz + virtual residual_S meta (no dense .dat).
+    n_svd = 2
+    np.savez(
+        str(output_dir / "svd_factors.npz"),
+        U=np.zeros((H * W, n_svd), dtype=np.float32),
+        S=np.zeros(n_svd, dtype=np.float32),
+        V_bin=np.zeros((T, n_svd), dtype=np.float32),
+        bin_size=np.int32(1),
+        T=np.int32(T),
     )
     (output_dir / "residual_S.meta.json").write_text(
-        json.dumps({"shape": [T, H, W], "dtype": "float32"})
+        json.dumps({"shape": [T, H, W], "dtype": "float32", "kind": "virtual",
+                    "svd_factors": "svd_factors.npz"})
     )
 
     # motion trace
@@ -80,12 +87,19 @@ def _make_foundation(output_dir: Path) -> None:
 
 
 def _write_residual(output_dir: Path, stage_idx: int) -> None:
+    """Write a virtual residual source sidecar for a completed subtraction."""
+    from roigbiv.pipeline.residual import SourceLayer
     T, H, W = SHAPE_T_H_W
-    np.zeros((T, H, W), dtype=np.float32).tofile(
-        str(output_dir / f"residual_S{stage_idx}.dat")
+    layer = SourceLayer(
+        flat_idx=np.array([0], dtype=np.int64),
+        W_design=np.ones((1, 1), dtype=np.float32),
+        traces=np.zeros((1, T), dtype=np.float32),
+        stage_idx=stage_idx,
     )
+    layer.save(output_dir / f"residual_S{stage_idx}.sources.npz")
     (output_dir / f"residual_S{stage_idx}.meta.json").write_text(
-        json.dumps({"shape": [T, H, W], "dtype": "float32"})
+        json.dumps({"shape": [T, H, W], "dtype": "float32", "kind": "virtual",
+                    "stage_idx": stage_idx, "n_sources": 1})
     )
 
 
@@ -312,14 +326,22 @@ def test_load_rois_raises_when_mask_missing_for_accept(workspace):
         )
 
 
-def test_verify_residual_detects_truncation(workspace):
+def test_verify_sources_detects_truncation(workspace):
+    """A sources sidecar whose W_design columns don't match |flat_idx| (a
+    partial write) must be rejected."""
     output_dir = workspace["output_dir"]
-    _write_residual(output_dir, 1)
-    # Truncate the dat by 8 bytes; meta still claims full shape.
-    dat = output_dir / "residual_S1.dat"
-    dat.write_bytes(dat.read_bytes()[:-8])
-    with pytest.raises(ResumeError, match="truncated"):
-        resume._verify_residual(dat, output_dir / "residual_S1.meta.json")
+    T = SHAPE_T_H_W[0]
+    sources_path = output_dir / "residual_S1.sources.npz"
+    # flat_idx has 3 pixels but W_design only has 1 column → inconsistent.
+    np.savez(
+        str(sources_path),
+        flat_idx=np.array([0, 1, 2], dtype=np.int64),
+        W_design=np.zeros((1, 1), dtype=np.float32),
+        traces=np.zeros((1, T), dtype=np.float32),
+        stage_idx=np.int32(1),
+    )
+    with pytest.raises(ResumeError, match="W_design"):
+        resume._verify_sources(sources_path, T)
 
 
 # ─────────────────────────── plan_resume ──────────────────────────────────
@@ -368,22 +390,23 @@ def test_plan_resume_after_stage1_with_residual_S1(workspace):
     plan = plan_resume(out, workspace["tif_path"], cfg, enable=True)
     assert plan.start_stage == "stage2"
     assert plan.fov is not None
-    assert plan.fov.residual_S1_path is not None
+    # The Stage 1 subtraction layer was rebuilt onto the live view.
+    assert len(plan.fov.residual_view.sources) == 1
     assert sorted(r.label_id for r in plan.fov.rois) == [1, 2]
     assert plan.prior_reports[1]["accepted"] == 1
 
 
 def test_plan_resume_replays_subtraction_when_only_detection_done(workspace):
     """Stage 1 detect ran (report exists), but subtraction died before
-    writing residual_S1.dat. residual_S.dat is still present → resume from
-    stage1_subtract."""
+    writing residual_S1.sources.npz. The substrate (svd_factors + data.bin) is
+    present → resume from stage1_subtract."""
     cfg = PipelineConfig(fs=7.5)
     out = workspace["output_dir"]
     _make_foundation(out)
     update_manifest(out, "foundation", cfg, workspace["tif_path"])
     _write_stage(out, 1, accept_label_ids=[1])
     update_manifest(out, "stage1", cfg, workspace["tif_path"])
-    # No residual_S1.dat yet.
+    # No residual_S1.sources.npz yet.
     plan = plan_resume(out, workspace["tif_path"], cfg, enable=True)
     assert plan.start_stage == "stage1_subtract"
     assert plan.fov is not None
@@ -392,9 +415,9 @@ def test_plan_resume_replays_subtraction_when_only_detection_done(workspace):
 def test_plan_resume_advances_past_skipped_subtraction(workspace):
     """Stage 2 detect ran but Stage 2's subtraction was intentionally skipped
     (Stage 3/4 disabled in the prior run, so no consumer needed S₂). Manifest
-    records stage2_subtract as status='skipped' and residual_S2.dat is absent.
-    plan_resume must NOT refuse; it advances to Stage 3 with no S₂ residual,
-    and run.py's _stage_input_residual will fall back to S₁."""
+    records stage2_subtract as status='skipped' and residual_S2.sources.npz is
+    absent. plan_resume must NOT refuse; it advances to Stage 3 with the live
+    view still at S₁ (only the Stage 1 layer applied)."""
     cfg = PipelineConfig(fs=7.5)
     out = workspace["output_dir"]
     _make_foundation(out)
@@ -409,10 +432,9 @@ def test_plan_resume_advances_past_skipped_subtraction(workspace):
                     status="skipped")
     plan = plan_resume(out, workspace["tif_path"], cfg, enable=True)
     assert plan.start_stage == "stage3"
-    # residual_S2_path stayed None — Stage 3's input fallback handles it.
+    # Stage 2 subtraction was skipped → the view carries only the Stage 1 layer.
     assert plan.fov is not None
-    assert plan.fov.residual_S2_path is None
-    assert plan.fov.residual_S1_path == out / "residual_S1.dat"
+    assert len(plan.fov.residual_view.sources) == 1
 
 
 def test_plan_resume_advances_past_skipped_detect(workspace):
@@ -438,21 +460,21 @@ def test_plan_resume_advances_past_skipped_detect(workspace):
 
 
 def test_plan_resume_refuses_when_manifest_claims_subtract_done_but_residual_gone(workspace):
-    """Manifest says stage1_subtract completed, but residual_S1.dat is gone.
-    Something (user, cleanup script) deleted the residual after the fact —
-    do not silently re-run subtraction; refuse and surface the inconsistency."""
+    """Manifest says stage1_subtract completed, but residual_S1.sources.npz is
+    gone. Something (user, cleanup script) deleted it after the fact — do not
+    silently re-run subtraction; refuse and surface the inconsistency."""
     cfg = PipelineConfig(fs=7.5)
     out = workspace["output_dir"]
     _make_foundation(out)
     _write_stage(out, 1, accept_label_ids=[1])
     _write_residual(out, 1)
     _write_stage(out, 2, accept_label_ids=[10])
-    (out / "residual_S1.dat").unlink()
+    (out / "residual_S1.sources.npz").unlink()
     update_manifest(out, "foundation", cfg, workspace["tif_path"])
     update_manifest(out, "stage1", cfg, workspace["tif_path"])
     update_manifest(out, "stage1_subtract", cfg, workspace["tif_path"])
     update_manifest(out, "stage2", cfg, workspace["tif_path"])
-    with pytest.raises(ResumeError, match="residual_S1.dat"):
+    with pytest.raises(ResumeError, match="residual_S1.sources.npz"):
         plan_resume(out, workspace["tif_path"], cfg, enable=True)
 
 
@@ -463,7 +485,7 @@ def test_plan_resume_refuses_when_manifest_claims_foundation_but_artifacts_gone(
     out = workspace["output_dir"]
     _make_foundation(out)
     update_manifest(out, "foundation", cfg, workspace["tif_path"])
-    (out / "residual_S.dat").unlink()
+    (out / "svd_factors.npz").unlink()
     with pytest.raises(ResumeError, match="foundation"):
         plan_resume(out, workspace["tif_path"], cfg, enable=True)
 
@@ -486,7 +508,8 @@ def test_plan_resume_all_stages_complete(workspace):
     plan = plan_resume(out, workspace["tif_path"], cfg, enable=True)
     assert plan.start_stage == "post_detection"
     assert sorted(r.label_id for r in plan.fov.rois) == [1, 2, 3, 4]
-    assert plan.fov.residual_S3_path is not None
+    # Stages 1-3 each appended a subtraction layer to the live view.
+    assert len(plan.fov.residual_view.sources) == 3
 
 
 def test_plan_resume_refuses_on_fingerprint_mismatch(workspace):
