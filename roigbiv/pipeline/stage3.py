@@ -121,57 +121,63 @@ def _process_chunk(
     n_pix = chunk_pixels.shape[0]
     K = template_freqs.shape[0]
 
-    x = torch.from_numpy(chunk_pixels).to(device)  # (n_pix, T)
+    # All GPU tensors are released in the ``finally`` even if an op raises
+    # mid-loop (e.g. CUDA OOM). Without this, a leaked chunk's tensors persist
+    # in the caching allocator and accumulate across chunks — the failure class
+    # behind the historical 114 GB blow-up on long FOVs.
+    x = x_freq = score_max = template_idx_max = mask = event_coords = None
+    try:
+        x = torch.from_numpy(chunk_pixels).to(device)  # (n_pix, T)
 
-    # Per-pixel MAD → σ (Gaussian-equivalent)
-    med = torch.median(x, dim=1).values                                # (n_pix,)
-    mad = torch.median(torch.abs(x - med[:, None]), dim=1).values      # (n_pix,)
-    sigma = torch.clamp(mad / 0.6745, min=1e-6)                        # (n_pix,)
+        # Per-pixel MAD → σ (Gaussian-equivalent)
+        med = torch.median(x, dim=1).values                                # (n_pix,)
+        mad = torch.median(torch.abs(x - med[:, None]), dim=1).values      # (n_pix,)
+        sigma = torch.clamp(mad / 0.6745, min=1e-6)                        # (n_pix,)
 
-    # FFT of traces once
-    x_freq = torch.fft.rfft(x, n=n_fft, dim=1)                         # (n_pix, n_rfft)
+        # FFT of traces once
+        x_freq = torch.fft.rfft(x, n=n_fft, dim=1)                         # (n_pix, n_rfft)
 
-    # Running max across templates — avoids materializing (n_pix, K, T)
-    score_max = torch.full((n_pix, T), -float("inf"), device=device)
-    template_idx_max = torch.zeros((n_pix, T), dtype=torch.int8, device=device)
+        # Running max across templates — avoids materializing (n_pix, K, T)
+        score_max = torch.full((n_pix, T), -float("inf"), device=device)
+        template_idx_max = torch.zeros((n_pix, T), dtype=torch.int8, device=device)
 
-    for k in range(K):
-        # Cross-correlation via FFT: ifft(fft(trace) * conj(fft(template)))
-        xcorr_k = torch.fft.irfft(x_freq * torch.conj(template_freqs[k : k + 1]),
-                                  n=n_fft, dim=1)[:, :T]               # (n_pix, T)
-        xcorr_k = xcorr_k / sigma[:, None]
-        update = xcorr_k > score_max
-        score_max = torch.where(update, xcorr_k, score_max)
-        template_idx_max = torch.where(
-            update,
-            torch.full_like(template_idx_max, k),
-            template_idx_max,
-        )
+        for k in range(K):
+            # Cross-correlation via FFT: ifft(fft(trace) * conj(fft(template)))
+            xcorr_k = torch.fft.irfft(x_freq * torch.conj(template_freqs[k : k + 1]),
+                                      n=n_fft, dim=1)[:, :T]               # (n_pix, T)
+            xcorr_k = xcorr_k / sigma[:, None]
+            update = xcorr_k > score_max
+            score_max = torch.where(update, xcorr_k, score_max)
+            template_idx_max = torch.where(
+                update,
+                torch.full_like(template_idx_max, k),
+                template_idx_max,
+            )
 
-    # Threshold. If the event count per chunk is catastrophic (typical of
-    # structured residuals at low σ), adaptively raise the threshold until
-    # the chunk yields ≤ max_per_chunk events — effectively turning the
-    # threshold into a "top-K by score" selector.
-    max_per_chunk = 200_000
-    effective_threshold = threshold
-    mask = score_max > effective_threshold
-    n_events = int(mask.sum().item())
-    bumps = 0
-    while n_events > max_per_chunk and bumps < 8:
-        effective_threshold += 1.0
+        # Threshold. If the event count per chunk is catastrophic (typical of
+        # structured residuals at low σ), adaptively raise the threshold until
+        # the chunk yields ≤ max_per_chunk events — effectively turning the
+        # threshold into a "top-K by score" selector.
+        max_per_chunk = 200_000
+        effective_threshold = threshold
         mask = score_max > effective_threshold
         n_events = int(mask.sum().item())
-        bumps += 1
+        bumps = 0
+        while n_events > max_per_chunk and bumps < 8:
+            effective_threshold += 1.0
+            mask = score_max > effective_threshold
+            n_events = int(mask.sum().item())
+            bumps += 1
 
-    event_coords = mask.nonzero(as_tuple=False)
-    pixel_idx = event_coords[:, 0].cpu().numpy()
-    times = event_coords[:, 1].cpu().numpy()
-    scores = score_max[event_coords[:, 0], event_coords[:, 1]].cpu().numpy()
-    tmpl_idx = template_idx_max[event_coords[:, 0], event_coords[:, 1]].cpu().numpy()
-
-    del x, x_freq, score_max, template_idx_max, mask, event_coords
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        event_coords = mask.nonzero(as_tuple=False)
+        pixel_idx = event_coords[:, 0].cpu().numpy()
+        times = event_coords[:, 1].cpu().numpy()
+        scores = score_max[event_coords[:, 0], event_coords[:, 1]].cpu().numpy()
+        tmpl_idx = template_idx_max[event_coords[:, 0], event_coords[:, 1]].cpu().numpy()
+    finally:
+        del x, x_freq, score_max, template_idx_max, mask, event_coords
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return pixel_idx.astype(np.int64), times.astype(np.int64), scores.astype(np.float32), tmpl_idx.astype(np.int8)
 
