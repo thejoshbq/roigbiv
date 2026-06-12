@@ -1,0 +1,78 @@
+# ── ROI G. Biv — PRISM imaging preset ────────────────────────────────────────
+# Documentary preset for 1024×1024 prism FOVs (Logan's data and similar).
+# Defaults in roigbiv/pipeline/types.py are tuned for 512×512 GRIN imaging.
+#
+# This file is DOCUMENTARY. The runtime does not load it. Pass these values
+# on the CLI:
+#
+#   roigbiv-pipeline --input data/<fov_dir>/ --fs 7.5 \
+#       --diameter 56 --min-area 1500 --max-area 5000 \
+#       --tile-norm-blocksize 256 \
+#       --flow-threshold 0.4 --cellprob-threshold -1.0 \
+#       --template-threshold 9.0
+#
+# Or use auto-calibration (recommended):
+#
+#   roigbiv-pipeline --input data/<fov_dir>/ --fs 7.5 \
+#       --diameter-auto --min-area 1500 --max-area 5000 \
+#       --tile-norm-blocksize 256 \
+#       --flow-threshold 0.4 --cellprob-threshold -1.0 \
+#       --template-threshold 9.0
+#
+# Gate 2 area bounds are automatically derived from --min-area / --max-area
+# (×0.75 and ×0.667 respectively). For the values above:
+#   gate2_min_area = round(1500 × 0.75) = 1125
+#   gate2_max_area = round(5000 × 0.667) = 3333
+# Override explicitly with --gate2-min-area / --gate2-max-area only if needed.
+#
+# For long recordings (T > 10k frames), Stage 3 auto-reduces chunk rows.
+# Raise budget if you have more RAM headroom:
+#   --stage3-chunk-budget-gb 4.0
+#
+# Stage 3 event threshold (IMPORTANT for prism). The GRIN default of 6.0 σ
+# saturates on the 1024² prism residual — the GCaMP template matches the
+# structured (non-Gaussian) background everywhere, emitting ~10⁸ events on a
+# 2k-frame FOV and degenerate Gate 3 yields. On the 27k-frame beh-006 FOV this
+# scaled to a host-RAM OOM before the accumulator was hard-capped. Raise it:
+#   --template-threshold 9.0      # start here; sweep 8–10 per dataset
+# The event accumulator is now bounded regardless (top --stage3-max-events by
+# score, default 2,000,000), so a too-low threshold degrades gracefully — it
+# no longer OOMs, but Gate 3 yield stays poor until the threshold is right.
+#
+# Numbers below are derived from `scripts/measure_prism_scale.py` run against
+# the three Logan FOVs at data/logan_cousa_trial/output/*/summary/mean_M.tif:
+#   median diameter ≈ 56 px,  median area ≈ 2480 px²,  p95 area ≈ 3350 px²
+# `min_area` sits below the empirical p5 (1713) and `max_area` above p95 ×1.5
+# to give Cellpose margin for under/over-segmentation edge cases.
+
+cellpose:
+  diameter: 56
+  diameter_auto: false   # set true to let Stage 1 estimate per-FOV
+  flow_threshold: 0.4
+  cellprob_threshold: -1.0
+  tile_norm_blocksize: 256
+
+gate1:
+  min_area: 1500
+  max_area: 5000
+
+gate2:
+  # Auto-derived; listed here for reference.
+  # gate2_min_area: 1125   (round(1500 × 0.75))
+  # gate2_max_area: 3333   (round(5000 × 0.667))
+
+# Motion correction (rowwise-pcc fast path). The generic default strip_height
+# is 32 rows; prism FOVs are dimmer (lower per-row SNR), so a taller strip buys
+# more signal per phase-correlation and further suppresses noise-driven warps:
+#   --motion-correction rowwise-pcc --mc-strip-height 48
+# The strip regularization (median + confidence + smoothing) is on by default and
+# is what suppresses the noise-driven per-row warps. The DoG band-pass
+# (--mc-prefilter) is OFF by default; prism's structured background is exactly the
+# case where it *might* help, so bench it on/off per FOV before committing. Use
+# --foundation-only to motion-correct and inspect the FOV before detection.
+motion_correction:
+  strip_height: 48
+
+# All other parameters: inherit from PipelineConfig defaults in
+# `roigbiv/pipeline/types.py`. Notably Gate 3/4 and subtraction settings are
+# unchanged from the GRIN defaults.

@@ -1,6 +1,11 @@
 # ── ROI G. Biv — Combined Pipeline Configuration ─────────────────────────────
 # All tunable parameters for the Suite2p + Cellpose consensus pipeline.
 # Override individual values with CLI flags; this file provides defaults.
+#
+# NOTE: This file is DOCUMENTARY. The runtime does not load it — see
+# `roigbiv/pipeline/types.py::PipelineConfig` for the values actually used.
+# Edits here change nothing without a matching `types.py` default update.
+# Variant presets (e.g. `pipeline.prism.yaml`) are also documentary.
 
 cellpose:
   # Path to the deployed Cellpose model (relative to project root)
@@ -23,6 +28,46 @@ cellpose:
 
   # Optional Cellpose3 image restoration before segmentation
   denoise: false
+
+motion_correction:
+  # Registration backend. CLI: --motion-correction {phasecorr|rowwise-pcc|legacy}.
+  # "phasecorr" (default): Suite2p rigid + non-rigid registration via
+  #   roigbiv/suite2p.py (the `suite2p:` section below tunes this path). Robust
+  #   on dim/low-SNR FOVs; matches legacy SIMA quality.
+  # "rowwise-pcc" (opt-in): GPU row-wise non-rigid phase correlation
+  #   (roigbiv/pipeline/registration.py). Fast on torch/CUDA. The strip
+  #   regularization below (taller strips + median/confidence + smoothing)
+  #   suppresses the noise-driven per-row warps of the original bench audit
+  #   (~30× less spurious warp on a still frame); disabling it reverts to them.
+  # "legacy" (opt-in): genuine SIMA HiddenMarkov2D(granularity='row') run in the
+  #   sima-legacy py3.8 sidecar conda env via subprocess
+  #   (roigbiv/pipeline/legacy_mc.py + scripts/sima_mc_worker.py). CPU-only and
+  #   slow; a faithful reproduction of the legacy notebook. Build the env once
+  #   with `bash envs/build_sima_legacy.sh`.
+  # All backends export {stem}_mc.tif into the per-FOV output dir.
+  backend: phasecorr
+
+  # rowwise-pcc tunables (CLI: --mc-max-displacement / --mc-strip-height /
+  # --mc-template-iters / --mc-prefilter / --mc-smooth-rows). Remaining knobs
+  # are types.py-only. max_displacement is shared with the legacy backend.
+  max_displacement: 50    # px clamp on rigid + per-strip shifts (SIMA parity)
+
+  # legacy (SIMA) backend tunables (CLI: --mc-sima-env / --mc-granularity).
+  sima_env: sima-legacy   # conda env hosting SIMA 1.3.2
+  granularity: row        # SIMA HMM2D granularity ('row' non-rigid | 'frame' rigid)
+  strip_height: 32        # horizontal strip height in rows for the non-rigid step
+  n_template_iters: 2     # template refinement iterations
+  subpixel_upsample: 10   # parabolic-refinement precision knob
+  frame_batch: 256        # frames per GPU batch (auto-capped by free VRAM)
+  # Quality-parity knobs (Option B). These suppress noise-driven per-row warps.
+  smooth_sigma_rows: 6.0       # per-row displacement-field smoothing
+  smooth_sigma_time: 1.0       # temporal smoothing across the frame batch
+  strip_confidence_weight: true  # median + confidence outlier rejection
+  # DoG band-pass: off by default (helps only with structured background; on
+  # white-noise-limited frames it degrades the peak). Bench per dataset.
+  prefilter: false
+  prefilter_sigma_low: 1.0     # shot-noise suppression (small blur)
+  prefilter_sigma_high: 8.0    # background high-pass (large blur)
 
 suite2p:
   # ── Data ──
@@ -48,27 +93,37 @@ suite2p:
   # Acquisition frame rate in Hz (uniform across all FOVs)
   fs: 30.0
 
-  # ── Registration ──
-  # Auto-detect: _mc filenames → OFF, else ON. This is the fallback default.
-  do_registration: 1
+  # ── Registration (phasecorr backend) ──
+  # NOTE: pipeline.yaml is a documentary defaults reference — it is NOT loaded at
+  # runtime. The phasecorr registration pass is driven by PipelineConfig.mc_s2p_*
+  # (defaults below) and overridden by the --mc-* CLI flags. The sweep harness
+  # behind these is scripts/sweep_suite2p_reg.py.
+  #
+  # TUNED DEFAULTS (block_size=[64,64] + 1Preg=true): full-session validation on
+  # the Logan Prism FOV (2271-frame mean vs a grid-aligned legacy SIMA mean)
+  # showed the old [128,128]/no-1Preg default reached only 58% of legacy cell-
+  # sharpness; these reach ~103% (at/above legacy), no over-fit banding. [64,64]
+  # alone gets 91%; 1Preg supplies the rest but is a 1-photon high-pass — for
+  # bright high-SNR 2P (non-Prism) data pass --no-mc-1preg / --mc-block-size 128 128.
+  do_registration: 1            # auto: _mc filenames → OFF, else ON
 
-  # Number of frames for reference image computation
-  nimg_init: 300
-
-  # Frames per GPU batch during registration (RTX 4060 8GB safe limit at 512×512)
-  batch_size: 500
-
-  # Gaussian smoothing of reference image (sigma in pixels)
-  smooth_sigma: 1.15
-
-  # Maximum shift as fraction of frame size
-  maxregshift: 0.1
-
-  # Enable non-rigid (piecewise) registration
-  nonrigid: true
-
-  # Block size in pixels for non-rigid registration
-  block_size: [128, 128]
+  nimg_init: 300                # frames for reference-image computation
+  batch_size: 500              # frames per GPU batch (detection path; registration uses its own)
+  smooth_sigma: 1.15            # spatial Gaussian blur of the reference (px)
+  smooth_sigma_time: 0          # temporal smoothing for shift estimation. CLI: --mc-smooth-sigma-time.
+                                # Raises SNR on dim frames but net-hurt on prism in the sweep.
+  maxregshift: 0.1              # rigid shift clamp (fraction of frame)
+  nonrigid: true                # enable piecewise (non-rigid) registration
+  block_size: [64, 64]          # TUNED. non-rigid block px. CLI: --mc-block-size H W. Finer than the
+                                # old [128,128]; [32,32] over-fits (background speckle) — do not go finer.
+  maxregshiftNR: 5              # max non-rigid block shift (px). CLI: --mc-maxregshift-nr.
+  two_step_registration: false  # rigid then non-rigid. CLI: --mc-two-step-reg.
+  # 1-photon high-pass before registration (Suite2p 1Preg family). Raises shift-
+  # estimation SNR on dim/low-contrast GRIN/prism frames. CLI: --mc-1preg / --no-mc-1preg.
+  "1Preg": true                 # TUNED (load-bearing for legacy parity; off = bright-2P path)
+  spatial_hp_reg: 42            # spatial high-pass window (px)
+  pre_smooth: 0                 # pre-high-pass Gaussian smoothing
+  spatial_taper: 40             # edge px tapered out of registration
 
   # ── Detection ──
   # Spatial scale: 0 = auto-detect from data. Cell diameter ~30 px → scale ~2
