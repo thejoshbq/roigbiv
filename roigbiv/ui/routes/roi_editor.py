@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import functools
 import io
+import json
 import threading
 from pathlib import Path
 
@@ -28,6 +29,12 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 from roigbiv.pipeline.corrections import apply_corrections, load_corrections
 from roigbiv.pipeline.loaders import load_fov_from_output_dir
 from roigbiv.pipeline.web_reingest import _mask_to_polygon_yx, reingest_from_annotations
+from roigbiv.ui.services.colors import (
+    SINGLE_COLOR,
+    color_for_feature,
+    color_for_gcid,
+    color_for_stage,
+)
 
 
 # ── Concurrency protection for concurrent browser-tab writes ─────────────────────
@@ -188,8 +195,42 @@ def _resolve_projection(output_dir: Path) -> Path:
 # ── Annotation serialisation ────────────────────────────────────────────────────
 
 
+def _gcid_by_label(output_dir: Path) -> dict[int, str]:
+    """Map ``local_label_id → global_cell_id`` from ``registry_match.json``.
+
+    Empty when the FOV has no registry match yet (common for single,
+    unregistered sessions) — gcid coloring then falls back to neutral gray.
+    """
+    reg_path = output_dir / "registry_match.json"
+    if not reg_path.exists():
+        return {}
+    try:
+        reg = json.loads(reg_path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[int, str] = {}
+    for entry in reg.get("cell_assignments", []):
+        try:
+            lid = int(entry.get("local_label_id"))
+            gid = entry.get("global_cell_id")
+        except (TypeError, ValueError):
+            continue
+        if gid:
+            out[lid] = str(gid)
+    return out
+
+
 def _rois_to_annotations(output_dir: Path) -> list[dict]:
-    """Load current ROI set (pipeline + corrections) → W3C annotation list."""
+    """Load current ROI set (pipeline + corrections) → W3C annotation list.
+
+    Each annotation carries a second ``roigbiv-attrs`` body holding the ROI's
+    provenance attributes plus the four precomputed view-mode colors
+    (single / stage / feature / gcid). The embedded editor's client-side
+    formatter reads this to recolor polygons live without a server round-trip.
+    The colors are computed here so the gcid hash (md5→HSV) need not be ported
+    to JS. The extra body is inert to ``reingest_from_annotations``, which keys
+    only off the SVG polygon geometry.
+    """
     fov, _ = load_fov_from_output_dir(output_dir)
     base_rois = list(fov.rois)
     if base_rois and base_rois[0].mask is not None:
@@ -202,6 +243,7 @@ def _rois_to_annotations(output_dir: Path) -> list[dict]:
 
     ops = load_corrections(output_dir)
     current_rois = apply_corrections(base_rois, ops, (H, W))
+    gcid_by_label = _gcid_by_label(output_dir)
 
     annotations = []
     for roi in current_rois:
@@ -213,11 +255,29 @@ def _rois_to_annotations(output_dir: Path) -> list[dict]:
         # Annotorious polygon: "x,y x,y ..." (x=col, y=row)
         points_str = " ".join(f"{x},{y}" for y, x in contour)
         svg_value = f'<svg><polygon points="{points_str}" /></svg>'
+        gcid = gcid_by_label.get(int(roi.label_id))
+        attrs = {
+            "label_id": int(roi.label_id),
+            "source_stage": int(roi.source_stage),
+            "activity_type": roi.activity_type,
+            "gate_outcome": str(roi.gate_outcome),
+            "global_cell_id": gcid,
+            "colors": {
+                "single": SINGLE_COLOR,
+                "stage": color_for_stage(roi.source_stage),
+                "feature": color_for_feature(roi.activity_type),
+                "gcid": color_for_gcid(gcid),
+            },
+        }
         annotations.append({
             "type": "Annotation",
             "id": f"roi-{roi.label_id}",
-            "body": [{"type": "TextualBody", "value": str(roi.label_id),
-                      "purpose": "tagging"}],
+            "body": [
+                {"type": "TextualBody", "value": str(roi.label_id),
+                 "purpose": "tagging"},
+                {"type": "TextualBody", "value": json.dumps(attrs),
+                 "purpose": "roigbiv-attrs"},
+            ],
             "target": {
                 "selector": {"type": "SvgSelector", "value": svg_value}
             },
@@ -257,10 +317,12 @@ _EDITOR_HTML = """\
     #btn-save { background: #0d6efd; border-color: #0d6efd; color: #fff; }
     #btn-save:hover { background: #0b5ed7; }
     #status { font-size: 11px; color: #888; margin-left: auto; min-width: 200px; text-align: right; }
-    .a9s-annotation .a9s-inner { stroke: #00d4ff !important; stroke-width: 3px !important;
-                                  fill: rgba(0,212,255,0.12) !important; }
+    /* Per-ROI stroke/fill is set inline by the formatRoi() formatter; the
+       selection highlight still wins via !important. */
     .a9s-annotation.selected .a9s-inner { stroke: #ff6b6b !important;
                                            fill: rgba(255,107,107,0.18) !important; }
+    /* Overlay toggle — hides every annotation while playback continues. */
+    #osd.overlay-off .a9s-annotationlayer { display: none !important; }
     /* ── Scrubber ─────────────────────────────────────────────────────── */
     #scrubber-bar { display: flex; align-items: center; gap: 8px;
                     padding: 6px 16px; background: #12141f; flex-shrink: 0;
@@ -342,10 +404,61 @@ const SAVE_URL       = {{ save_url | tojson }};
 const FRAME_URL_BASE = {{ frame_url | tojson }};
 const META_URL       = {{ meta_url | tojson }};
 
+// Seeded from query params so the first paint matches the Review controls,
+// before any postMessage arrives. Updated live by the 'roigbiv-style' listener.
+window._colorMode = {{ init_color | tojson }} || 'stage';
+window._overlayOn = ({{ init_overlay | tojson }} !== '0');
+
 let anno = null;
 let selectedAnnotation = null;
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+// ── ROI coloring (formatter reads colors embedded in the annotation body) ────
+function _fillFrom(c) {
+  // c is "rgba(r, g, b, a)" — reuse RGB, drop alpha to a translucent fill.
+  const m = /rgba?\(([^)]+)\)/.exec(c || '');
+  if (m) {
+    const p = m[1].split(',').map(s => s.trim());
+    return 'rgba(' + p[0] + ',' + p[1] + ',' + p[2] + ',0.15)';
+  }
+  return 'rgba(0,212,255,0.12)';
+}
+
+function _attrsOf(annotation) {
+  const bodies = Array.isArray(annotation.body) ? annotation.body
+               : (annotation.body ? [annotation.body] : []);
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i];
+    if (b && b.purpose === 'roigbiv-attrs') {
+      try { return JSON.parse(b.value); } catch (e) { return null; }
+    }
+  }
+  return null;
+}
+
+function formatRoi(annotation) {
+  const attrs  = _attrsOf(annotation);
+  const colors = attrs && attrs.colors;
+  const c = (colors && colors[window._colorMode]) || 'rgba(0,212,255,0.85)';
+  return { style: 'stroke:' + c + '; stroke-width:3px; fill:' + _fillFrom(c) + ';' };
+}
+
+function _applyOverlayVisibility() {
+  const osd = document.getElementById('osd');
+  if (osd) osd.classList.toggle('overlay-off', !window._overlayOn);
+}
+
+// Live style/overlay updates from the embedding Review page.
+window.addEventListener('message', function(e) {
+  if (e.origin !== window.location.origin) return;
+  const d = e.data || {};
+  if (d.type !== 'roigbiv-style') return;
+  if (d.color) window._colorMode = d.color;
+  window._overlayOn = !!d.overlay;
+  _applyOverlayVisibility();
+  if (anno) anno.setAnnotations(anno.getAnnotations());  // re-run formatter
+});
 
 const viewer = OpenSeadragon({
   id: 'osd',
@@ -377,9 +490,25 @@ viewer.addHandler('open', function() {
     disableEditor: true,
     allowEmpty: true,
     widgets: [],
+    formatter: formatRoi,
   });
+  _applyOverlayVisibility();
 
-  anno.on('selectAnnotation',  (a) => { selectedAnnotation = a; setStatus('ROI selected — press Delete to remove'); });
+  anno.on('selectAnnotation',  (a) => {
+    selectedAnnotation = a;
+    setStatus('ROI selected — press Delete to remove');
+    // Mirror selection to the embedding Review page so its ROI drawer +
+    // cross-session traces react. Only existing ROIs (id "roi-<label>")
+    // map to a label; freshly-drawn polygons have UUID ids and are skipped.
+    try {
+      const m = /^roi-(\\d+)$/.exec((a && a.id) ? String(a.id) : '');
+      if (m && window.parent && window.parent !== window) {
+        window.parent.postMessage(
+          { type: 'roigbiv-roi-selected', label_id: parseInt(m[1], 10) },
+          window.location.origin);
+      }
+    } catch (err) { /* not embedded — ignore */ }
+  });
   anno.on('cancelSelected',    ()  => { selectedAnnotation = null; setStatus('Ready'); });
   anno.on('createAnnotation',  (a) => { setStatus('ROI added — saving… (draw another or click Select when done)'); _scheduleSave(); });
   anno.on('updateAnnotation',  ()  => { setStatus('ROI updated — saving…'); _scheduleSave(); });
@@ -689,6 +818,10 @@ def register_flask_routes(server: Flask) -> None:
         except ValueError as exc:
             return str(exc), 400
         qs = f"?dir={dir_b64}"
+        color = request.args.get("color", "stage")
+        if color not in ("single", "stage", "feature", "gcid"):
+            color = "stage"
+        overlay = "0" if request.args.get("overlay", "1") == "0" else "1"
         return render_template_string(
             _EDITOR_HTML,
             fov_stem=fov_stem,
@@ -697,6 +830,8 @@ def register_flask_routes(server: Flask) -> None:
             save_url=f"/api/corrections/{fov_stem}{qs}",
             frame_url=f"/api/frame/{fov_stem}{qs}",
             meta_url=f"/api/fov-meta/{fov_stem}{qs}",
+            init_color=color,
+            init_overlay=overlay,
         )
 
     @server.route("/api/fov-image/<fov_stem>")

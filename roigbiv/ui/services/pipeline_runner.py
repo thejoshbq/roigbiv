@@ -16,12 +16,14 @@ running.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Sequence
 
 from roigbiv.pipeline.workspace import (
     FOVRunResult,
@@ -31,6 +33,52 @@ from roigbiv.pipeline.workspace import (
 from roigbiv.registry.config import RegistryConfig
 
 _MAX_LOG_LINES = 2000
+
+# ── stage-marker derivation ──────────────────────────────────────────────────
+# Pipeline stages are emitted as ``fmt.stage_header(n, label)`` lines of the
+# form ``--- Stage {n}: {label} ----``. In batch mode each line is prefixed
+# with ``[FOV i/n] `` (see workspace._process_one). We map the ``{n}`` token to
+# a short human label for the Run-status banner. Foundation has no stage_header
+# (it runs first), so a run begins on the Foundation label until Stage 1 fires.
+_FOUNDATION_STAGE = "Foundation · motion correction"
+
+# Ordered (token -> label). The token is matched exactly against the value
+# captured between "Stage " and ":".
+_STAGE_LABELS: dict[str, str] = {
+    "1": "Stage 1 · Cellpose detection",
+    "1→S": "Source subtraction",
+    "2": "Stage 2 · Temporal detection",
+    "2→S": "Source subtraction",
+    "3": "Stage 3 · Template sweep",
+    "3→S": "Source subtraction",
+    "4": "Stage 4 · Tonic search",
+    "Post": "Trace extraction + QC",
+    "Summary": "Detection complete",
+}
+
+# Optional leading "[FOV i/n] " prefix, then the stage marker.
+_FOV_PREFIX_RE = re.compile(r"^\[FOV\s+(\d+/\d+)\]\s*")
+_STAGE_MARKER_RE = re.compile(r"---\s*Stage\s+(\S+):")
+
+
+def _derive_stage(line: str) -> Optional[str]:
+    """Return a human stage label if ``line`` is a stage marker, else None.
+
+    Captures any ``[FOV i/n]`` batch prefix so the banner can read e.g.
+    ``FOV 2/5 · Stage 3 · Template sweep``.
+    """
+    fov_prefix = ""
+    m_fov = _FOV_PREFIX_RE.match(line)
+    if m_fov:
+        fov_prefix = f"FOV {m_fov.group(1)} · "
+        line = line[m_fov.end():]
+    m = _STAGE_MARKER_RE.search(line)
+    if not m:
+        return None
+    label = _STAGE_LABELS.get(m.group(1))
+    if label is None:
+        return None
+    return f"{fov_prefix}{label}"
 
 
 @dataclass
@@ -46,6 +94,7 @@ class RunSnapshot:
     logs: list[str]
     error: Optional[str]
     results_summary: list[dict] = field(default_factory=list)
+    current_stage: Optional[str] = None
 
 
 class PipelineRunner:
@@ -65,6 +114,8 @@ class PipelineRunner:
         self._error: Optional[str] = None
         self._results: list[FOVRunResult] = []
         self._registry_config: Optional[RegistryConfig] = None
+        self._slack_channel: Optional[str] = None
+        self._current_stage: Optional[str] = None
         self._last_accessed: float = time.monotonic()
 
     # ── control ───────────────────────────────────────────────────────────
@@ -73,12 +124,18 @@ class PipelineRunner:
         workspace: WorkspacePaths,
         overrides: dict,
         registry_config: Optional[RegistryConfig] = None,
+        slack_channel: Optional[str] = None,
+        selected_tifs: Optional[Sequence[Path]] = None,
     ) -> bool | str:
         """Kick off a run.
 
         Pass ``registry_config`` (from :attr:`AppState.registry_config`) so the
         pipeline never reads ``os.environ`` for registry paths, enabling safe
         concurrent sessions on different workspaces.
+
+        Pass ``slack_channel`` (a Slack channel ID) to post a run summary +
+        overlay PNGs when the batch finishes; the bot token is read from
+        ``ROIGBIV_SLACK_TOKEN`` in the environment that launched the UI.
 
         Returns:
           True    — run started successfully.
@@ -95,15 +152,20 @@ class PipelineRunner:
                     return False
                 self._reset_locked()
                 self._registry_config = registry_config
+                self._slack_channel = slack_channel
                 self._active = True
                 self._started_at = time.time()
-                self._n_fovs = len(workspace.tifs)
+                self._n_fovs = (len(selected_tifs) if selected_tifs is not None
+                                else len(workspace.tifs))
+                # Foundation runs first and emits no stage_header; show it until
+                # the first Stage marker streams in.
+                self._current_stage = _FOUNDATION_STAGE
         except Exception:
             self._gate.release()
             raise
         t = threading.Thread(
             target=self._run,
-            args=(workspace, overrides),
+            args=(workspace, overrides, selected_tifs),
             name="roigbiv-ui-pipeline",
             daemon=True,
         )
@@ -123,6 +185,7 @@ class PipelineRunner:
                 logs=list(self._logs),
                 error=self._error,
                 results_summary=[self._summarize(r) for r in self._results],
+                current_stage=self._current_stage,
             )
 
     def results(self) -> list[FOVRunResult]:
@@ -139,18 +202,21 @@ class PipelineRunner:
         self._n_failed = 0
         self._error = None
         self._results = []
+        self._current_stage = None
 
     def _log(self, line: str) -> None:
         with self._lock:
             self._logs.append(line)
 
-    def _run(self, workspace: WorkspacePaths, overrides: dict) -> None:
+    def _run(self, workspace: WorkspacePaths, overrides: dict,
+             selected_tifs: Optional[Sequence[Path]] = None) -> None:
         try:
             try:
                 results = run_with_workspace(
                     workspace, overrides,
                     log_cb=self._append_and_tally,
                     registry_config=self._registry_config,
+                    selected_tifs=selected_tifs,
                 )
             except BaseException as exc:  # noqa: BLE001
                 tb = traceback.format_exc()
@@ -169,14 +235,87 @@ class PipelineRunner:
                 self._active = False
         finally:
             self._gate.release()
+        # Post-run Slack notification (network + disk only; GPU gate already
+        # released so it never blocks another session's pipeline).
+        self._maybe_post_slack(results, overrides)
+
+    def _maybe_post_slack(self, results: list[FOVRunResult], overrides: dict) -> None:
+        """Render overlays + post a summary to Slack if a channel was set.
+
+        ``run_with_workspace`` does not render overlays (the CLI does this in
+        ``run.py::_run_workspace``), so we render here to have an image to
+        upload, then map each :class:`FOVRunResult` to the
+        :class:`~roigbiv.pipeline._email.EmailFOVResult` the notifier consumes.
+        Failures are surfaced as a single log line — never raised.
+        """
+        import os
+        from pathlib import Path
+
+        channel = self._slack_channel
+        if not channel or not results:
+            return
+        if not os.environ.get("ROIGBIV_SLACK_TOKEN"):
+            self._log("Slack: ROIGBIV_SLACK_TOKEN not set in the UI's "
+                      "environment; skipping notification.")
+            return
+
+        from roigbiv import overlay as _overlay
+        from roigbiv.pipeline._email import EmailFOVResult
+        from roigbiv.pipeline._slack import SlackParams, send_slack
+
+        model_name = Path(overrides.get("cellpose_model", "")).name
+        for r in results:
+            if r.error is not None or r.fov is None or r.png_path is not None:
+                continue
+            fov_stem = r.tif.stem.replace("_mc", "")
+            try:
+                r.png_path = _overlay.render_overlay(
+                    fov=r.fov, output_dir=r.output_dir,
+                    model_name=model_name, fov_stem=fov_stem,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self._log(f"Slack: overlay render failed for {fov_stem}: {exc}")
+
+        summary = {
+            "model_name": model_name,
+            "fs": overrides.get("fs", "?"),
+            "tau": overrides.get("tau", "?"),
+            "flow_threshold": overrides.get("flow_threshold", "?"),
+            "stage_flags": {
+                2: overrides.get("enable_stage_2"),
+                3: overrides.get("enable_stage_3"),
+                4: overrides.get("enable_stage_4"),
+            },
+        }
+        slack_results = [
+            EmailFOVResult(
+                tif=r.tif, output_dir=r.output_dir, duration_s=r.duration_s,
+                error=r.error, png_path=r.png_path,
+                roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
+            )
+            for r in results
+        ]
+        params = SlackParams(channel=channel, token_env="ROIGBIV_SLACK_TOKEN")
+        ok = send_slack(slack_results, params, summary)
+        self._log("Slack: summary + overlays posted." if ok else
+                  "Slack FAILED — see server logs; overlays remain on disk.")
 
     def _append_and_tally(self, line: str) -> None:
-        """Log callback that also counts completed FOVs from ``pipeline OK``."""
+        """Log callback that also counts completed FOVs and tracks the stage.
+
+        Counts ``pipeline OK`` lines for FOV completion and derives the current
+        stage from ``--- Stage N: ...`` markers so the Run-status banner can
+        name what the pipeline is doing.
+        """
         self._log(line)
         low = line.lstrip()
-        if low.startswith("pipeline OK"):
+        stage = _derive_stage(line)
+        if low.startswith("pipeline OK") or stage is not None:
             with self._lock:
-                self._n_done += 1
+                if low.startswith("pipeline OK"):
+                    self._n_done += 1
+                if stage is not None:
+                    self._current_stage = stage
 
     @staticmethod
     def _summarize(r: FOVRunResult) -> dict:

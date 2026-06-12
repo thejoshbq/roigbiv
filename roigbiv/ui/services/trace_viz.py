@@ -59,6 +59,20 @@ class GlobalCellRow:
     label_ids_by_session: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass
+class SingleROIData:
+    local_label_id: int
+    row_index: int
+    activity_type: Optional[str]
+    gate_outcome: str
+    source_label: str
+    fs: float
+    n_frames: int
+    dff: Optional[np.ndarray]           # (n_frames,) float32 or None
+    f_corrected: Optional[np.ndarray]   # (n_frames,) float32 or None
+    f_neuropil: Optional[np.ndarray]    # (n_frames,) float32 or None
+
+
 Y_LABELS: dict[SignalKind, str] = {
     "dff": "dF/F",
     "f": "F (neuropil-corrected)",
@@ -177,6 +191,81 @@ def load_session_traces(
         rows=list(sidecar.get("rois") or []),
         source_label=source_label,
         note=note,
+    )
+
+
+def fetch_single_roi_data(
+    output_dir: Path,
+    local_label_id: int,
+) -> Optional[SingleROIData]:
+    """Load all fluorescence channels for one ROI from the freshest bundle.
+
+    Returns None when no ``traces/`` bundle exists. f_corrected is loaded
+    via the shared LRU cache (full matrix); dff and neuropil are sliced
+    directly from disk — single-row reads not worth caching separately.
+    """
+    output_dir = Path(output_dir)
+    bundle_dir, source_label = _select_bundle_dir(output_dir)
+    if bundle_dir is None:
+        return None
+
+    meta_path = bundle_dir / "traces_meta.json"
+    sidecar = json.loads(meta_path.read_text())
+    entry = next(
+        (r for r in (sidecar.get("rois") or [])
+         if int(r.get("local_label_id", -1)) == int(local_label_id)),
+        None,
+    )
+    if entry is None:
+        return None
+
+    row_index = int(entry["row_index"])
+    fs = float(sidecar.get("fs") or 0.0)
+    n_frames = int(sidecar.get("n_frames") or 0)
+    mtime = meta_path.stat().st_mtime
+
+    matrix, _ = _load_cached(str(bundle_dir.resolve()), "f", mtime)
+    f_corrected = (np.asarray(matrix[row_index], dtype=np.float32)
+                   if matrix is not None else None)
+
+    f_neuropil: Optional[np.ndarray] = None
+    neuropil_path = bundle_dir / "traces_neuropil.npy"
+    if neuropil_path.exists():
+        try:
+            f_neuropil = np.asarray(
+                np.load(neuropil_path, mmap_mode="r")[row_index], dtype=np.float32,
+            )
+        except Exception:
+            pass
+
+    dff: Optional[np.ndarray] = None
+    local_dff = bundle_dir / "dFF.npy"
+    if local_dff.exists():
+        dff_path: Optional[Path] = local_dff
+    elif bundle_dir.name == "traces":
+        parent_dff = bundle_dir.parent / "dFF.npy"
+        dff_path = parent_dff if parent_dff.exists() else None
+    else:
+        dff_path = None
+    if dff_path is not None:
+        try:
+            dff = np.asarray(
+                np.load(dff_path, mmap_mode="r")[row_index], dtype=np.float32,
+            )
+        except Exception:
+            pass
+
+    return SingleROIData(
+        local_label_id=int(local_label_id),
+        row_index=row_index,
+        activity_type=entry.get("activity_type"),
+        gate_outcome=entry.get("gate_outcome", "unknown"),
+        source_label=source_label,
+        fs=fs,
+        n_frames=n_frames,
+        dff=dff,
+        f_corrected=f_corrected,
+        f_neuropil=f_neuropil,
     )
 
 

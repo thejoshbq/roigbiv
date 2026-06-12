@@ -21,11 +21,15 @@ import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.io import validate_tif
+from roigbiv.pipeline.loaders import _maybe_read_tif
 from roigbiv.pipeline.stage1 import list_available_models
 from roigbiv.pipeline.workspace import WorkspacePaths, resolve_workspace
+from roigbiv.ui.components.figure import build_roi_figure
+from roigbiv.ui.components.forms import HELP_TEXT, help_icon, labeled_with_help
 from roigbiv.ui.components.log_stream import log_stream
 from roigbiv.ui.services.app_state import get_app_state
-from roigbiv.ui.services.pipeline_runner import get_pipeline_runner
+from roigbiv.ui.services.loaders import list_motion_corrected_fovs, mc_input_mean
+from roigbiv.ui.services.pipeline_runner import RunSnapshot, get_pipeline_runner
 
 
 # ── layout ─────────────────────────────────────────────────────────────────
@@ -34,16 +38,31 @@ from roigbiv.ui.services.pipeline_runner import get_pipeline_runner
 def layout() -> html.Div:
     state = get_app_state()
     workspace = state.workspace
+    # Rehydrate the run UI on refresh: the PipelineRunner persists per Flask
+    # session, so a mid-run reload re-enables the interval and repaints the
+    # last snapshot rather than dropping back to an empty Run-status panel.
+    snap = get_pipeline_runner().snapshot()
+    has_run = snap.started_at is not None
     return html.Div([
-        dcc.Interval(id="roigbiv-process-tick", interval=1500, disabled=True),
+        dcc.Interval(id="roigbiv-process-tick", interval=1500,
+                     disabled=not snap.active),
+        # Benign sink for the TIF-selection sync callback (writes the user's
+        # subset into server-side AppState); kept in the always-present layout
+        # so its Output target exists before the first scan.
+        dcc.Store(id="roigbiv-tif-select-sink"),
         dbc.Row([
-            dbc.Col(_left_column(workspace), md=5, lg=4, className="pe-md-4"),
-            dbc.Col(_right_column(),         md=7, lg=8),
+            dbc.Col(_left_column(workspace, run_active=snap.active,
+                                 diameter_default=state.calibrated_diameter() or 12),
+                    md=5, lg=4, className="pe-md-4"),
+            dbc.Col(_right_column(snap if has_run else None),
+                    md=7, lg=8),
         ], className="g-3"),
     ])
 
 
-def _left_column(workspace: Optional[WorkspacePaths]) -> html.Div:
+def _left_column(workspace: Optional[WorkspacePaths],
+                 run_active: bool = False,
+                 diameter_default: int = 12) -> html.Div:
     return html.Div([
         html.H4("Workspace", className="mb-3"),
         dbc.InputGroup([
@@ -63,58 +82,467 @@ def _left_column(workspace: Optional[WorkspacePaths]) -> html.Div:
         ),
         html.Hr(className="roigbiv-h-line"),
         html.H5("Pipeline parameters", className="mb-2"),
-        _params_form(),
+        _params_form(diameter_default=diameter_default),
         dbc.Button("Run pipeline", id="roigbiv-run-btn",
                    color="primary", className="mt-3 w-100", n_clicks=0,
-                   disabled=workspace is None),
+                   disabled=workspace is None or run_active),
     ])
 
 
-def _params_form() -> dbc.Card:
-    row = lambda *children: dbc.Row(children, className="mb-2")    # noqa: E731
+def _field_row(label: str, target_id: str, control) -> dbc.Row:
+    """Label (with hover-help) + control, two columns."""
+    return dbc.Row([
+        dbc.Col(labeled_with_help(label, target_id, HELP_TEXT[target_id]),
+                md=6, className="d-flex align-items-center"),
+        dbc.Col(control, md=6),
+    ], className="mb-2")
+
+
+def _switch_row(switch: dbc.Switch, target_id: str):
+    """A ``dbc.Switch`` with a trailing hover-help icon."""
+    return html.Div(
+        [switch, *help_icon(target_id, HELP_TEXT[target_id])],
+        className="d-flex align-items-center mb-1",
+    )
+
+
+def _stage_card(title: str, body: list) -> dbc.Card:
+    return dbc.Card(dbc.CardBody([html.H6(title, className="mb-3"), *body]),
+                    className="mb-3")
+
+
+def _params_form(diameter_default: int = 12) -> html.Div:
     _model_opts = list_available_models()
-    return dbc.Card(dbc.CardBody([
-        row(
-            dbc.Col(dbc.Label("fs (Hz)", html_for="roigbiv-param-fs"), md=6),
-            dbc.Col(dbc.Input(id="roigbiv-param-fs",
-                              type="number", value=7.5, step=0.5), md=6),
+    foundation = _stage_card("Foundation", [
+        _field_row("fs (Hz)", "roigbiv-param-fs",
+                   dbc.Input(id="roigbiv-param-fs", type="number",
+                             value=7.5, step=0.5)),
+        _field_row("tau (s)", "roigbiv-param-tau",
+                   dbc.Input(id="roigbiv-param-tau", type="number",
+                             value=1.0, step=0.1)),
+        _field_row("k_background", "roigbiv-param-k",
+                   dbc.Input(id="roigbiv-param-k", type="number",
+                             value=30, step=1)),
+        _field_row("Motion correction", "roigbiv-param-mc-backend",
+                   dbc.Select(
+                       id="roigbiv-param-mc-backend",
+                       options=[
+                           {"label": "Row-wise non-rigid (rowwise-pcc)",
+                            "value": "rowwise-pcc"},
+                           {"label": "Suite2p (phasecorr)",
+                            "value": "phasecorr"},
+                           {"label": "Legacy SIMA HMM2D (legacy)",
+                            "value": "legacy"},
+                       ],
+                       value="phasecorr",
+                   )),
+        html.Small(
+            "Legacy = genuine SIMA HiddenMarkov2D from the original "
+            "notebook. CPU-only and slow (~16 min/session); requires "
+            "the 'sima-legacy' conda env (build once with "
+            "envs/build_sima_legacy.sh).",
+            id="roigbiv-param-mc-backend-help",
+            className="text-muted d-block mt-1",
         ),
-        row(
-            dbc.Col(dbc.Label("tau (s)", html_for="roigbiv-param-tau"), md=6),
-            dbc.Col(dbc.Input(id="roigbiv-param-tau",
-                              type="number", value=1.0, step=0.1), md=6),
+    ])
+    stage1 = _stage_card("Stage 1 · Cellpose detection", [
+        _field_row("Model", "roigbiv-param-model",
+                   dbc.Select(
+                       id="roigbiv-param-model",
+                       options=_model_opts,
+                       value=(_model_opts[0]["value"] if _model_opts
+                              else "models/deployed/current_model"),
+                   )),
+        _field_row("flow_threshold", "roigbiv-param-flow-threshold",
+                   dbc.Input(id="roigbiv-param-flow-threshold", type="number",
+                             value=0.4, step=0.05, min=0.0, max=3.0)),
+        _field_row("diameter (px)", "roigbiv-param-diameter",
+                   dbc.Input(id="roigbiv-param-diameter", type="number",
+                             value=diameter_default, step=1, min=3, max=200,
+                             debounce=True)),
+        html.Div([
+            dbc.Button("Suggest from image", id="roigbiv-mc-suggest-btn",
+                       size="sm", color="secondary", outline=True, n_clicks=0),
+            html.Small(id="roigbiv-mc-diameter-readout",
+                       className="text-muted ms-2"),
+        ], className="d-flex align-items-center mt-1"),
+        html.Small(
+            "Soma diameter in pixels. Drag the cyan circle on the "
+            "motion-correction preview to match a representative cell, or click "
+            "Suggest. Applies to every FOV in the run.",
+            className="text-muted d-block mt-1",
         ),
-        row(
-            dbc.Col(dbc.Label("k_background",
-                              html_for="roigbiv-param-k"), md=6),
-            dbc.Col(dbc.Input(id="roigbiv-param-k",
-                              type="number", value=30, step=1), md=6),
+    ])
+    stage_control = _stage_card("Stage control", [
+        html.Small(
+            "Foundation, Stage 1 (Cellpose), and gates 1–4 always run.",
+            className="text-muted d-block mb-2",
         ),
-        row(
-            dbc.Col(dbc.Label("Model", html_for="roigbiv-param-model"), md=6),
-            dbc.Col(
-                dbc.Select(
-                    id="roigbiv-param-model",
-                    options=_model_opts,
-                    value=(_model_opts[0]["value"]
-                           if _model_opts else "models/deployed/current_model"),
-                ),
-                md=6,
-            ),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-scout",
+                       label="Scout mode — Cellpose-only (fast triage)",
+                       value=False),
+            "roigbiv-param-scout",
         ),
-    ]))
+        html.Small(
+            "Skip SVD/L+S/residual; run only Cellpose + Gate 1 for fast FOV-"
+            "clarity and model checks. No traces/QC/registry — not analysis-"
+            "grade. Overrides the stage toggles below.",
+            className="text-muted d-block ms-4 mb-2",
+        ),
+        html.Hr(className="my-2"),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-foundation-only",
+                       label="Foundation-only — dry run (motion correction, "
+                             "then stop)",
+                       value=False),
+            "roigbiv-param-foundation-only",
+        ),
+        html.Small(
+            "Run motion correction + SVD/L+S + summary images, then stop before "
+            "ROI detection so you can inspect the corrected FOV first. View it in "
+            "Review. Re-run with Resume (foundation-only off) to continue. "
+            "Overrides the stage toggles below.",
+            className="text-muted d-block ms-4 mb-2",
+        ),
+        html.Hr(className="my-2"),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-stage-2",
+                       label="Stage 2 — Temporal Detection (Suite2p)",
+                       value=True),
+            "roigbiv-param-stage-2",
+        ),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-stage-3",
+                       label="Stage 3 — Template Sweep",
+                       value=True),
+            "roigbiv-param-stage-3",
+        ),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-stage-4",
+                       label="Stage 4 — Tonic Search",
+                       value=True),
+            "roigbiv-param-stage-4",
+        ),
+        html.Hr(className="my-2"),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-resume", label="Resume", value=False),
+            "roigbiv-param-resume",
+        ),
+    ])
+    notifications = _stage_card("Notifications", [
+        _field_row("Slack channel ID", "roigbiv-param-slack-channel",
+                   dbc.Input(id="roigbiv-param-slack-channel", type="text",
+                             placeholder="C0123ABCD (optional)")),
+        html.Small(
+            "Posts a run summary + overlay PNGs to this Slack channel when the "
+            "run finishes. Requires ROIGBIV_SLACK_TOKEN exported in the "
+            "environment that launched roigbiv-ui. See "
+            "docs/slack-notifications.md.",
+            id="roigbiv-param-slack-channel-help",
+            className="text-muted d-block mt-1",
+        ),
+    ])
+    return html.Div([foundation, stage1, stage_control, notifications])
 
 
-def _right_column() -> html.Div:
+def _stage_control_reactivity(scout, foundation_only) -> tuple:
+    """Form state mirroring ``_on_run``'s early-stop precedence.
+
+    Scout and Foundation-only both override the downstream stages; **scout takes
+    precedence over foundation-only** (it stops even earlier). Returns, in the
+    order the ``_sync_stage_controls`` callback emits them::
+
+        (fo_disabled,
+         s2_disabled, s2_value, s3_disabled, s3_value, s4_disabled, s4_value,
+         resume_disabled, resume_value)
+
+    Under an early-stop mode the stage 2/3/4 + resume switches go off+disabled;
+    otherwise they restore to their on-defaults (resume default is off). The
+    foundation-only switch is greyed (not unchecked) under scout — its ``value``
+    must stay an Input-only of the callback or Dash flags a circular dependency;
+    ``_on_run`` already forces it off under scout, so the run stays correct.
+    """
+    scout_on = bool(scout)
+    foundation_only_on = bool(foundation_only) and not scout_on
+    early_stop = scout_on or foundation_only_on
+    return (
+        scout_on,
+        early_stop, not early_stop,
+        early_stop, not early_stop,
+        early_stop, not early_stop,
+        early_stop, False,
+    )
+
+
+def _mc_mean_and_title(value: Optional[str]):
+    """Resolve a self-describing dropdown ``value`` to ``(mean, title)``.
+
+    The value is self-describing (see :func:`list_motion_corrected_fovs`):
+
+    * ``summary:{output_dir}`` — a processed FOV; read its precomputed
+      ``summary/mean_M.tif``.
+    * ``input:{tif_path}`` — a pre-corrected input not yet run; compute a sampled
+      temporal mean on demand (:func:`mc_input_mean`).
+
+    ``None`` / unparseable returns ``(None, None)``.
+    """
+    if value and ":" in value:
+        kind, payload = value.split(":", 1)
+        if kind == "summary":
+            return (_maybe_read_tif(Path(payload) / "summary" / "mean_M.tif"),
+                    Path(payload).name)
+        if kind == "input":
+            return (mc_input_mean(Path(payload)),
+                    f"{Path(payload).stem.replace('_mc', '')} (input)")
+    return None, None
+
+
+def _stem_for_value(value: Optional[str]) -> Optional[str]:
+    """Light parse of a dropdown ``value`` to a FOV name (no pixel read)."""
+    if value and ":" in value:
+        _, payload = value.split(":", 1)
+        return Path(payload).name
+    return None
+
+
+def _diameter_circle_shape(W: int, H: int, diameter_px: float) -> dict:
+    """An editable Plotly circle of ``diameter_px`` centered on the image.
+
+    Drawn in data (pixel) coordinates so its extent reads directly as a soma
+    diameter. ``editable`` + the Graph's ``edits.shapePosition`` config give it
+    drag handles; the user resizes it to a representative cell.
+    """
+    r = float(diameter_px) / 2.0
+    cx, cy = W / 2.0, H / 2.0
+    return dict(
+        type="circle", xref="x", yref="y",
+        x0=cx - r, x1=cx + r, y0=cy - r, y1=cy + r,
+        line=dict(color="#00E5FF", width=2),
+        fillcolor="rgba(0,229,255,0.10)",
+        editable=True, layer="above",
+    )
+
+
+def _diameter_from_relayout(relayout) -> Optional[float]:
+    """Extract the circle diameter (px) from a Graph ``relayoutData`` payload.
+
+    Plotly emits either incremental keys (``shapes[0].x0`` …) or a whole
+    ``shapes`` list when a shape is edited; pan/zoom emit axis-range keys
+    instead, for which this returns ``None`` (the caller no-ops, breaking any
+    figure→relayout feedback loop).
+
+    Diameter is taken from the x-extent (``|x1 - x0|``); the y-axis is reversed
+    on the image figure (``range=[H-1, 0]``), so ``y0 > y1`` after a drag — the
+    ``abs`` on the y-fallback keeps the result orientation-independent.
+    """
+    if not isinstance(relayout, dict):
+        return None
+
+    sh = None
+    if isinstance(relayout.get("shapes"), list) and relayout["shapes"]:
+        sh = relayout["shapes"][0]
+
+    def _coord(name):
+        if sh is not None and name in sh:
+            return sh[name]
+        return relayout.get(f"shapes[0].{name}")
+
+    x0, x1 = _coord("x0"), _coord("x1")
+    if x0 is not None and x1 is not None:
+        try:
+            d = abs(float(x1) - float(x0))
+            return d if d > 0 else None
+        except (TypeError, ValueError):
+            return None
+    y0, y1 = _coord("y0"), _coord("y1")
+    if y0 is not None and y1 is not None:
+        try:
+            d = abs(float(y1) - float(y0))
+            return d if d > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coerce_diameter(d) -> Optional[float]:
+    """Coerce a form value to a usable diameter (px), or ``None``."""
+    try:
+        d = float(d)
+    except (TypeError, ValueError):
+        return None
+    return d if d >= 3.0 else None
+
+
+def _on_run_diameter(d) -> int:
+    """Diameter (int px) for the run config; falls back to the cfg default 12.
+
+    A blank/garbage/too-small field must not poison the run — it degrades to the
+    same value as an untouched form, so behaviour matches the pre-feature
+    default (diameter=12, diameter_auto off).
+    """
+    coerced = _coerce_diameter(d)
+    return int(round(coerced)) if coerced is not None else 12
+
+
+def _diameter_overrides(calibrated: Optional[int], field_value) -> dict:
+    """Diameter-related pipeline overrides for a run.
+
+    The AppState calibration (drag / type / Suggest, all funnelled there) wins
+    over the raw form field, since a drag never writes the number input.
+    ``diameter_auto`` is always forced off: stage1 silently overrides
+    ``cfg.diameter`` when it's on (stage1.py:259), which would discard the
+    user's measured value.
+    """
+    diam = int(calibrated) if calibrated is not None else _on_run_diameter(field_value)
+    return {"diameter": diam, "diameter_auto": False}
+
+
+def _mc_preview_figure(value: Optional[str], diameter_px: Optional[float] = None):
+    """Render the MC preview for a dropdown ``value`` into an overlay-free figure.
+
+    When a ``diameter_px`` is given and a mean image is available, an editable
+    reference circle of that diameter is drawn so the user can size it against a
+    real soma. ``show_overlay=False`` is the mode :func:`build_roi_figure`
+    documents for inspecting MC quality.
+    """
+    mean, title = _mc_mean_and_title(value)
+    fig = build_roi_figure(mean, [], show_overlay=False, title=title)
+    if mean is not None and diameter_px:
+        H, W = mean.shape
+        fig.update_layout(shapes=[_diameter_circle_shape(W, H, diameter_px)])
+    return fig
+
+
+def _mc_options_and_value(workspace, current: Optional[str] = None):
+    """Build the MC dropdown ``(options, value)`` from a workspace.
+
+    Shared by the layout seed, the run-tick refresh, and the scan handler so the
+    three can't drift. Keeps ``current`` selected if it still exists, else
+    defaults to the first FOV. Values are the self-describing strings from
+    :func:`list_motion_corrected_fovs`.
+    """
+    fovs = list_motion_corrected_fovs(workspace)
+    options = [{"label": label, "value": value} for label, value in fovs]
+    values = {opt["value"] for opt in options}
+    if current in values:
+        value = current
+    elif options:
+        value = options[0]["value"]
+    else:
+        value = None
+    return options, value
+
+
+def _tif_options_and_values(workspace):
+    """Build the TIF-selection checklist ``(options, all_values)``.
+
+    One option per ``workspace.tifs`` entry; ``value`` is ``str(tif)`` (the
+    resolved path already stored in the workspace — stable and unique, so the
+    run can map a selection back to ``Path`` objects). Each label carries the
+    validity tick + name + shape so the checklist doubles as the discovery
+    summary. Shared by :func:`_workspace_summary` and the scan rebuild so the
+    rendered options can't drift.
+    """
+    options: list[dict] = []
+    values: list[str] = []
+    if workspace is None:
+        return options, values
+    for tif in workspace.tifs:
+        value = str(tif)
+        values.append(value)
+        try:
+            _, shape = validate_tif(tif)
+            label = html.Span([
+                html.Span("OK ", className="text-success fw-bold"),
+                html.Span(tif.name, className="me-2"),
+                html.Span(f"{shape[0]}×{shape[1]}×{shape[2]}",
+                          className="text-muted small"),
+            ])
+        except ValueError as exc:
+            label = html.Span([
+                html.Span("! ", className="text-danger fw-bold"),
+                html.Span(tif.name, className="me-2"),
+                html.Span(str(exc), className="text-danger small"),
+            ])
+        options.append({"label": label, "value": value})
+    return options, values
+
+
+def _sync_select_all_values(trigger, master_value, child_value, all_values):
+    """Pure decision core for the Select-all ↔ checklist sync.
+
+    Returns ``(child_value_out, master_value_out)``; either element may be
+    :data:`no_update` to leave that control untouched. Breaks the master/child
+    feedback loop: a master *uncheck* only clears the children when they are
+    *currently* all-selected (a genuine user toggle) — not when it is the
+    programmatic echo of a partial child selection that just drove the master
+    to empty.
+    """
+    child_set = set(child_value or [])
+    full = set(all_values)
+    if trigger == "roigbiv-tif-select-all":
+        checked = bool(master_value and "all" in master_value)
+        if checked:
+            return (no_update if child_set == full else list(all_values)), no_update
+        if all_values and child_set == full:
+            return [], no_update
+        return no_update, no_update
+    # Child changed → reflect all-or-not in the master, but only if it differs
+    # (else the master update would re-trigger this callback needlessly).
+    desired = ["all"] if (all_values and child_set == full) else []
+    if list(master_value or []) == desired:
+        return no_update, no_update
+    return no_update, desired
+
+
+def _selected_run_paths(workspace, selected):
+    """Map the stored selection (set of path strings, or ``None`` = all) to the
+    ordered ``Path`` subset of ``workspace.tifs`` to run."""
+    return [t for t in workspace.tifs
+            if selected is None or str(t) in selected]
+
+
+def _mc_preview_section() -> html.Div:
+    """Read-only motion-correction preview: mean projection per FOV.
+
+    Seeded from the active workspace at render time so a page reload (or a
+    workspace with prior outputs / pre-corrected inputs) shows FOVs immediately;
+    the interval tick keeps the list fresh as Foundation finishes each FOV during
+    a live run, and the scan handler seeds it after an interactive scan.
+    """
+    state = get_app_state()
+    options, value = _mc_options_and_value(state.workspace)
+    diam = state.calibrated_diameter() or 12
+    return html.Div([
+        html.H5("Motion-correction preview", className="mb-2 mt-3"),
+        dbc.Select(id="roigbiv-mc-fov-select", options=options, value=value,
+                   className="mb-2"),
+        dcc.Graph(id="roigbiv-mc-preview",
+                  figure=_mc_preview_figure(value, diameter_px=diam),
+                  config={"displaylogo": False, "scrollZoom": True,
+                          "edits": {"shapePosition": True}},
+                  style={"height": "720px"}),
+    ])
+
+
+def _right_column(snap: Optional["RunSnapshot"] = None) -> html.Div:
+    progress, label = _progress_for(snap)
     return html.Div([
         html.H4("Run status", className="mb-3"),
-        dbc.Progress(id="roigbiv-run-progress", value=0, striped=True,
-                     className="mb-3"),
-        html.Div(id="roigbiv-run-banner"),
-        html.Div(id="roigbiv-run-log", children=log_stream([])),
+        html.Div(id="roigbiv-run-timer", className="mb-2",
+                 children=(_format_timer(snap.started_at, snap.completed_at)
+                           if snap else "")),
+        dbc.Progress(id="roigbiv-run-progress", value=progress, label=label,
+                     striped=True, className="mb-3"),
+        html.Div(id="roigbiv-run-banner", children=_render_banner(snap)),
+        html.Div(id="roigbiv-run-log",
+                 children=log_stream(snap.logs if snap else [])),
+        _mc_preview_section(),
         html.Hr(),
         html.H5("Per-FOV results", className="mb-2"),
-        html.Div(id="roigbiv-run-results"),
+        html.Div(id="roigbiv-run-results",
+                 children=_render_results(snap.results_summary if snap else [])),
     ])
 
 
@@ -126,6 +554,8 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-scan-result", "children"),
         Output("roigbiv-run-btn", "disabled"),
         Output("roigbiv-active-registry", "children", allow_duplicate=True),
+        Output("roigbiv-mc-fov-select", "options", allow_duplicate=True),
+        Output("roigbiv-mc-fov-select", "value", allow_duplicate=True),
         Input("roigbiv-scan-btn", "n_clicks"),
         State("roigbiv-input-path", "value"),
         prevent_initial_call=True,
@@ -133,16 +563,23 @@ def register_callbacks(app: dash.Dash) -> None:
     def _on_scan(_n: int, path: Optional[str]):
         state = get_app_state()
         if not path:
-            return dbc.Alert("Enter a path first.", color="warning"), True, no_update
+            return (dbc.Alert("Enter a path first.", color="warning"), True,
+                    no_update, no_update, no_update)
         try:
             workspace = resolve_workspace(Path(path))
         except FileNotFoundError as exc:
-            return dbc.Alert(str(exc), color="danger"), True, no_update
+            return (dbc.Alert(str(exc), color="danger"), True,
+                    no_update, no_update, no_update)
         state.set_workspace(workspace)
+        # Seed the MC preview immediately: the run tick is disabled while idle,
+        # so without this the list would only populate on page reload or a run.
+        options, value = _mc_options_and_value(workspace)
         return (
             _workspace_summary(workspace),
             False,
             f"registry: {workspace.db_path}",
+            options,
+            value,
         )
 
     @app.callback(
@@ -164,21 +601,58 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-param-tau", "value"),
         State("roigbiv-param-k", "value"),
         State("roigbiv-param-model", "value"),
+        State("roigbiv-param-mc-backend", "value"),
+        State("roigbiv-param-flow-threshold", "value"),
+        State("roigbiv-param-diameter", "value"),
+        State("roigbiv-param-scout", "value"),
+        State("roigbiv-param-foundation-only", "value"),
+        State("roigbiv-param-stage-2", "value"),
+        State("roigbiv-param-stage-3", "value"),
+        State("roigbiv-param-stage-4", "value"),
+        State("roigbiv-param-resume", "value"),
+        State("roigbiv-param-slack-channel", "value"),
         prevent_initial_call=True,
     )
-    def _on_run(_n: int, fs, tau, k, model):
+    def _on_run(_n: int, fs, tau, k, model, mc_backend, flow_threshold,
+                diameter, scout, foundation_only, stage_2, stage_3, stage_4,
+                resume, slack_channel):
         state = get_app_state()
         if state.workspace is None:
             return True, dbc.Alert("Scan a workspace first.", color="warning")
+        selected = state.selected_tifs
+        if selected is not None and len(selected) == 0:
+            return True, dbc.Alert("Select at least one TIF to run.",
+                                   color="warning")
+        scout_on = bool(scout)
+        # Foundation-only is a dry run that stops before Stage 1; scout takes
+        # precedence if both are toggled (it stops even earlier).
+        foundation_only_on = bool(foundation_only) and not scout_on
+        early_stop = scout_on or foundation_only_on
         overrides = {
             "fs": float(fs or 7.5),
             "tau": float(tau or 1.0),
             "k_background": int(k or 30),
             "cellpose_model": model or "models/deployed/current_model",
+            "motion_correction_backend": mc_backend or "phasecorr",
+            "flow_threshold": float(flow_threshold if flow_threshold is not None else 0.4),
+            # Diameter chosen on the MC preview (+ diameter_auto forced off).
+            **_diameter_overrides(state.calibrated_diameter(), diameter),
+            "scout_mode": scout_on,
+            "foundation_only": foundation_only_on,
+            # Scout / foundation-only stop early; the stage toggles are ignored
+            # when either is on, and a foundation-only dry run is not resumable.
+            "enable_stage_2": False if early_stop else (True if stage_2 is None else bool(stage_2)),
+            "enable_stage_3": False if early_stop else (True if stage_3 is None else bool(stage_3)),
+            "enable_stage_4": False if early_stop else (True if stage_4 is None else bool(stage_4)),
+            "resume": False if (resume is None or early_stop) else bool(resume),
         }
         runner = get_pipeline_runner()
+        slack_channel = (slack_channel or "").strip() or None
+        selected_paths = _selected_run_paths(state.workspace, selected)
         result = runner.start(state.workspace, overrides,
-                              registry_config=state.registry_config)
+                              registry_config=state.registry_config,
+                              slack_channel=slack_channel,
+                              selected_tifs=selected_paths)
         if result == "busy":
             return False, dbc.Alert(
                 "Pipeline is running for another session — try again shortly.",
@@ -189,8 +663,9 @@ def register_callbacks(app: dash.Dash) -> None:
                 "A pipeline run is already active — wait for it to finish.",
                 color="warning",
             )
-        return False, dbc.Alert("Pipeline run started.",
-                                color="info", className="py-2 mb-2")
+        # Seed the banner from the fresh snapshot (current_stage = Foundation);
+        # the interval tick takes over from here.
+        return False, _render_banner(runner.snapshot())
 
     @app.callback(
         Output("roigbiv-run-log", "children"),
@@ -198,74 +673,231 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-run-progress", "label"),
         Output("roigbiv-run-results", "children"),
         Output("roigbiv-process-tick", "disabled", allow_duplicate=True),
+        Output("roigbiv-run-timer", "children"),
+        Output("roigbiv-run-banner", "children", allow_duplicate=True),
+        Output("roigbiv-run-btn", "disabled", allow_duplicate=True),
         Input("roigbiv-process-tick", "n_intervals"),
         prevent_initial_call="initial_duplicate",
     )
     def _on_tick(_n):
         runner = get_pipeline_runner()
         snap = runner.snapshot()
-
-        if snap.n_fovs > 0:
-            progress = int(
-                round(100 * (snap.n_done + snap.n_failed) / snap.n_fovs)
-            )
-            label = f"{snap.n_done + snap.n_failed} / {snap.n_fovs}"
-        else:
-            progress = 0
-            label = ""
-
-        results_block = _render_results(snap.results_summary)
-        interval_disabled = not snap.active
+        progress, label = _progress_for(snap)
+        state = get_app_state()
         return (
             log_stream(snap.logs),
             progress, label,
-            results_block,
-            interval_disabled,
+            _render_results(snap.results_summary),
+            not snap.active,
+            _format_timer(snap.started_at, snap.completed_at),
+            _render_banner(snap),
+            state.workspace is None or snap.active,
         )
+
+    @app.callback(
+        Output("roigbiv-mc-fov-select", "options", allow_duplicate=True),
+        Output("roigbiv-mc-fov-select", "value", allow_duplicate=True),
+        Input("roigbiv-process-tick", "n_intervals"),
+        State("roigbiv-mc-fov-select", "value"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _refresh_mc_fovs(_n, current):
+        # Cheap: enumeration only globs summary names + reads _mc filename
+        # suffixes, never pixels (the heavy mean read is in _render_mc_preview,
+        # on selection change). Keeps the user's current selection if it still
+        # exists. Rides the same 1.5 s run-status interval.
+        return _mc_options_and_value(get_app_state().workspace, current)
+
+    @app.callback(
+        Output("roigbiv-tif-select", "value", allow_duplicate=True),
+        Output("roigbiv-tif-select-all", "value", allow_duplicate=True),
+        Input("roigbiv-tif-select-all", "value"),
+        Input("roigbiv-tif-select", "value"),
+        State("roigbiv-tif-select", "options"),
+        prevent_initial_call=True,
+    )
+    def _on_select_all(master_value, child_value, options):
+        # Single combined callback (master + child as inputs) keyed on the
+        # trigger id: avoids the destructive feedback loop a two-callback master/
+        # child pair hits when the programmatic master update echoes back. Pure
+        # logic in _sync_select_all_values.
+        all_values = [opt["value"] for opt in (options or [])]
+        return _sync_select_all_values(dash.ctx.triggered_id, master_value,
+                                       child_value, all_values)
+
+    @app.callback(
+        Output("roigbiv-tif-select-sink", "data"),
+        Input("roigbiv-tif-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _sync_selected_tifs(value):
+        # Mirror the checklist selection into server-side AppState so the run
+        # path (_on_run, server-side) reads it without a new callback State.
+        get_app_state().set_selected_tifs(value or [])
+        return len(value or [])
+
+    @app.callback(
+        Output("roigbiv-mc-preview", "figure"),
+        Input("roigbiv-mc-fov-select", "value"),
+        Input("roigbiv-param-diameter", "value"),
+        prevent_initial_call=True,
+    )
+    def _render_mc_preview(value, diameter):
+        # Single figure writer. Fires on FOV change or number-input change (the
+        # input is debounced and Suggest writes it once — so the heavy mean read
+        # happens at most once per deliberate change, never per keystroke/tick).
+        #
+        # Persist to AppState ONLY when the number input is the trigger: a bare
+        # FOV switch must not overwrite a diameter the user set by dragging the
+        # circle (drags live in AppState, not the box). Always draw at the live
+        # AppState diameter so a FOV switch redraws the circle at the measured
+        # size rather than the possibly-stale box value.
+        state = get_app_state()
+        d = _coerce_diameter(diameter)
+        if dash.ctx.triggered_id == "roigbiv-param-diameter" and d is not None:
+            state.set_calibration(d, _stem_for_value(value))
+        draw_d = state.calibrated_diameter() or d
+        return _mc_preview_figure(value, diameter_px=draw_d)
+
+    @app.callback(
+        Output("roigbiv-mc-diameter-readout", "children"),
+        Input("roigbiv-mc-preview", "relayoutData"),
+        State("roigbiv-mc-fov-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_circle_edit(relayout, value):
+        # Drag/resize of the reference circle. We deliberately do NOT write the
+        # number input or re-render the figure here: Plotly already moved/resized
+        # the shape on-screen, so re-rendering would snap it back to center. We
+        # only capture the measured diameter into AppState (read by _on_run) and
+        # echo it in the readout. Pan/zoom relayouts carry no shape keys →
+        # _diameter_from_relayout returns None → no_update.
+        diam = _diameter_from_relayout(relayout)
+        if diam is None:
+            return no_update
+        get_app_state().set_calibration(diam, _stem_for_value(value))
+        return f"circle = {diam:.0f} px"
+
+    @app.callback(
+        Output("roigbiv-param-diameter", "value", allow_duplicate=True),
+        Output("roigbiv-mc-diameter-readout", "children", allow_duplicate=True),
+        Input("roigbiv-mc-suggest-btn", "n_clicks"),
+        State("roigbiv-mc-fov-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_suggest_diameter(_n, value):
+        # Estimate the soma diameter from the displayed mean image using the same
+        # DoG-peak + Otsu estimator that backs the pipeline's diameter_auto, then
+        # pre-fill the number input. Fast (a few hundred ms); runs inline.
+        mean, _title = _mc_mean_and_title(value)
+        if mean is None:
+            return no_update, "Run foundation first to load a FOV."
+        from roigbiv.pipeline.stage1 import _estimate_diameter_px
+        est = _estimate_diameter_px(mean)
+        if est is None or est <= 4.0:
+            return no_update, "No estimate — adjust the circle manually."
+        return int(round(est)), f"suggested = {est:.0f} px"
+
+    @app.callback(
+        Output("roigbiv-param-foundation-only", "disabled"),
+        Output("roigbiv-param-stage-2", "disabled"),
+        Output("roigbiv-param-stage-2", "value"),
+        Output("roigbiv-param-stage-3", "disabled"),
+        Output("roigbiv-param-stage-3", "value"),
+        Output("roigbiv-param-stage-4", "disabled"),
+        Output("roigbiv-param-stage-4", "value"),
+        Output("roigbiv-param-resume", "disabled"),
+        Output("roigbiv-param-resume", "value"),
+        Input("roigbiv-param-scout", "value"),
+        Input("roigbiv-param-foundation-only", "value"),
+        prevent_initial_call=True,
+    )
+    def _sync_stage_controls(scout, foundation_only):
+        # Make the form visibly mirror what _on_run already enforces: scout /
+        # foundation-only override the downstream stages (scout precedence).
+        # foundation-only.value is Input-only here — never an Output of this
+        # callback — or Dash raises a circular dependency.
+        return _stage_control_reactivity(scout, foundation_only)
 
 
 # ── rendering helpers ──────────────────────────────────────────────────────
 
 
+def _progress_for(snap: Optional["RunSnapshot"]) -> tuple[int, str]:
+    """Progress-bar value (0–100) and ``done / total`` label from a snapshot."""
+    if snap and snap.n_fovs > 0:
+        done = snap.n_done + snap.n_failed
+        return int(round(100 * done / snap.n_fovs)), f"{done} / {snap.n_fovs}"
+    return 0, ""
+
+
+def _render_banner(snap: Optional["RunSnapshot"]):
+    """Live run-status banner: current stage while active, outcome when done."""
+    if snap is None or snap.started_at is None:
+        return None
+    if snap.error:
+        return dbc.Alert("Run failed — see log below.",
+                         color="danger", className="py-2 mb-2")
+    if not snap.active:
+        return dbc.Alert("Run complete.",
+                         color="success", className="py-2 mb-2")
+    stage = snap.current_stage or "Pipeline run started"
+    return dbc.Alert(
+        [html.Span("Running · ", className="fw-bold"), html.Span(stage)],
+        color="info", className="py-2 mb-2",
+    )
+
+
 def _workspace_summary(workspace: WorkspacePaths) -> html.Div:
-    tif_rows = []
-    for tif in workspace.tifs:
-        try:
-            _, shape = validate_tif(tif)
-            tif_rows.append(html.Tr([
-                html.Td("OK", className="text-success fw-bold"),
-                html.Td(tif.name),
-                html.Td(f"{shape[0]}×{shape[1]}×{shape[2]}"),
-            ]))
-        except ValueError as exc:
-            tif_rows.append(html.Tr([
-                html.Td("!",  className="text-danger fw-bold"),
-                html.Td(tif.name),
-                html.Td(str(exc), className="text-danger"),
-            ]))
-    db_hint = "(new)" if not workspace.db_path.exists() else "(found)"
+    # The TIF list is a checklist: the user picks which detected stacks to run.
+    # All are selected by default; the "Select all" master toggles the set. The
+    # checklist lives inside roigbiv-scan-result, so a re-scan rebuilds it (and
+    # AppState.set_workspace resets the stored selection to all) — no separate
+    # seeding output is needed on the scan callback.
+    options, values = _tif_options_and_values(workspace)
     return dbc.Card(dbc.CardBody([
         html.H6("Workspace resolved", className="mb-2"),
-        html.Div([
-            html.Span("Input: "),
-            html.Code(str(workspace.input_root), className="roigbiv-muted-code")
-        ], className="mb-1"),
-        html.Div([
-            html.Span("Output: "),
-            html.Code(str(workspace.output_root),
-                      className="roigbiv-muted-code"),
-        ], className="mb-1"),
-        html.Div([
-            html.Span("Registry DB: "),
-            html.Code(str(workspace.db_path), className="roigbiv-muted-code"),
-            html.Span(f" {db_hint}", className="ms-2 text-muted"),
-        ], className="mb-2"),
-        dbc.Table(
-            [html.Thead(html.Tr([html.Th(""), html.Th("File"), html.Th("Shape")])),
-             html.Tbody(tif_rows)],
-            size="sm", striped=True, borderless=True, className="mt-2 mb-0",
+        html.Small("Select which detected TIF stacks to run.",
+                   className="text-muted d-block mb-2"),
+        dbc.Checklist(
+            id="roigbiv-tif-select-all",
+            options=[{"label": "Select all", "value": "all"}],
+            value=["all"] if values else [],
+            className="fw-bold mb-1",
+        ),
+        dbc.Checklist(
+            id="roigbiv-tif-select",
+            options=options,
+            value=list(values),
+            className="ms-3 mb-0",
         ),
     ]), className="roigbiv-card-accent mt-2")
+
+
+def _format_timer(
+    started_at: Optional[float],
+    completed_at: Optional[float],
+) -> "str | html.Div":
+    import time
+    if started_at is None:
+        return ""
+    start_str = time.strftime("%H:%M:%S", time.localtime(started_at))
+    end_ts = completed_at if completed_at is not None else time.time()
+    elapsed_s = int(end_ts - started_at)
+    h, rem = divmod(elapsed_s, 3600)
+    m, s = divmod(rem, 60)
+    elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
+    return html.Div(
+        [
+            html.Span(f"Started: {start_str}", className="me-4"),
+            html.Span(f"Elapsed: {elapsed_str}"),
+        ],
+        style={
+            "fontFamily": "var(--roigbiv-font-mono)",
+            "fontSize": "0.80rem",
+            "color": "var(--roigbiv-accent)",
+        },
+    )
 
 
 def _render_results(summaries: list[dict]) -> html.Div:

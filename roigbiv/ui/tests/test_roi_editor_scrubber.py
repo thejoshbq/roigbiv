@@ -322,3 +322,96 @@ def test_frameinflight_guard_wired_both_directions(tmp_path):
     data = _get_editor_html(tmp_path)
     assert b"_frameInFlight = true" in data
     assert b"_frameInFlight = false" in data
+
+
+# ── Embedded-editor: color/overlay seeding + postMessage bridges ────────────
+
+
+def test_editor_page_color_overlay_params(tmp_path):
+    out = tmp_path / "fov"
+    out.mkdir()
+    (out / "pipeline_log.json").write_text("{}")
+    _make_mean_m(out, Ly=8, Lx=8)
+    app = _app_with_routes()
+    with app.test_client() as c:
+        r = c.get(f"/roi-editor/fov?dir={_b64(out)}&color=feature&overlay=0")
+    assert r.status_code == 200
+    assert b'window._colorMode = "feature"' in r.data
+    assert b'window._overlayOn = ("0"' in r.data
+
+
+def test_editor_page_color_defaults_to_stage(tmp_path):
+    out = tmp_path / "fov"
+    out.mkdir()
+    (out / "pipeline_log.json").write_text("{}")
+    _make_mean_m(out, Ly=8, Lx=8)
+    app = _app_with_routes()
+    with app.test_client() as c:
+        r = c.get(f"/roi-editor/fov?dir={_b64(out)}")  # no color/overlay
+    assert r.status_code == 200
+    assert b'window._colorMode = "stage"' in r.data
+    assert b'window._overlayOn = ("1"' in r.data
+
+
+def test_editor_html_has_style_bridge(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"addEventListener('message'" in data
+    assert b"roigbiv-style" in data
+    assert b"formatRoi" in data
+
+
+def test_editor_emits_roi_selected(tmp_path):
+    data = _get_editor_html(tmp_path)
+    assert b"roigbiv-roi-selected" in data
+    assert b"window.parent.postMessage" in data
+
+
+# ── Embedded-editor: per-ROI attributes + colors in /api/annotations ────────
+
+
+def _make_output_dir_with_rois(tmp_path: Path) -> Path:
+    """Minimal pipeline output dir with one ROI so _rois_to_annotations runs."""
+    out = tmp_path / "fov_rois"
+    out.mkdir()
+    (out / "pipeline_log.json").write_text(json.dumps({"shape": [1, 8, 8]}))
+    # One 3x3 ROI labelled 1 in an 8x8 field.
+    masks = np.zeros((8, 8), dtype=np.uint16)
+    masks[2:5, 2:5] = 1
+    tifffile.imwrite(str(out / "merged_masks.tif"), masks)
+    (out / "roi_metadata.json").write_text(json.dumps([
+        {"label_id": 1, "source_stage": 2, "confidence": "high",
+         "gate_outcome": "accept", "area": 9, "activity_type": "phasic"},
+    ]))
+    _make_mean_m(out, Ly=8, Lx=8)
+    return out
+
+
+def test_annotations_embed_attrs(tmp_path):
+    out = _make_output_dir_with_rois(tmp_path)
+    app = _app_with_routes()
+    with app.test_client() as c:
+        r = c.get(f"/api/annotations/fov_rois?dir={_b64(out)}")
+    assert r.status_code == 200
+    anns = r.get_json()
+    assert isinstance(anns, list) and len(anns) == 1
+    bodies = anns[0]["body"]
+    attr_body = next(b for b in bodies if b.get("purpose") == "roigbiv-attrs")
+    attrs = json.loads(attr_body["value"])
+    assert attrs["label_id"] == 1
+    assert attrs["source_stage"] == 2
+    assert attrs["activity_type"] == "phasic"
+    assert "global_cell_id" in attrs            # None when unregistered
+    assert set(attrs["colors"]) == {"single", "stage", "feature", "gcid"}
+    # Stage-2 color is the Suite2p orange from the shared palette.
+    from roigbiv.ui.services.colors import color_for_stage
+    assert attrs["colors"]["stage"] == color_for_stage(2)
+    # The tagging body (used by the editor for the label) is still present.
+    assert any(b.get("purpose") == "tagging" for b in bodies)
+
+
+def test_annotations_id_is_label_keyed(tmp_path):
+    out = _make_output_dir_with_rois(tmp_path)
+    app = _app_with_routes()
+    with app.test_client() as c:
+        r = c.get(f"/api/annotations/fov_rois?dir={_b64(out)}")
+    assert r.get_json()[0]["id"] == "roi-1"

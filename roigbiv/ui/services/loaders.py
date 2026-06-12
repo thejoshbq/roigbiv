@@ -14,6 +14,7 @@ Both bundles are cache-friendly — computed once per output_dir and stored in
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -195,6 +196,156 @@ def _gcid_by_label_from_registry(registry: Optional[dict]) -> dict[int, str]:
         if gid:
             out[lid] = str(gid)
     return out
+
+
+# ── Motion-correction preview discovery ────────────────────────────────────
+
+
+def list_motion_corrected_fovs(workspace) -> list[tuple[str, str]]:
+    """Previewable motion-corrected FOVs in a workspace, for the MC preview.
+
+    Two sources, merged and de-duplicated by *output* stem
+    (``tif.stem.replace("_mc", "")`` — the same key Foundation uses for its
+    output directory name, so the two sources collide correctly):
+
+    * **Processed FOVs** — Foundation has written its temporal mean
+      (``{output_root}/{stem}/summary/mean_M.tif``). Surfaces a FOV as soon as
+      motion correction is done, including foundation-only dry runs and FOVs
+      still mid-pipeline. Value ``f"summary:{output_dir}"``.
+    * **Pre-corrected inputs** — already-motion-corrected stacks sitting in the
+      workspace (``*_mc.tif`` or content-tagged) that have *not* been run yet,
+      so they have no summary. Drawn from ``workspace.tifs`` (already deduped +
+      output-excluded by ``resolve_workspace``) so we never re-run
+      ``discover_tifs`` here. Value ``f"input:{tif_path}"`` — rendered via an
+      on-demand sampled temporal mean (:func:`mc_input_mean`).
+
+    A processed summary always wins over a pre-corrected input for the same
+    stem (the registered ``mean_M`` is the authoritative projection). The value
+    string is self-describing (``summary:`` / ``input:`` prefix) because the
+    render callback only receives the dropdown value, not the option's kind.
+
+    Filesystem-based (not the registry) on purpose: the registry only lists
+    fully-completed, *registered* FOVs.
+
+    Returns ``[(label, value), ...]`` sorted by output stem. ``workspace`` is
+    any object exposing ``output_root`` + ``tifs``; ``None`` or missing
+    attributes degrade gracefully to whatever source is available.
+    """
+    # stem -> (label, value); insertion of summary entries first lets the input
+    # pass skip any stem already covered by a (winning) summary.
+    by_stem: dict[str, tuple[str, str]] = {}
+
+    output_root = getattr(workspace, "output_root", None)
+    if output_root is not None:
+        output_root = Path(output_root)
+        if output_root.exists():
+            for mean_path in output_root.glob("*/summary/mean_M.tif"):
+                out_dir = mean_path.parent.parent
+                by_stem[out_dir.name] = (out_dir.name, f"summary:{out_dir}")
+
+    for tif in getattr(workspace, "tifs", ()) or ():
+        tif = Path(tif)
+        out_stem = tif.stem.replace("_mc", "")
+        if out_stem in by_stem:
+            continue  # processed summary wins
+        if not _is_precorrected_input(tif):
+            continue
+        by_stem[out_stem] = (f"{out_stem} (input)", f"input:{tif}")
+
+    return [by_stem[stem] for stem in sorted(by_stem)]
+
+
+def _is_precorrected_input(tif: Path) -> bool:
+    """True if *tif* is an already-motion-corrected stack we can preview.
+
+    Suffix-first: the free ``_mc`` filename check covers the common case without
+    opening the file; only an inconclusive suffix falls through to the
+    header-reading content check (TIFF Software tag), keeping per-tick cost low.
+    """
+    if tif.stem.endswith("_mc"):
+        return True
+    from roigbiv.io import detect_motion_corrected
+
+    try:
+        return bool(detect_motion_corrected(tif)[0])
+    except Exception:  # noqa: BLE001 — unreadable input is simply not previewable
+        return False
+
+
+# ── Motion-correction input mean projection (on-demand, cached) ─────────────
+
+_MC_PREVIEW_FRAMES = 64  # evenly-sampled frames for the input-stack temporal mean
+_mc_mean_cache: dict[tuple, np.ndarray] = {}
+_mc_mean_lock = threading.Lock()
+
+
+def mc_input_mean(tif_path) -> Optional[np.ndarray]:
+    """Temporal mean of a pre-corrected input stack, for the MC preview.
+
+    Computes a mean projection over up to ``_MC_PREVIEW_FRAMES`` evenly-spaced
+    frames (memory- and I/O-bounded: a raw ``_mc.tif`` may be many GB, unlike
+    the tiny precomputed ``mean_M.tif``). Sampling is sufficient to reveal
+    residual-motion blur/ghosting for a registration-quality preview.
+
+    Cached by ``(resolved path, mtime_ns, size)`` so re-selecting a FOV is
+    instant and a regenerated file invalidates. Thread-safe (Dash runs callbacks
+    under multi-threaded Flask); the heavy read happens *outside* the lock so
+    concurrent renders don't serialize. Returns ``None`` if unreadable.
+    """
+    import tifffile
+
+    path = Path(tif_path)
+    try:
+        st = path.stat()
+        key = (str(path.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+    cached = _mc_mean_cache.get(key)
+    if cached is not None:
+        return cached
+
+    mean = _read_sampled_mean(path)
+    if mean is None:
+        return None
+    with _mc_mean_lock:
+        return _mc_mean_cache.setdefault(key, mean)
+
+
+def _read_sampled_mean(path: Path) -> Optional[np.ndarray]:
+    """Mean over ≤``_MC_PREVIEW_FRAMES`` evenly-spaced frames of a TIFF stack.
+
+    Reads *only* the sampled pages (``TiffFile.asarray(key=...)``) so peak I/O
+    and memory scale with the sample count, not the (possibly multi-GB) stack.
+    Falls back to a full read + slice if keyed access isn't supported for the
+    stack's layout. Returns ``None`` on any read error.
+    """
+    import tifffile
+
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            shape = tf.series[0].shape
+            if len(shape) < 3:  # single frame — the mean is the frame itself
+                return np.asarray(tf.asarray(), dtype=np.float32)
+            n = int(shape[0])
+            if n <= _MC_PREVIEW_FRAMES:
+                idx = list(range(n))
+            else:
+                idx = np.linspace(0, n - 1, _MC_PREVIEW_FRAMES).round().astype(int)
+                idx = sorted(set(int(i) for i in idx))
+            try:
+                sample = tf.asarray(key=idx, series=0)
+            except Exception:  # noqa: BLE001 — layout doesn't support keyed read
+                full = tf.asarray(series=0)
+                flat = full.reshape(-1, *full.shape[-2:])
+                sample = flat[idx]
+    except Exception:  # noqa: BLE001 — unreadable / non-TIFF input
+        return None
+
+    sample = np.asarray(sample, dtype=np.float32)
+    if sample.ndim == 2:  # a single sampled page
+        return sample
+    return sample.mean(axis=0)
 
 
 # ── Cross-session bundle ───────────────────────────────────────────────────

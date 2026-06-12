@@ -2,7 +2,7 @@
 
 Pages in a top nav:
 
-* **Process** — scan a workspace, set params, run the pipeline.
+* **Pipeline** — scan a workspace, set params, run the pipeline.
 * **Review** — unified viewing + HITL corrections. Multi-session grid
   canvas, slide-in metadata drawer, overlay toggle, Add ROI draw mode,
   polygon / freehand / eraser, merge / split / edit / relabel, additive
@@ -58,7 +58,7 @@ THEME_TOGGLE_ID = "roigbiv-theme-toggle"
 THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
-    ("/process",  "Process",  process),
+    ("/pipeline", "Pipeline", process),
     ("/review",   "Review",   review),
 )
 
@@ -158,7 +158,7 @@ def _build_layout() -> html.Div:
     navbar = dbc.Navbar(
         dbc.Container(
             [
-                dcc.Link(brand, href="/process",
+                dcc.Link(brand, href="/pipeline",
                          style={"textDecoration": "none", "color": "inherit"}),
                 registry_indicator,
                 dbc.Nav(nav_items, navbar=True, className="ms-auto"),
@@ -196,8 +196,9 @@ def _wire_routes(app: dash.Dash) -> None:
         # Review. Bookmarks to /viewer still land somewhere sensible.
         if pathname.rstrip("/") == "/viewer":
             return review.layout()
-        # Registry browsing was retired — route stragglers to Process.
-        if pathname.rstrip("/") == "/registry":
+        # The Process page was renamed to Pipeline (/process → /pipeline);
+        # registry browsing was retired. Route both stragglers to the page.
+        if pathname.rstrip("/") in ("/process", "/registry"):
             return process.layout()
         for path, _, page in PAGES:
             if pathname.rstrip("/") == path.rstrip("/"):

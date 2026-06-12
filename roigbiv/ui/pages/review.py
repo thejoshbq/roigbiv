@@ -19,10 +19,10 @@ from urllib.parse import parse_qs, urlparse
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import ALL, Input, Output, State, dcc, html, no_update
+from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.ui.components.errors import user_error, user_error_figure
-from roigbiv.ui.components.figure import build_roi_figure
+from roigbiv.ui.components.forms import HELP_TEXT, help_icon, labeled_with_help
 from roigbiv.ui.components.log_stream import log_stream
 from roigbiv.ui.components.roi_panel import (
     DETAILS_COLLAPSE_ID,
@@ -32,18 +32,17 @@ from roigbiv.ui.components.roi_panel import (
 from roigbiv.ui.components.sidebar import (
     segmented,
     sidebar_toggle,
-    workspace_summary_card,
 )
 from roigbiv.ui.components.trace_figure import (
     build_mean_multi,
     build_mean_single,
     build_roi_across_sessions,
+    build_roi_single,
 )
 from roigbiv.ui.logging import get_logger
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.cellpose_trainer import get_trainer
 from roigbiv.ui.services.loaders import (
-    CrossSessionBundle,
     FOVBundle,
     load_cross_session_bundle,
 )
@@ -52,13 +51,16 @@ from roigbiv.ui.services.theme import axis_muted_color, plotly_template
 from roigbiv.ui.services.trace_viz import (
     collect_cross_session_traces,
     collect_sessions_for_fov,
+    fetch_single_roi_data,
     load_session_traces,
 )
 
 
 log = get_logger("review")
 
-KIND_OPTIONS = [("dff", "dF/F"), ("f", "F corrected")]
+# F corrected is the default (neuropil-subtracted fluorescence); dF/F is the
+# legacy baseline-normalized signal, kept available but no longer primary.
+KIND_OPTIONS = [("f", "F corrected"), ("dff", "dF/F")]
 COLOR_OPTIONS = [
     ("single", "Single"),
     ("stage", "Stage"),
@@ -80,13 +82,19 @@ RIGHT_SIDEBAR_TOGGLE_ID = "roigbiv-review-right-sidebar-toggle"
 
 
 def layout() -> html.Div:
-    state = get_app_state()
     return html.Div([
         # Session-scoped stores (memory — cleared on tab close).
         dcc.Store(id="roigbiv-review-state", storage_type="memory"),
         dcc.Store(id="roigbiv-review-selected-roi", storage_type="memory"),
         dcc.Store(id="roigbiv-review-output-dir", storage_type="memory"),
+        # Bridges between the embedded editor iframe and Dash:
+        #  · style-bridge / msg-init are dummy sinks for clientside callbacks
+        #  · roi-msg carries the editor's selectAnnotation → ROI drawer
+        dcc.Store(id="roigbiv-review-style-bridge", storage_type="memory"),
+        dcc.Store(id="roigbiv-review-msg-init", storage_type="memory"),
+        dcc.Store(id="roigbiv-review-roi-msg", storage_type="memory"),
         dcc.Interval(id="roigbiv-trainer-tick", interval=2000, disabled=True),
+        dcc.Download(id="roigbiv-review-export-download"),
         html.Div([
             sidebar_toggle(toggle_id=SIDEBAR_TOGGLE_ID,
                            store_id=SIDEBAR_STORE_ID),
@@ -95,9 +103,9 @@ def layout() -> html.Div:
         ], className="d-flex justify-content-between mb-2"),
         dbc.Row([
             dbc.Col(
-                [workspace_summary_card(state.workspace),
-                 _selector_card(),
+                [_selector_card(),
                  _view_controls_card(),
+                 _export_card(),
                  _external_edit_card(),
                  _finetune_card()],
                 id=SIDEBAR_COL_ID, md=3, className="pe-md-3",
@@ -105,6 +113,7 @@ def layout() -> html.Div:
             dbc.Col([
                 html.H4(id="roigbiv-review-title", children="Review",
                         className="mb-2"),
+                _canvas_toolbar(),
                 html.Div(id="roigbiv-review-canvas"),
                 html.Hr(),
                 html.H5("FOV signal — per-session mean",
@@ -135,6 +144,10 @@ _TRACE_CONFIG = {
 
 
 def _selector_card() -> dbc.Card:
+    # The Sessions checklist drives the cross-session (longitudinal) overlay;
+    # the Active-session radio — co-located beneath it and constrained to the
+    # checked sessions — picks which one the editor iframe and external-edit /
+    # export handoffs target. This replaces the former redundant third dropdown.
     return dbc.Card(dbc.CardBody([
         html.H6("FOV", className="mb-2"),
         dbc.Select(id="roigbiv-review-fov-select",
@@ -142,36 +155,56 @@ def _selector_card() -> dbc.Card:
         dbc.Button("Refresh", id="roigbiv-review-refresh",
                    size="sm", outline=True, color="secondary",
                    n_clicks=0, className="mb-3"),
-        html.H6("Sessions", className="mb-2"),
-        dbc.Checklist(id="roigbiv-review-session-check",
-                      options=[], value=[], switch=False,
-                      className="mb-3"),
-        html.H6("Active session", className="mb-1"),
+        html.H6("Sessions", className="mb-1"),
         html.Small(
-            "External-edit handoff (Open output folder) targets this session.",
+            "Check sessions to overlay across days; the selected radio is the "
+            "active session (editor + export target).",
             className="text-muted d-block mb-2",
         ),
-        dbc.Select(id="roigbiv-review-active-session",
-                   options=[], value=None),
+        dbc.Checklist(id="roigbiv-review-session-check",
+                      options=[], value=[], switch=False,
+                      className="mb-2"),
+        html.Small("Active session", className="text-muted d-block mb-1"),
+        dbc.RadioItems(id="roigbiv-review-active-session",
+                       options=[], value=None),
     ]), className="mb-3")
 
 
 def _view_controls_card() -> dbc.Card:
     return dbc.Card(dbc.CardBody([
-        html.H6("Signal", className="mb-2"),
-        segmented("roigbiv-review-kind", KIND_OPTIONS, value="dff"),
-        html.H6("Color", className="mt-3 mb-2"),
-        segmented("roigbiv-review-color", COLOR_OPTIONS, value="stage"),
-        html.Div([
-            html.H6("Overlay", className="mt-3 mb-1 d-inline-block me-2"),
-            dbc.Switch(id="roigbiv-review-overlay",
-                       value=True, className="d-inline-block"),
-        ]),
-        html.Small(
-            "Turn off to inspect the raw mean projection.",
-            className="text-muted d-block",
+        html.Div(
+            [html.H6("Signal", className="mb-0 me-1"),
+             *help_icon("roigbiv-review-kind", HELP_TEXT["roigbiv-review-kind"])],
+            className="d-flex align-items-center mb-2",
         ),
+        segmented("roigbiv-review-kind", KIND_OPTIONS, value="f"),
+        html.Div(
+            [html.H6("Color", className="mb-0 me-1"),
+             *help_icon("roigbiv-review-color",
+                        HELP_TEXT["roigbiv-review-color"])],
+            className="d-flex align-items-center mt-3 mb-2",
+        ),
+        segmented("roigbiv-review-color", COLOR_OPTIONS, value="stage"),
     ]), className="mb-3")
+
+
+def _canvas_toolbar() -> html.Div:
+    """Editor-area toolbar (above the canvas) hosting the Overlay toggle.
+
+    Lives in the main column rather than ``_render_canvas`` so the Switch is
+    not recreated on every canvas re-render — the clientside style bridge that
+    pushes Overlay into the iframe keys off this stable component.
+    """
+    return html.Div(
+        [
+            html.Span("Overlay", className="me-2 text-muted small"),
+            dbc.Switch(id="roigbiv-review-overlay", value=True,
+                       className="d-inline-block m-0"),
+            *help_icon("roigbiv-review-overlay",
+                       HELP_TEXT["roigbiv-review-overlay"]),
+        ],
+        className="d-flex align-items-center mb-2",
+    )
 
 
 def _roi_details_card() -> dbc.Card:
@@ -196,29 +229,48 @@ def _roi_trace_card() -> dbc.Card:
     ]), className="mb-3")
 
 
-def _external_edit_card() -> dbc.Card:
-    """Browser-based ROI editor for the active session.
+def _export_card() -> dbc.Card:
+    return dbc.Card(dbc.CardBody([
+        html.H6("Download traces", className="mb-2"),
+        html.Small(
+            "HDF5 file: index = time (s), columns = neuron ID. "
+            "Merge sessions with pd.concat([df1, df2], axis=1).",
+            className="text-muted d-block mb-2",
+        ),
+        dbc.Select(
+            id="roigbiv-review-export-kind",
+            options=[
+                {"label": "dF/F + F corrected", "value": "dff,f"},
+                {"label": "dF/F only",           "value": "dff"},
+                {"label": "All channels",        "value": "dff,f,raw,neuropil"},
+            ],
+            value="dff,f",
+            className="mb-2",
+        ),
+        dbc.Button(
+            "Download .h5", id="roigbiv-review-export-btn",
+            size="sm", color="primary", className="w-100", n_clicks=0,
+        ),
+        html.Div(id="roigbiv-review-export-status", className="mt-1 small text-muted"),
+    ]), className="mb-3")
 
-    Opens the web editor in a new tab via the Flask route
-    ``/roi-editor/<stem>?dir=<b64>``.  Corrections are saved directly to
-    ``corrections/corrections.jsonl`` on the server; refresh the Review
-    page after saving to pick up the changes.
+
+def _external_edit_card() -> dbc.Card:
+    """Context for the embedded ROI editor (the main pane).
+
+    The editor for the active session is embedded directly above; edits draw /
+    delete ROIs and autosave to ``corrections/corrections.jsonl`` on the server.
+    This card just surfaces the active output directory for external-tool
+    (Fiji / ``roigbiv-reingest``) round-trips.
     """
     return dbc.Card(dbc.CardBody([
-        html.H6("Edit ROIs in browser", className="mb-2"),
+        html.H6("ROI editing", className="mb-2"),
         html.P(
-            "Draw, edit, or delete ROIs directly in the browser. "
-            "Changes are saved to the corrections log on the server. "
-            "Refresh this page after saving to reload the updated ROIs.",
+            "Draw, edit, or delete ROIs in the editor above — changes autosave "
+            "to the corrections log. Color and Overlay controls apply live. "
+            "For Fiji / ImageJ round-trips, point roigbiv-reingest at the path "
+            "below.",
             className="text-muted small",
-        ),
-        html.A(
-            [html.I(className="bi bi-pencil-square me-2"),
-             "Open ROI editor"],
-            id="roigbiv-review-open-web-editor",
-            href="#",
-            target="_blank",
-            className="btn btn-outline-primary btn-sm mb-1 w-100",
         ),
         html.Div(
             id="roigbiv-review-output-path",
@@ -231,12 +283,16 @@ def _finetune_card() -> dbc.Card:
     return dbc.Card(dbc.CardBody([
         html.H6("Fine-tune model", className="mb-2"),
         dbc.Row([
-            dbc.Col(dbc.Label("Epochs", className="small"), width=5),
+            dbc.Col(labeled_with_help("Epochs", "roigbiv-trainer-epochs",
+                                      HELP_TEXT["roigbiv-trainer-epochs"]),
+                    width=5, className="small d-flex align-items-center"),
             dbc.Col(dbc.Input(id="roigbiv-trainer-epochs", type="number",
                               value=200, min=1, step=10, size="sm"), width=7),
         ], className="mb-1 g-1"),
         dbc.Row([
-            dbc.Col(dbc.Label("LR", className="small"), width=5),
+            dbc.Col(labeled_with_help("LR", "roigbiv-trainer-lr",
+                                      HELP_TEXT["roigbiv-trainer-lr"]),
+                    width=5, className="small d-flex align-items-center"),
             dbc.Col(dbc.Input(id="roigbiv-trainer-lr", type="number",
                               value=0.05, step=0.005, size="sm"), width=7),
         ], className="mb-2 g-1"),
@@ -360,97 +416,98 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-review-canvas", "children"),
         Output("roigbiv-review-title", "children"),
-        Input("roigbiv-review-state", "data"),
-        Input("roigbiv-review-session-check", "value"),
-        Input("roigbiv-review-active-session", "value"),
+        Input("roigbiv-review-output-dir", "data"),
+        State("roigbiv-review-color", "value"),
+        State("roigbiv-review-overlay", "value"),
+    )
+    def _render_canvas(output_dir, color_mode, overlay_on):
+        # The main pane is the embedded ROI editor (OpenSeadragon + Annotorious)
+        # for the *active* session. Color/Overlay are seeded into the iframe URL
+        # only on (re)load; live changes are driven by the clientside style
+        # bridge via postMessage so the iframe never reloads and edit/playback
+        # state survives.
+        if not output_dir:
+            return (html.Em("Select a FOV and active session to edit ROIs.",
+                            className="text-muted"), "Review")
+        stem = Path(output_dir).name
+        dir_b64 = base64.urlsafe_b64encode(output_dir.encode()).decode()
+        color = color_mode or "stage"
+        overlay = "1" if (True if overlay_on is None else overlay_on) else "0"
+        src = (f"/roi-editor/{stem}?dir={dir_b64}"
+               f"&color={color}&overlay={overlay}")
+        iframe = html.Iframe(
+            id="roigbiv-review-editor-iframe",
+            src=src,
+            style={"width": "100%", "height": "78vh", "border": "0",
+                   "borderRadius": "6px", "background": "#0f1117"},
+        )
+        return iframe, f"Review · {stem}"
+
+    # Live recolor / overlay bridge: push the Color + Overlay controls into the
+    # embedded editor iframe via postMessage (no reload, no lost edits).
+    app.clientside_callback(
+        """
+        function(color, overlay) {
+            var f = document.getElementById('roigbiv-review-editor-iframe');
+            if (f && f.contentWindow) {
+                f.contentWindow.postMessage(
+                    {type: 'roigbiv-style', color: color || 'stage',
+                     overlay: !!overlay},
+                    window.location.origin);
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("roigbiv-review-style-bridge", "data"),
         Input("roigbiv-review-color", "value"),
         Input("roigbiv-review-overlay", "value"),
-        Input("roigbiv-theme", "data"),
     )
-    def _render_canvas(viewer_state, selected_ids, active_session,
-                       color_mode, overlay_on, theme):
-        if not viewer_state or "fov_id" not in viewer_state:
-            return (html.Em("Select a FOV to load sessions.",
-                            className="text-muted"), "Review")
-        if viewer_state.get("error"):
-            return (user_error(RuntimeError(viewer_state["error"]),
-                               "Loading cross-session bundle"),
-                    "Review")
-        cfg = get_app_state().registry_config
-        try:
-            bundle = load_cross_session_bundle(viewer_state["fov_id"], cfg=cfg)
-        except Exception as exc:  # noqa: BLE001
-            return (user_error(exc, "Rendering canvas"), "Review")
-        if not bundle.sessions:
-            return (html.Em("No sessions on this FOV yet.",
-                            className="text-muted"), "Review")
 
-        sel_set = set(selected_ids or [])
-        if not sel_set:
-            sel_set = {bundle.sessions[0].session_id}
-
-        cards = []
-        graph_config = {
-            "displayModeBar": True,
-            "modeBarButtonsToRemove": ["select2d", "lasso2d",
-                                       "autoScale2d",
-                                       "toggleSpikelines"],
-            "scrollZoom": True,
-            "responsive": True,
+    # Install (once) a window message listener that mirrors the editor's
+    # selectAnnotation into a Dash store via set_props. Re-runs harmlessly when
+    # the canvas re-renders; a window flag guards against duplicate listeners.
+    app.clientside_callback(
+        """
+        function(_children) {
+            if (!window._roigbivRoiListener) {
+                window._roigbivRoiListener = true;
+                window.addEventListener('message', function(e) {
+                    if (e.origin !== window.location.origin) return;
+                    var d = e.data || {};
+                    if (d.type !== 'roigbiv-roi-selected') return;
+                    if (d.label_id === undefined || d.label_id === null) return;
+                    window._roigbivRoiN = (window._roigbivRoiN || 0) + 1;
+                    if (window.dash_clientside && window.dash_clientside.set_props) {
+                        window.dash_clientside.set_props(
+                            'roigbiv-review-roi-msg',
+                            {data: {label_id: d.label_id, n: window._roigbivRoiN}});
+                    }
+                });
+            }
+            return window.dash_clientside.no_update;
         }
-        for s in bundle.sessions:
-            if s.session_id not in sel_set:
-                continue
-            fb = bundle.bundles[s.session_id]
-            date_str = (s.session_date.isoformat()
-                        if s.session_date else s.session_id[:8])
-            fig = build_roi_figure(
-                fb.mean_M, fb.rois,
-                color_mode=color_mode or "stage",
-                show_overlay=bool(overlay_on),
-                title=None,
-                theme=theme,
-            )
-            fig.update_layout(dragmode="pan")
-            is_active = (s.session_id == active_session)
-            cards.append(_session_card(s, fb, date_str, fig, graph_config,
-                                        is_active))
-
-        # Always stack vertically at full main-col width — shrinking the grid
-        # as session count grew made per-ROI detail unreadable.
-        title = _compose_title(bundle, len(cards))
-        return (dbc.Row([dbc.Col(c, md=12, className="mb-3")
-                         for c in cards]),
-                title)
+        """,
+        Output("roigbiv-review-msg-init", "data"),
+        Input("roigbiv-review-canvas", "children"),
+    )
 
     @app.callback(
         Output("roigbiv-review-selected-roi", "data"),
-        Input({"type": "roigbiv-session-graph", "session_id": ALL},
-              "clickData"),
-        State("roigbiv-review-state", "data"),
+        Input("roigbiv-review-roi-msg", "data"),
+        State("roigbiv-review-active-session", "value"),
         prevent_initial_call=True,
     )
-    def _on_roi_click(click_datas, viewer_state):
-        if not click_datas or not viewer_state:
+    def _roi_msg_to_selection(msg, active_session):
+        # The editor reports only the ROI label; pair it with the active
+        # session (the iframe is always showing that session's ROIs).
+        if not msg or not active_session:
             return no_update
-        triggered = [(i, cd) for i, cd in enumerate(click_datas) if cd]
-        if not triggered:
-            return no_update
-        _, cd = triggered[-1]
-        points = (cd or {}).get("points") or []
-        if not points:
-            return no_update
-        label_id = _extract_label_id(points[0])
+        label_id = msg.get("label_id")
         if label_id is None:
             return no_update
-        triggered_id = dash.callback_context.triggered_id
-        session_id = (triggered_id.get("session_id")
-                      if isinstance(triggered_id, dict) else None)
-        if not session_id:
-            return no_update
-        # click_counter increments on every click so the drawer re-opens
-        # even if the user clicks the same ROI twice.
-        return {"session_id": session_id,
+        # click_counter increments on every selection so the drawer re-opens
+        # even when the same ROI is picked twice.
+        return {"session_id": active_session,
                 "local_label_id": int(label_id),
                 "click_counter": _click_counter_inc()}
 
@@ -506,7 +563,7 @@ def register_callbacks(app: dash.Dash) -> None:
     def _render_fov_trace(viewer_state, selected_ids, kind, theme):
         if not (viewer_state and viewer_state.get("fov_id")):
             return _placeholder_fig("Select a FOV to load traces.", theme)
-        kind = kind or "dff"
+        kind = kind or "f"
         fov_id = viewer_state["fov_id"]
         cfg = get_app_state().registry_config
         fov_meta = _lookup_fov_meta(fov_id, cfg=cfg)
@@ -547,7 +604,7 @@ def register_callbacks(app: dash.Dash) -> None:
                 "Click an ROI in a session above to load traces.", theme,
             )
         fov_id = viewer_state["fov_id"]
-        kind = kind or "dff"
+        kind = kind or "f"
         local_label_id = int(selected["local_label_id"])
         cfg = get_app_state().registry_config
         fov_meta = _lookup_fov_meta(fov_id, cfg=cfg)
@@ -580,21 +637,48 @@ def register_callbacks(app: dash.Dash) -> None:
                 pairs = [(sess, row)] if row is not None else []
         except Exception as exc:  # noqa: BLE001
             return user_error_figure(exc, "Collecting ROI traces", theme=theme)
+        if len(pairs) == 1:
+            sess, _row = pairs[0]
+            try:
+                roi_data = fetch_single_roi_data(sess.output_dir, local_label_id)
+            except Exception:  # noqa: BLE001
+                roi_data = None
+            if roi_data is not None:
+                return build_roi_single(fov_meta, roi_data, theme=theme)
         return build_roi_across_sessions(fov_meta, pairs, session_id,
                                          theme=theme)
 
     @app.callback(
-        Output("roigbiv-review-open-web-editor", "href"),
         Output("roigbiv-review-output-path", "children"),
         Input("roigbiv-review-output-dir", "data"),
     )
-    def _update_editor_link(output_dir):
+    def _update_output_path(output_dir):
         if not output_dir:
-            return "#", "(select an active session to populate)"
+            return "(select an active session to populate)"
+        return output_dir
+
+    # ── Trace export callback ───────────────────────────────────────────────
+
+    @app.callback(
+        Output("roigbiv-review-export-download", "data"),
+        Output("roigbiv-review-export-status", "children"),
+        Input("roigbiv-review-export-btn", "n_clicks"),
+        State("roigbiv-review-output-dir", "data"),
+        State("roigbiv-review-export-kind", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_export(n_clicks, output_dir, kind_str):
+        if not output_dir:
+            return no_update, "Select an active session first."
+        from roigbiv.pipeline.export_io import export_fov_traces_to_tempfile
+        kinds = tuple(k.strip() for k in (kind_str or "dff,f").split(",") if k.strip())
+        try:
+            tmp_path = export_fov_traces_to_tempfile(Path(output_dir), kinds=kinds)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Trace export failed")
+            return no_update, f"Export failed: {exc}"
         stem = Path(output_dir).name
-        dir_b64 = base64.urlsafe_b64encode(output_dir.encode()).decode()
-        href = f"/roi-editor/{stem}?dir={dir_b64}"
-        return href, output_dir
+        return dcc.send_file(str(tmp_path), filename=f"{stem}_traces.h5"), ""
 
     # ── Fine-tune callbacks ─────────────────────────────────────────────────
 
@@ -697,51 +781,6 @@ _click_counter_state: dict[str, int] = {"n": 0}
 def _click_counter_inc() -> int:
     _click_counter_state["n"] += 1
     return _click_counter_state["n"]
-
-
-def _extract_label_id(pt: dict) -> Optional[int]:
-    cd = pt.get("customdata")
-    if cd:
-        try:
-            return int(cd[0]) if isinstance(cd, list) else int(cd)
-        except (TypeError, ValueError):
-            return None
-    text = pt.get("text")
-    if text is not None:
-        try:
-            return int(text)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _compose_title(bundle: CrossSessionBundle, n_selected: int) -> str:
-    animal = bundle.animal_id or "—"
-    region = bundle.region or "—"
-    return (f"FOV {bundle.fov_id[:8]} · {animal} / {region}  "
-            f"· viewing {n_selected} / {len(bundle.sessions)} session(s)")
-
-
-def _session_card(sref, fb: FOVBundle, date_str: str, fig,
-                  graph_config: dict, is_active: bool):
-    card_class = "roigbiv-active-session" if is_active else ""
-    header_suffix = " · active" if is_active else ""
-    return dbc.Card(dbc.CardBody([
-        html.Div([
-            html.Strong(f"Session {date_str}{header_suffix}"),
-            html.Span(f"  · {len(fb.rois)} ROIs",
-                      className="text-muted ms-2"),
-        ], className="mb-2"),
-        dcc.Graph(
-            id={"type": "roigbiv-session-graph",
-                "session_id": sref.session_id},
-            figure=fig,
-            config=graph_config,
-            # vh-based height lets the 1:1-locked plot fill most of a wide
-            # stacked card; minHeight keeps small viewports sensible.
-            style={"height": "85vh", "minHeight": "520px"},
-        ),
-    ]), className=card_class)
 
 
 def _session_labels(fov_id: Optional[str], session_ids: list[str], cfg=None) -> dict:

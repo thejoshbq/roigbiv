@@ -1,6 +1,6 @@
 """Plotly figure builders for the Viewer page's trace panels.
 
-Three builders, all producing a single :class:`go.Figure`:
+Four builders, all producing a single :class:`go.Figure`:
 
 * :func:`build_mean_single`          — mean-FOV trace for one session.
 * :func:`build_mean_multi`           — per-session mean-FOV traces overlaid on
@@ -9,6 +9,9 @@ Three builders, all producing a single :class:`go.Figure`:
 * :func:`build_roi_across_sessions`  — one ROI across every available session,
                                        overlaid with the session where it was
                                        selected drawn bold on top.
+* :func:`build_roi_single`           — single-session ROI: dF/F + transient
+                                       markers + optional raw/neuropil subplot
+                                       + activity-type badge.
 
 Each figure exposes the identifiers the criteria require: FOV id in the
 figure title, session id/date in the legend, and for ROI views the
@@ -22,6 +25,8 @@ from typing import Optional
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.signal import find_peaks
 
 from roigbiv.ui.services.colors import session_colors
 from roigbiv.ui.services.theme import (
@@ -29,7 +34,7 @@ from roigbiv.ui.services.theme import (
     plotly_template,
     warning_color,
 )
-from roigbiv.ui.services.trace_viz import SessionTraces, Y_LABELS
+from roigbiv.ui.services.trace_viz import SessionTraces, SingleROIData, Y_LABELS
 
 
 MEAN_COLOR = "rgba(46, 204, 113, 0.9)"
@@ -399,6 +404,175 @@ def build_roi_across_sessions(
             showarrow=False,
             font={"size": 10, "color": axis_muted_color(theme)},
         )
+    return fig
+
+
+# ── single-session single-ROI view ───────────────────────────────────────
+
+
+_ACTIVITY_COLORS: dict[str, str] = {
+    "phasic":    "rgba(46, 204, 113, 0.85)",
+    "sparse":    "rgba(52, 152, 219, 0.85)",
+    "tonic":     "rgba(230, 126, 34, 0.85)",
+    "silent":    "rgba(127, 140, 141, 0.85)",
+    "ambiguous": "rgba(241, 196, 15, 0.85)",
+}
+_ACTIVITY_COLOR_DEFAULT = "rgba(149, 165, 166, 0.85)"
+
+DFF_COLOR = "rgba(231, 76, 60, 0.95)"          # matches HIGHLIGHT_COLOR
+F_CORRECTED_COLOR = "rgba(52, 152, 219, 0.65)"
+F_NEUROPIL_COLOR = "rgba(149, 165, 166, 0.50)"
+
+
+def build_roi_single(
+    fov_meta: dict,
+    data: SingleROIData,
+    *,
+    theme: Optional[str] = None,
+) -> go.Figure:
+    """Single-session ROI: dF/F with transient markers + raw/neuropil subplot.
+
+    Primary panel: dF/F trace with scipy MAD-threshold peak markers and an
+    activity-type badge. Secondary panel (when f_corrected or f_neuropil are
+    available): corrected F (solid) and neuropil F (dotted) on a shared x-axis.
+    """
+    title = _fov_title(fov_meta, f"ROI {data.local_label_id} · dF/F")
+
+    if data.dff is None:
+        return _empty_fig(title, "dF/F not available for this ROI.", theme=theme)
+
+    dff = np.asarray(data.dff, dtype=np.float32)
+    has_secondary = data.f_corrected is not None or data.f_neuropil is not None
+
+    if has_secondary:
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.68, 0.32],
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+        )
+        dff_row, sec_row = 1, 2
+    else:
+        fig = go.Figure()
+        dff_row = sec_row = None
+
+    # Time axis
+    if data.fs and data.n_frames:
+        t = np.arange(data.n_frames, dtype=np.float32) / float(data.fs)
+        xaxis_label = "time (s)"
+    else:
+        t = np.arange(len(dff), dtype=np.float32)
+        xaxis_label = "frame"
+
+    n = min(len(t), len(dff))
+    t, dff = t[:n], dff[:n]
+
+    add_kw: dict = ({"row": dff_row, "col": 1} if has_secondary else {})
+
+    fig.add_trace(go.Scatter(
+        x=t, y=dff,
+        mode="lines",
+        line={"color": DFF_COLOR, "width": 1.5},
+        name="dF/F",
+        hovertemplate="t = %{x:.2f} s<br>dF/F = %{y:.4f}<extra></extra>",
+    ), **add_kw)
+
+    # Transient markers — MAD-based threshold, handles NaN (silent ROIs)
+    valid_mask = ~np.isnan(dff)
+    if np.any(valid_mask):
+        dff_filled = dff.copy()
+        med = float(np.nanmedian(dff_filled))
+        dff_filled[~valid_mask] = med
+        mad = float(np.nanmedian(np.abs(dff_filled - med))) or 1e-6
+        min_dist = max(1, int((data.fs or 7.5) * 0.5))
+        try:
+            peaks, _ = find_peaks(
+                dff_filled, height=med + 2.0 * mad, distance=min_dist,
+            )
+        except Exception:
+            peaks = np.array([], dtype=int)
+        if len(peaks):
+            fig.add_trace(go.Scatter(
+                x=t[peaks], y=dff[peaks],
+                mode="markers",
+                marker={
+                    "symbol": "triangle-up", "size": 7,
+                    "color": "rgba(255, 255, 255, 0.9)",
+                    "line": {"color": DFF_COLOR, "width": 1},
+                },
+                name="transients",
+                hovertemplate=(
+                    "transient<br>t = %{x:.2f} s<br>dF/F = %{y:.4f}"
+                    "<extra></extra>"
+                ),
+            ), **add_kw)
+
+    # Secondary panel — raw channels
+    if has_secondary:
+        if data.f_corrected is not None:
+            fc = np.asarray(data.f_corrected, dtype=np.float32)
+            n2 = min(len(t), len(fc))
+            fig.add_trace(go.Scatter(
+                x=t[:n2], y=fc[:n2],
+                mode="lines",
+                line={"color": F_CORRECTED_COLOR, "width": 1.0},
+                name="F corrected",
+                hovertemplate="t = %{x:.2f} s<br>F = %{y:.2f}<extra></extra>",
+            ), row=sec_row, col=1)
+        if data.f_neuropil is not None:
+            fn = np.asarray(data.f_neuropil, dtype=np.float32)
+            n2 = min(len(t), len(fn))
+            fig.add_trace(go.Scatter(
+                x=t[:n2], y=fn[:n2],
+                mode="lines",
+                line={"color": F_NEUROPIL_COLOR, "width": 0.9, "dash": "dot"},
+                name="F neuropil",
+                hovertemplate="t = %{x:.2f} s<br>F_neu = %{y:.2f}<extra></extra>",
+            ), row=sec_row, col=1)
+
+    fig.update_layout(
+        title=title,
+        template=plotly_template(theme),
+        autosize=True,
+        margin={"l": 60, "r": 20, "t": 70, "b": 50},
+        hovermode="x unified",
+        legend={"orientation": "h", "x": 0.0, "y": -0.12,
+                "xanchor": "left", "yanchor": "top"},
+    )
+
+    if has_secondary:
+        fig.update_yaxes(title_text="dF/F", row=1, col=1)
+        fig.update_yaxes(title_text="F (a.u.)", row=2, col=1)
+        fig.update_xaxes(title_text=xaxis_label, row=2, col=1)
+    else:
+        fig.update_layout(
+            xaxis_title=xaxis_label,
+            yaxis_title="dF/F",
+        )
+
+    # Activity-type badge
+    activity = data.activity_type or "—"
+    fig.add_annotation(
+        text=f" {activity} ",
+        xref="paper", yref="paper",
+        x=0.01, y=1.0,
+        xanchor="left", yanchor="bottom",
+        showarrow=False,
+        font={"size": 11, "color": "#fff"},
+        bgcolor=_ACTIVITY_COLORS.get(activity, _ACTIVITY_COLOR_DEFAULT),
+        borderpad=3,
+    )
+
+    if data.source_label and data.source_label != "pipeline":
+        fig.add_annotation(
+            text=f"source: {data.source_label}",
+            xref="paper", yref="paper",
+            x=1.0, y=1.02,
+            xanchor="right", yanchor="bottom",
+            showarrow=False,
+            font={"size": 10, "color": axis_muted_color(theme)},
+        )
+
     return fig
 
 
