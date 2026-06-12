@@ -128,6 +128,10 @@ _STAGE_RANKS: dict[str, int] = {
 _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     "enable_stage_2", "enable_stage_3", "enable_stage_4",
     "force_cpu",
+    # Foundation-only is a stop-point, not a correctness knob: a dry run writes
+    # the "foundation" manifest entry, then a later --resume run (with the flag
+    # off) must continue from Stage 1 without a fingerprint mismatch.
+    "foundation_only",
 })
 
 

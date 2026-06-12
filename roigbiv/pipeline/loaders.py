@@ -24,6 +24,51 @@ def _maybe_read_tif(path: Path):
     return None
 
 
+def _load_foundation_only(output_dir: Path) -> tuple[FOVData, list]:
+    """Reconstitute a FOVData from a foundation-only (dry-run) output dir.
+
+    A ``--foundation-only`` run stops before Stage 1, so the usual hard
+    requirements (``pipeline_log.json``, ``roi_metadata.json``,
+    ``merged_masks.tif``) are absent. Only the summary images exist; build a
+    shell FOVData with ``rois=[]`` so the UI can preview the motion-corrected
+    FOV without crashing.
+    """
+    output_dir = Path(output_dir)
+    summary = output_dir / "summary"
+    mean_M  = _maybe_read_tif(summary / "mean_M.tif")
+    mean_S  = _maybe_read_tif(summary / "mean_S.tif")
+    mean_L  = _maybe_read_tif(summary / "mean_L.tif")
+    max_S   = _maybe_read_tif(summary / "max_S.tif")
+    std_S   = _maybe_read_tif(summary / "std_S.tif")
+    vcorr_S = _maybe_read_tif(summary / "vcorr_S.tif")
+    dog_map = _maybe_read_tif(summary / "dog_map.tif")
+
+    sentinel = {}
+    sentinel_path = output_dir / "foundation_only.json"
+    if sentinel_path.exists():
+        try:
+            sentinel = json.loads(sentinel_path.read_text())
+        except (ValueError, OSError):
+            sentinel = {}
+    shape = tuple(sentinel.get("shape", (0, *(mean_M.shape if mean_M is not None else (0, 0)))))
+
+    fov = FOVData(
+        raw_path=output_dir / "unknown.tif",
+        output_dir=output_dir,
+        data_bin_path=output_dir / "suite2p" / "plane0" / "data.bin",
+        shape=shape,
+        mean_M=mean_M,
+        mean_S=mean_S,
+        mean_L=mean_L,
+        max_S=max_S,
+        std_S=std_S,
+        vcorr_S=vcorr_S,
+        dog_map=dog_map,
+        rois=[],
+    )
+    return fov, []
+
+
 def load_fov_from_output_dir(
     output_dir: Path,
 ) -> tuple[FOVData, list]:
@@ -41,6 +86,10 @@ def load_fov_from_output_dir(
             review_queue.json                                  (optional)
     """
     output_dir = Path(output_dir)
+    # Foundation-only dry runs stop before Stage 1 and have no ROI artifacts;
+    # serve a summary-images-only shell instead of failing the hard checks.
+    if (output_dir / "foundation_only.json").exists():
+        return _load_foundation_only(output_dir)
     log_path = output_dir / "pipeline_log.json"
     meta_path = output_dir / "roi_metadata.json"
     masks_path = output_dir / "merged_masks.tif"
