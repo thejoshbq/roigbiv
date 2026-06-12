@@ -235,6 +235,23 @@ def _grid_cluster(pts: np.ndarray, distance_threshold: float) -> np.ndarray:
     return (inverse + 1).astype(np.int64)
 
 
+def _topk_by_score(
+    arrays: tuple[np.ndarray, ...], scores: np.ndarray, cap: int,
+) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
+    """Keep the ``cap`` highest-`scores` entries of every array in ``arrays``.
+
+    Uses ``argpartition`` (O(n), unordered) rather than a full sort — Stage 3's
+    downstream (spatial clustering, per-cluster temporal-independence) is
+    order-independent, so we only need the top-``cap`` *set*, not its ranking.
+    Returns ``(pruned_arrays, pruned_scores)``. No-op when ``len(scores) <= cap``.
+    """
+    n = len(scores)
+    if n <= cap:
+        return arrays, scores
+    keep = np.argpartition(-scores, cap)[:cap]
+    return tuple(a[keep] for a in arrays), scores[keep]
+
+
 def _count_temporally_independent(
     times: np.ndarray,
     scores: np.ndarray,
@@ -321,6 +338,21 @@ def run_stage3(
     # last chunk may be smaller — it writes into chunk_pixels[:n_pix].
     chunk_pixels = np.empty((rows_per_chunk * W, T), dtype=np.float32)
 
+    # Bound the event accumulation. A mis-tuned threshold (or a structured,
+    # non-Gaussian residual — e.g. prism-scale FOVs where GRIN-tuned templates
+    # match everywhere) can emit billions of suprathreshold events. Appending
+    # them all and concatenating at the end peaks at >2× their footprint and
+    # OOM-kills the host on long FOVs. Instead we keep only the top
+    # `stage3_max_events` by score, pruning whenever the buffer crosses a
+    # high-water mark so peak memory stays ~2× the cap regardless of input.
+    cap = int(cfg.stage3_max_events)
+    high_water = 2 * cap
+    total_seen = 0          # true event count (for diagnostics), pre-cap
+    pruned_ever = False
+    # Running pruned arrays (None until the first prune); chunk outputs land in
+    # the buffer lists and are folded in when the high-water mark is crossed.
+    acc: tuple[np.ndarray, ...] | None = None
+
     t_fft_total = 0.0
     for y0 in range(0, H, rows_per_chunk):
         y1 = min(y0 + rows_per_chunk, H)
@@ -351,33 +383,60 @@ def run_stage3(
             all_t.append(times)
             all_score.append(scores)
             all_tmpl.append(tmpl_idx)
+            total_seen += int(pixel_idx.size)
+
+            buffered = sum(len(a) for a in all_score)
+            acc_len = 0 if acc is None else len(acc[3])
+            if buffered + acc_len > high_water:
+                # Fold buffers (and any prior running arrays) into a single
+                # top-`cap` set, then reset the buffers. Bounds live memory.
+                parts_y = ([acc[0]] if acc else []) + all_y
+                parts_x = ([acc[1]] if acc else []) + all_x
+                parts_t = ([acc[2]] if acc else []) + all_t
+                parts_s = ([acc[3]] if acc else []) + all_score
+                parts_k = ([acc[4]] if acc else []) + all_tmpl
+                merged_s = np.concatenate(parts_s)
+                acc, _ = _topk_by_score(
+                    (np.concatenate(parts_y), np.concatenate(parts_x),
+                     np.concatenate(parts_t), merged_s, np.concatenate(parts_k)),
+                    merged_s, cap,
+                )
+                all_y, all_x, all_t, all_score, all_tmpl = [], [], [], [], []
+                if not pruned_ever:
+                    print(f"  [cap] event count exceeded {high_water} "
+                          f"(2× stage3_max_events={cap}); pruning to top {cap} "
+                          f"by score. This signals threshold saturation — "
+                          f"consider raising --template-threshold.", flush=True)
+                    pruned_ever = True
 
     del tmpl_tensor, template_freqs, chunk_pixels
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if not all_y:
+    if acc is None and not all_y:
         print(f"  Stage 3: 0 events detected in {t_fft_total:.1f}s", flush=True)
         return []
 
-    ys = np.concatenate(all_y)
-    xs = np.concatenate(all_x)
-    ts = np.concatenate(all_t)
-    scs = np.concatenate(all_score)
-    tis = np.concatenate(all_tmpl)
-    n_events = len(ys)
-    print(f"  Stage 3: {n_events} suprathreshold events in {t_fft_total:.1f}s", flush=True)
+    # Fold the running pruned arrays (if any) with the remaining buffers. The
+    # accumulation invariant bounds this concatenate at ≤ high_water + one
+    # chunk, so it can no longer OOM regardless of total_seen.
+    ys = np.concatenate(([acc[0]] if acc else []) + all_y)
+    xs = np.concatenate(([acc[1]] if acc else []) + all_x)
+    ts = np.concatenate(([acc[2]] if acc else []) + all_t)
+    scs = np.concatenate(([acc[3]] if acc else []) + all_score)
+    tis = np.concatenate(([acc[4]] if acc else []) + all_tmpl)
+    print(f"  Stage 3: {total_seen} suprathreshold events in {t_fft_total:.1f}s",
+          flush=True)
 
-    # Global cap: if still too many events, keep top-K by score. This path is
-    # unusual — real calcium data with a 6σ threshold typically yields < 1e6
-    # events. Hitting the cap implies structured (non-Gaussian) residual.
-    if n_events > cfg.stage3_max_events:
-        top_k_idx = np.argsort(-scs)[: cfg.stage3_max_events]
-        ys = ys[top_k_idx]; xs = xs[top_k_idx]; ts = ts[top_k_idx]
-        scs = scs[top_k_idx]; tis = tis[top_k_idx]
-        n_events = len(ys)
-        print(f"  [cap] retained top {n_events} events by score "
-              f"(above stage3_max_events={cfg.stage3_max_events})", flush=True)
+    # Final cap to the exact budget. Real calcium data with a 6σ threshold
+    # typically yields < 1e6 events; exceeding the cap implies a structured
+    # (non-Gaussian) residual or a mis-tuned threshold — the top-K-by-score
+    # set is retained either way (and `pruned_ever` already warned).
+    if len(ys) > cap:
+        (ys, xs, ts, scs, tis), _ = _topk_by_score((ys, xs, ts, scs, tis), scs, cap)
+        print(f"  [cap] retained top {len(ys)} events by score of {total_seen} "
+              f"seen (stage3_max_events={cap})", flush=True)
+    n_events = len(ys)
 
     # ── Spatial clustering ────────────────────────────────────────────────
     t0 = time.time()

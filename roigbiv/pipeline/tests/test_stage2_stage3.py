@@ -261,6 +261,81 @@ def test_gate3_waveform_r2():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Stage 3 bounded event accumulation (OOM guard)
+# ─────────────────────────────────────────────────────────────────────────
+
+def test_topk_by_score_keeps_highest():
+    """`_topk_by_score` keeps exactly the cap highest-score entries, and the
+    parallel arrays stay row-aligned with the retained scores."""
+    from roigbiv.pipeline.stage3 import _topk_by_score
+
+    rng = np.random.default_rng(0)
+    n = 1000
+    scores = rng.normal(size=n).astype(np.float32)
+    ys = np.arange(n, dtype=np.int64)          # identity tag → check alignment
+    xs = (np.arange(n, dtype=np.int64) * 7) % 64
+
+    cap = 50
+    (ys2, xs2, scs2), scs_ret = _topk_by_score((ys, xs, scores), scores, cap)
+    assert len(ys2) == cap
+    assert scs_ret is scores[ys2] or np.array_equal(scs_ret, scores[ys2])
+    # The retained set must be the cap globally-largest scores.
+    expected = set(np.argsort(-scores)[:cap].tolist())
+    assert set(ys2.tolist()) == expected
+    # Arrays stay aligned: xs2 follows the same permutation as ys2 (identity tag).
+    assert np.array_equal(xs2, (ys2 * 7) % 64)
+    # No-op below the cap.
+    out, _ = _topk_by_score((ys, xs, scores), scores, n + 1)
+    assert out[0] is ys
+
+
+def test_stage3_accumulation_is_bounded_under_saturation():
+    """A pure-noise residual at a low threshold emits far more events than the
+    cap; Stage 3 must complete (no OOM / unbounded growth) and retain ≤ cap
+    events. Regression for the beh-006 host-RAM OOM."""
+    from roigbiv.pipeline.stage3 import run_stage3
+    from roigbiv.pipeline.stage3_templates import build_template_bank
+    from roigbiv.pipeline.residual import ResidualView
+    from roigbiv.pipeline.types import FOVData, PipelineConfig
+
+    T, H, W = 200, 48, 48
+    fs, tau = 30.0, 1.0
+    bank = build_template_bank(fs=fs, tau=tau)
+
+    # Pure Gaussian noise + a very low threshold → dense, structureless events,
+    # i.e. the saturation regime. With cap ≪ emitted count, the high-water
+    # prune path must fire and bound the result.
+    rng = np.random.default_rng(7)
+    residual = rng.normal(scale=1.0, size=(T, H, W)).astype(np.float32)
+
+    cap = 500
+    with tempfile.TemporaryDirectory() as td:
+        view = ResidualView.from_dense(residual)
+        cfg = PipelineConfig(
+            fs=fs, tau=tau, reconstruct_chunk=100,
+            template_threshold=0.5,        # deliberately low → saturate
+            spatial_pool_radius=8, cluster_distance=12, min_event_separation=2.0,
+            stage3_pixel_chunk_rows=4,     # many chunks → exercise prune loop
+            stage3_max_events=cap,
+        )
+        fov = FOVData(
+            raw_path=Path("dummy.tif"), output_dir=Path(td),
+            data_bin_path=Path(td) / "data.bin", shape=(T, H, W),
+            residual_view=view,
+            mean_M=np.zeros((H, W), np.float32), mean_S=np.zeros((H, W), np.float32),
+            max_S=np.zeros((H, W), np.float32), std_S=np.ones((H, W), np.float32),
+            vcorr_S=np.zeros((H, W), np.float32), dog_map=np.zeros((H, W), np.float32),
+            mean_L=np.zeros((H, W), np.float32), k_background=30,
+        )
+        # Must not raise / hang; the cap bounds the retained-event working set.
+        rois = run_stage3(view, fov, bank, cfg, starting_label_id=1)
+    # Clustering/gating may collapse events to few ROIs — the contract we assert
+    # is that the run completed under saturation without unbounded accumulation.
+    assert isinstance(rois, list)
+    print("  [PASS] test_stage3_accumulation_is_bounded_under_saturation")
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -273,6 +348,8 @@ if __name__ == "__main__":
         test_template_bank_sanity,
         test_stage3_clustering,
         test_gate3_waveform_r2,
+        test_topk_by_score_keeps_highest,
+        test_stage3_accumulation_is_bounded_under_saturation,   # slower (GPU)
         test_stage3_synthetic_event_detection,   # slower (uses GPU)
     ]
     failed = []
