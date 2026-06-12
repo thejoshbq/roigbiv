@@ -142,6 +142,56 @@ def denoise_mean_S(mean_S: np.ndarray, gpu: bool = True) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _estimate_diameter_px(
+    img: np.ndarray,
+    n_peaks: int = 30,
+    box_radius: int = 40,
+) -> Optional[float]:
+    """Robust per-image cell-diameter estimate via DoG peaks + Otsu sizing.
+
+    Returns the median equivalent-diameter (px) across detected somata, or
+    None if too few peaks are found to be reliable.
+    """
+    try:
+        from skimage.feature import peak_local_max
+        from skimage.filters import difference_of_gaussians, threshold_otsu
+        from skimage.measure import label as _label, regionprops
+    except ImportError:
+        return None
+
+    arr = img.astype(np.float32)
+    H, W = arr.shape
+    # DoG sigmas span GRIN→prism cell radii (~3 to ~15 px).
+    dog = difference_of_gaussians(arr, low_sigma=3.0, high_sigma=15.0)
+    peaks = peak_local_max(
+        dog, min_distance=20, threshold_rel=0.15,
+        num_peaks=n_peaks, exclude_border=box_radius,
+    )
+    diameters: list[float] = []
+    for (y, x) in peaks:
+        y0, y1 = max(0, y - box_radius), min(H, y + box_radius)
+        x0, x1 = max(0, x - box_radius), min(W, x + box_radius)
+        crop = arr[y0:y1, x0:x1]
+        if crop.size < 100:
+            continue
+        try:
+            t = threshold_otsu(crop)
+        except Exception:
+            continue
+        labels = _label(crop > t)
+        cy, cx = y - y0, x - x0
+        target = labels[cy, cx]
+        if target == 0:
+            continue
+        for r in regionprops((labels == target).astype(np.uint8)):
+            if 30 <= r.area <= 8000:
+                diameters.append(float(r.equivalent_diameter))
+            break
+    if len(diameters) < 5:
+        return None
+    return float(np.median(diameters))
+
+
 def run_cellpose_detection(
     mean_S: np.ndarray,
     vcorr_S: np.ndarray,
@@ -199,10 +249,35 @@ def run_cellpose_detection(
     H, W = mean_S_input.shape
     x = np.stack([mean_S_input, vcorr_S.astype(np.float32)], axis=-1)  # (H, W, 2)
 
+    # Diameter auto-calibration: peak-detection + Otsu sizing on the mean
+    # channel produces a robust per-FOV cell-scale estimate. Replaces
+    # cfg.diameter for the main inference call below. Cellpose 3.x's bundled
+    # SizeModel is only attached to `Cellpose(...)` wrapper instances; our
+    # custom-trained `CellposeModel` doesn't carry one, so we estimate from
+    # the image directly.
+    effective_diameter = cfg.diameter
+    if cfg.diameter_auto:
+        t_cal = time.time()
+        d_est = _estimate_diameter_px(mean_S_input)
+        if d_est is not None and d_est > 4.0:
+            effective_diameter = int(round(d_est))
+            print(
+                f"  diameter_auto: image estimate {effective_diameter}px "
+                f"(overriding cfg.diameter={cfg.diameter}) "
+                f"[calibration {time.time()-t_cal:.2f}s]",
+                flush=True,
+            )
+        else:
+            print(
+                f"  WARNING: diameter_auto image estimate failed "
+                f"(d_est={d_est}); keeping cfg.diameter={cfg.diameter}.",
+                flush=True,
+            )
+
     t0 = time.time()
     masks, flows, styles = model.eval(
         x,
-        diameter=cfg.diameter,
+        diameter=effective_diameter,
         cellprob_threshold=cfg.cellprob_threshold,
         flow_threshold=cfg.flow_threshold,
         channels=list(cfg.channels),
