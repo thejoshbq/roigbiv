@@ -89,6 +89,8 @@ def evaluate_gate2(
             roi.eccentricity = float(rp[0].eccentricity or 0.0)
         if roi.solidity < cfg.gate2_min_solidity:
             failures.append(f"solidity:{roi.solidity:.3f}")
+        if roi.eccentricity > cfg.gate2_max_eccentricity:
+            failures.append(f"eccentricity:{roi.eccentricity:.3f}")
 
         # ── Temporal independence / anti-correlation ──────────────────────
         max_abs_corr = 0.0
