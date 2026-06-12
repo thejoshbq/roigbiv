@@ -174,6 +174,91 @@ class PipelineConfig:
     svd_bin_frames: int = 5000              # target binned frame count
     reconstruct_chunk: int = 500            # temporal chunk size for L+S streaming
 
+    # ── Scout mode (Cellpose-only triage) ─────────────────────────────────
+    # Skip SVD/L+S/residual; compute Cellpose channel 2 as a correlation map on
+    # the registered movie. Stops after Stage 1 + Gate 1. Fast FOV-clarity and
+    # model A/B triage — NOT analysis-grade (no traces/QC/registry; not resumable).
+    scout_mode: bool = False
+    scout_vcorr_stride: int = 1             # frame decimation for scout Vcorr (1 = every frame)
+    scout_vcorr_neighbors: int = 8          # 8 (full) or 4 (von Neumann) stencil
+
+    # ── Foundation-only dry run ───────────────────────────────────────────
+    # Stop immediately after Foundation (motion correction + SVD/L+S + summary
+    # images), before Stage 1, so the motion-corrected FOV can be inspected
+    # before committing to ROI detection. Writes a foundation_only.json sentinel.
+    # Resumable: a later --resume run (without the flag) continues from Stage 1.
+    foundation_only: bool = False
+
+    # ── Motion correction backend ─────────────────────────────────────────
+    # "phasecorr":   Suite2p rigid + non-rigid registration (default). Robust on
+    #                dim, shot-noise-dominated frames where naive per-frame phase
+    #                correlation fails; visually matches the legacy SIMA output.
+    # "rowwise-pcc": GPU row-wise non-rigid phase correlation. The strip
+    #                regularization below (taller strips + median/confidence +
+    #                smoothing) suppresses the noise-driven per-row warps that
+    #                regressed dim/low-SNR FOVs (~30× less spurious warp on a
+    #                still frame); without it, it injects those warps. Still
+    #                opt-in: validate parity on the real stack before trusting it
+    #                over the phasecorr default.
+    # "legacy":      genuine SIMA HiddenMarkov2D(granularity='row') run in the
+    #                sima-legacy py3.8 sidecar conda env via subprocess
+    #                (roigbiv/pipeline/legacy_mc.py). CPU-only and slow (tens of
+    #                minutes to hours per FOV); a faithful reproduction of the
+    #                legacy notebook's correction. Opt-in for exact legacy repro.
+    # The mc_* knobs apply to rowwise-pcc except where noted (mc_max_displacement
+    # is shared; mc_sima_env / mc_granularity apply to legacy).
+    motion_correction_backend: str = "phasecorr"
+    mc_max_displacement: int = 50           # px clamp; shared by rowwise-pcc + legacy
+    mc_strip_height: int = 32               # horizontal strip height (rows); larger
+                                            # = higher per-strip SNR on dim data
+    mc_n_template_iters: int = 2            # template refinement iterations
+    mc_subpixel_upsample: int = 10          # parabolic refinement precision knob
+    mc_frame_batch: int = 256              # frames per GPU batch (auto-capped by VRAM)
+    # Strip regularization that closes the rowwise-pcc quality gap (Option B).
+    mc_smooth_sigma_rows: float = 6.0       # per-row displacement-field smoothing
+    mc_smooth_sigma_time: float = 1.0       # temporal smoothing across the frame batch
+    mc_strip_confidence_weight: bool = True  # median + confidence outlier rejection
+    # DoG band-pass on shift-estimation inputs. Off by default: it helps only when
+    # a structured background dominates; on white-noise-limited frames it degrades
+    # the correlation peak. Toggle per-dataset via the bench harness.
+    mc_prefilter: bool = False
+    mc_prefilter_sigma_low: float = 1.0     # shot-noise suppression (small blur)
+    mc_prefilter_sigma_high: float = 8.0    # background high-pass (large blur)
+    # legacy (SIMA) backend knobs:
+    mc_sima_env: str = "sima-legacy"        # conda env hosting SIMA 1.3.2
+    mc_granularity: str = "row"             # SIMA HMM2D granularity ('row' | 'frame')
+
+    # ── phasecorr (Suite2p) registration knobs ────────────────────────────
+    # These feed the Suite2p ops dict for the *registration* pass of the
+    # phasecorr backend (and are forwarded but inert for rowwise-pcc/legacy,
+    # which register elsewhere and run Suite2p detection-only). Namespaced
+    # mc_s2p_* to avoid colliding with the rowwise-pcc mc_* knobs above (e.g.
+    # mc_smooth_sigma_time means something different there).
+    #
+    # TUNED DEFAULTS: block_size=[64,64] + one_photon_reg(1Preg)=True. Full-
+    # session validation on the Logan Prism FOV (2271-frame mean vs a grid-
+    # aligned legacy SIMA mean) showed the old [128,128]/no-1Preg default reached
+    # only 58% of legacy cell-sharpness, while these reach ~103% (at/above legacy)
+    # with no over-fit banding. [64,64] alone gets 91%; 1Preg supplies the rest
+    # but is a 1-photon high-pass — if you process bright high-SNR 2P (non-Prism)
+    # data, pass --no-mc-1preg (and/or --mc-block-size 128 128). All other knobs
+    # keep Suite2p's own defaults. See scripts/sweep_suite2p_reg.py for the sweep.
+    mc_s2p_block_size: list = field(default_factory=lambda: [64, 64])  # non-rigid block px (tuned)
+    mc_s2p_smooth_sigma: float = 1.15       # spatial Gaussian blur of the reference
+    mc_s2p_smooth_sigma_time: float = 0.0   # temporal smoothing for shift estimation
+    mc_s2p_maxregshift: float = 0.1         # rigid shift clamp (fraction of frame)
+    mc_s2p_nonrigid: bool = True            # enable piecewise (non-rigid) registration
+    mc_s2p_maxregshift_nr: int = 5          # max non-rigid block shift (px) → ops maxregshiftNR
+    mc_s2p_nimg_init: int = 300             # frames used to build the reference image
+    mc_s2p_two_step_registration: bool = False  # rigid pass then non-rigid (needs raw movie)
+    # 1-photon-style high-pass before registration (Suite2p 1Preg family). Raises
+    # shift-estimation SNR on dim/low-contrast (GRIN/Prism) frames; ON by default
+    # (load-bearing for reaching legacy parity). Pass --no-mc-1preg for bright 2P.
+    mc_s2p_one_photon_reg: bool = True      # → ops "1Preg" (tuned)
+    mc_s2p_spatial_hp_reg: int = 42         # spatial high-pass window (px)
+    mc_s2p_pre_smooth: float = 0.0          # pre-high-pass Gaussian smoothing
+    mc_s2p_spatial_taper: float = 40.0      # edge pixels tapered out of registration
+
     # ── Stage 1 (Cellpose) ────────────────────────────────────────────────
     cellpose_model: str = _DEFAULT_CELLPOSE_MODEL
     diameter: int = 12
