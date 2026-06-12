@@ -31,7 +31,13 @@ def _build_ops(input_dir, fs: float, tau: float = 1.0,
     config dict. CLI-supplied ``fs``, ``tau``, ``anatomical_only``, and
     ``do_registration`` always take precedence over config values.
     """
-    from suite2p.default_ops import default_ops
+    try:
+        from suite2p.default_ops import default_ops
+    except ImportError as e:
+        raise RuntimeError(
+            "suite2p is not installed in this Python environment. "
+            "Activate the project env first:  conda activate roigbiv"
+        ) from e
 
     ops = default_ops()
     s2p_cfg = (cfg or {}).get("suite2p", {})
@@ -47,13 +53,27 @@ def _build_ops(input_dir, fs: float, tau: float = 1.0,
         "fs":               fs,
 
         # ── Registration ──────────────────────────────────────────────────
+        # Defaults below equal Suite2p's own default_ops values, so a cfg=None
+        # (or empty suite2p:) call is byte-identical to the historical path;
+        # these only bite when explicitly tuned (see PipelineConfig.mc_s2p_*).
         "do_registration":  1 if do_registration else 0,
         "nimg_init":        s2p_cfg.get("nimg_init", 300),
         "batch_size":       s2p_cfg.get("batch_size", 250),
         "smooth_sigma":     s2p_cfg.get("smooth_sigma", 1.15),
+        "smooth_sigma_time": s2p_cfg.get("smooth_sigma_time", 0),
         "maxregshift":      s2p_cfg.get("maxregshift", 0.1),
         "nonrigid":         s2p_cfg.get("nonrigid", True),
         "block_size":       s2p_cfg.get("block_size", [128, 128]),
+        "maxregshiftNR":    s2p_cfg.get("maxregshiftNR", 5),
+        "two_step_registration": s2p_cfg.get("two_step_registration", False),
+        # two-step needs the raw movie retained for the second pass:
+        "keep_movie_raw":   s2p_cfg.get("keep_movie_raw",
+                                        s2p_cfg.get("two_step_registration", False)),
+        # 1-photon high-pass family (dim/low-contrast shift-estimation robustness):
+        "1Preg":            s2p_cfg.get("1Preg", False),
+        "spatial_hp_reg":   s2p_cfg.get("spatial_hp_reg", 42),
+        "pre_smooth":       s2p_cfg.get("pre_smooth", 0),
+        "spatial_taper":    s2p_cfg.get("spatial_taper", 40),
 
         # ── Detection ─────────────────────────────────────────────────────
         "spatial_scale":    spatial_scale if spatial_scale is not None else s2p_cfg.get("spatial_scale", 0),
@@ -125,15 +145,27 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     -------
     bool — True if processed, False if skipped (already done).
     """
-    from suite2p.run_s2p import run_s2p
+    try:
+        from suite2p.run_s2p import run_s2p
+    except ImportError as e:
+        raise RuntimeError(
+            "suite2p is not installed in this Python environment. "
+            "Activate the project env first:  conda activate roigbiv"
+        ) from e
+    from roigbiv.io import validate_tif
 
-    tif_path = Path(tif_path)
-    output_dir = Path(output_dir)
+    # Resolve to absolute: Suite2p joins tiff_list relative to data_path, so a
+    # relative input/output path yields a doubled, nonexistent stage path.
+    tif_path = Path(tif_path).resolve()
+    output_dir = Path(output_dir).resolve()
     stem = tif_path.stem.replace("_mc", "")
 
     stat_path = output_dir / stem / "suite2p" / "plane0" / "stat.npy"
     if stat_path.exists():
         return False
+
+    # Fail fast on 2D reference images before Suite2p's C extension segfaults
+    validate_tif(tif_path)
 
     # Stage TIF to local storage — Suite2p's file scanner cannot reliably
     # reach Google Drive FUSE paths across Suite2p versions. Use a hardlink
