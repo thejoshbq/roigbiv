@@ -37,44 +37,145 @@ from roigbiv.pipeline.types import FOVData, PipelineConfig
 # Motion correction (Suite2p wrapper)
 # ─────────────────────────────────────────────────────────────────────────
 
+def _mc_stage_label(do_registration: bool) -> str:
+    """Foundation stage header text for the actual motion-correction mode.
+
+    ``do_registration`` is the correct single proxy across all three backends:
+    when False the input was detected as pre-corrected and Suite2p runs
+    detection-only, so the header must not imply registration occurred.
+    """
+    if do_registration:
+        return "Motion correction"
+    return "Motion correction (detection-only · pre-corrected input)"
+
+
 def run_motion_correction(
     tif_path: Path,
     cfg: PipelineConfig,
     output_dir: Path,
+    gpu_lock=None,
 ) -> tuple[dict, Path, np.ndarray, np.ndarray]:
-    """Run Suite2p registration (or skip for *_mc.tif) via the existing wrapper.
+    """Motion-correct one FOV via the configured backend, write ``{stem}_mc.tif``.
 
-    Delegates to roigbiv.suite2p.run_suite2p_fov which:
-      - Stages the TIF to a local directory
-      - Invokes suite2p.run_s2p.run_s2p() with our ops
-      - Writes {output_dir}/{stem}/suite2p/plane0/{ops.npy, data.bin, ...}
-      - Retains data.bin (we need it as the input to L+S separation)
+    Dispatches on ``cfg.motion_correction_backend``:
+      - ``"phasecorr"`` (default) — Suite2p does both registration and detection
+        in one pass; a ``{stem}_mc.tif`` is exported afterward. Robust on dim,
+        shot-noise-dominated frames (it smooths + builds an iterative reference),
+        so it matches the legacy SIMA quality where ``rowwise-pcc`` regresses.
+      - ``"rowwise-pcc"`` (opt-in) — GPU row-wise non-rigid phase correlation
+        (:func:`roigbiv.pipeline.registration.run_rowwise_pcc_register`) writes a
+        corrected ``{stem}_mc.tif``; Suite2p then runs **detection-only**
+        (``do_registration=False``) on it to produce ``data.bin``/``stat.npy``.
+        Fast on high-SNR data but injects noise-driven per-row warps on low-SNR
+        FOVs (hazy, horizontally-banded mean) — see the MC bench audit.
+      - ``"legacy"`` (opt-in) — genuine SIMA ``HiddenMarkov2D(granularity='row')``
+        run in the ``sima-legacy`` py3.8 sidecar conda env via subprocess
+        (:func:`roigbiv.pipeline.legacy_mc.run_sima_legacy_register`). Writes a
+        corrected ``{stem}_mc.tif``; Suite2p then runs **detection-only** on it,
+        exactly like ``rowwise-pcc``. CPU-only and slow (tens of minutes to hours
+        per FOV); faithful reproduction of the legacy notebook's correction.
 
-    Returns
-    -------
-    ops             : dict — Suite2p ops dict (contains Ly, Lx, meanImg, xoff, yoff, ...)
-    data_bin_path   : Path — {output_dir}/{stem}/suite2p/plane0/data.bin
-    motion_x        : (T,) float32 — per-frame rigid x displacement
-    motion_y        : (T,) float32 — per-frame rigid y displacement
+    Either way Suite2p produces the int16 ``data.bin`` + ``stat.npy``/``ops.npy``
+    that Foundation's L+S separation and Stage 2 consume; only *which* algorithm
+    corrected the motion differs. Returns the uniform
+    ``(ops, data_bin_path, motion_x, motion_y)`` tuple, with motion traces coming
+    from whichever backend did the correction.
     """
+    from roigbiv.pipeline.registration import (
+        run_rowwise_pcc_register, _write_mc_tif)
     from roigbiv.suite2p import run_suite2p_fov
 
     tif_path = Path(tif_path)
     output_dir = Path(output_dir)
     stem = tif_path.stem.replace("_mc", "")
+    backend = getattr(cfg, "motion_correction_backend", "phasecorr")
+
+    if backend not in ("rowwise-pcc", "phasecorr", "legacy"):
+        raise ValueError(
+            f"Unknown motion_correction_backend {backend!r}; "
+            f"expected 'rowwise-pcc', 'phasecorr', or 'legacy'."
+        )
+
+    rowwise_motion: tuple | None = None
+
+    if backend == "rowwise-pcc":
+        # 1. Pre-register on the GPU → corrected {stem}_mc.tif in the output dir.
+        mc_tif_path, motion_x, motion_y = run_rowwise_pcc_register(
+            tif_path,
+            output_dir,
+            fs=cfg.fs,
+            do_registration=cfg.do_registration,
+            max_displacement=getattr(cfg, "mc_max_displacement", 50),
+            strip_height=getattr(cfg, "mc_strip_height", 32),
+            n_template_iters=getattr(cfg, "mc_n_template_iters", 2),
+            subpixel_upsample=getattr(cfg, "mc_subpixel_upsample", 10),
+            smooth_sigma_rows=getattr(cfg, "mc_smooth_sigma_rows", 6.0),
+            smooth_sigma_time=getattr(cfg, "mc_smooth_sigma_time", 1.0),
+            prefilter=getattr(cfg, "mc_prefilter", False),
+            prefilter_sigma_low=getattr(cfg, "mc_prefilter_sigma_low", 1.0),
+            prefilter_sigma_high=getattr(cfg, "mc_prefilter_sigma_high", 8.0),
+            strip_confidence_weight=getattr(cfg, "mc_strip_confidence_weight", True),
+            frame_batch=getattr(cfg, "mc_frame_batch", 256),
+            force_cpu=cfg.force_cpu,
+            gpu_lock=gpu_lock,
+        )
+        rowwise_motion = (motion_x, motion_y)
+        # 2. Suite2p detection-only on the already-corrected movie.
+        s2p_input = mc_tif_path
+        s2p_do_registration = False
+    elif backend == "legacy":
+        # Genuine SIMA HiddenMarkov2D in the sima-legacy sidecar env (subprocess).
+        from roigbiv.pipeline.legacy_mc import run_sima_legacy_register
+        mc_tif_path, motion_x, motion_y = run_sima_legacy_register(
+            tif_path,
+            output_dir,
+            fs=cfg.fs,
+            do_registration=cfg.do_registration,
+            max_displacement=getattr(cfg, "mc_max_displacement", 50),
+            granularity=getattr(cfg, "mc_granularity", "row"),
+            sima_env=getattr(cfg, "mc_sima_env", "sima-legacy"),
+            gpu_lock=gpu_lock,  # accepted and ignored (SIMA is CPU-only)
+        )
+        rowwise_motion = (motion_x, motion_y)
+        # Suite2p detection-only on the SIMA-corrected movie.
+        s2p_input = mc_tif_path
+        s2p_do_registration = False
+    else:
+        s2p_input = tif_path
+        s2p_do_registration = cfg.do_registration
+
     s2p_root = output_dir / stem  # run_suite2p_fov lands outputs at output_dir/{stem}/suite2p/...
 
+    # Forward the phasecorr registration knobs from PipelineConfig into the
+    # Suite2p ops dict. Only *registration* keys are passed, so detection params
+    # stay at their _build_ops defaults (unchanged from the old cfg=None path).
+    # Defaults of these mc_s2p_* fields equal Suite2p's own, so a stock run is
+    # byte-identical; they diverge only when explicitly tuned. (For rowwise-pcc/
+    # legacy this is do_registration=False, so the keys are inert.)
+    s2p_reg_cfg = {"suite2p": {
+        "block_size":            getattr(cfg, "mc_s2p_block_size", [64, 64]),
+        "smooth_sigma":          getattr(cfg, "mc_s2p_smooth_sigma", 1.15),
+        "smooth_sigma_time":     getattr(cfg, "mc_s2p_smooth_sigma_time", 0.0),
+        "maxregshift":           getattr(cfg, "mc_s2p_maxregshift", 0.1),
+        "nonrigid":              getattr(cfg, "mc_s2p_nonrigid", True),
+        "maxregshiftNR":         getattr(cfg, "mc_s2p_maxregshift_nr", 5),
+        "nimg_init":             getattr(cfg, "mc_s2p_nimg_init", 300),
+        "two_step_registration": getattr(cfg, "mc_s2p_two_step_registration", False),
+        "1Preg":                 getattr(cfg, "mc_s2p_one_photon_reg", True),
+        "spatial_hp_reg":        getattr(cfg, "mc_s2p_spatial_hp_reg", 42),
+        "pre_smooth":            getattr(cfg, "mc_s2p_pre_smooth", 0.0),
+        "spatial_taper":         getattr(cfg, "mc_s2p_spatial_taper", 40.0),
+    }}
+
     # run_suite2p_fov wants output_dir as its root; it creates {output_dir}/{stem}/suite2p/...
-    # For our nested layout (inference/pipeline/{stem}/suite2p/...), we pass output_dir
-    # without the stem — the wrapper appends {stem} itself.
-    processed = run_suite2p_fov(
-        tif_path,
+    run_suite2p_fov(
+        s2p_input,
         output_dir,
         fs=cfg.fs,
         anatomical_only=0,
         tau=cfg.tau,
-        do_registration=cfg.do_registration,
-        cfg=None,  # don't load pipeline.yaml; we hardcode defaults per plan rule 4
+        do_registration=s2p_do_registration,
+        cfg=s2p_reg_cfg,
     )
 
     ops_path = s2p_root / "suite2p" / "plane0" / "ops.npy"
@@ -90,9 +191,18 @@ def run_motion_correction(
 
     ops = np.load(ops_path, allow_pickle=True).item()
 
-    # Motion traces — may be absent when do_registration=False
-    motion_x = np.asarray(ops.get("xoff", np.zeros(ops.get("nframes", 0))), dtype=np.float32)
-    motion_y = np.asarray(ops.get("yoff", np.zeros(ops.get("nframes", 0))), dtype=np.float32)
+    if rowwise_motion is not None:
+        # rowwise-pcc did the correction; use its traces (Suite2p's are ~0 here).
+        motion_x, motion_y = rowwise_motion
+    else:
+        motion_x = np.asarray(ops.get("xoff", np.zeros(ops.get("nframes", 0))), dtype=np.float32)
+        motion_y = np.asarray(ops.get("yoff", np.zeros(ops.get("nframes", 0))), dtype=np.float32)
+        # phasecorr: export {stem}_mc.tif from the Suite2p-registered data.bin.
+        try:
+            _write_mc_tif(data_bin_path, output_dir / f"{stem}_mc.tif",
+                          int(ops["Ly"]), int(ops["Lx"]))
+        except Exception as exc:  # noqa: BLE001 — export is a convenience artifact
+            print(f"  WARN: could not export {stem}_mc.tif: {exc}", flush=True)
 
     return ops, data_bin_path, motion_x, motion_y
 
@@ -309,32 +419,37 @@ def _iter_S_chunks(residual_view, chunk: int = 500):
     yield from residual_view.iter_chunks(chunk)
 
 
-def generate_summary_images(
-    residual_view,
-    chunk: int = 500,
-) -> dict:
-    """Compute mean, max, std, and 8-neighbor Vcorr projections of residual S.
+# 8-neighbor stencil — each pixel's correlation with each of 8 neighbors.
+_VCORR_OFFSETS_8 = [(-1, -1), (-1, 0), (-1, 1),
+                    ( 0, -1),          ( 0, 1),
+                    ( 1, -1), ( 1, 0), ( 1, 1)]
+# 4-neighbor stencil (von Neumann) — Suite2p's reduced form; ~half the work.
+_VCORR_OFFSETS_4 = [(-1, 0), (0, -1), (0, 1), (1, 0)]
 
-    All accumulators run in a single pass through the residual view (each chunk
-    reconstructed on demand). Memory per projection is ~1 MB (H,W float64/32).
-    Vcorr needs 5 accumulators × 8 neighbors ≈ 40 MB.
 
-    Returns dict with keys 'mean', 'max', 'std', 'vcorr', each a (Ly, Lx) float32.
+def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -> dict:
+    """Single-pass mean/max/std/Vcorr accumulator over a chunk iterator.
+
+    ``chunk_iter`` yields ``(t0, t1, chunk_arr)`` where ``chunk_arr`` is a
+    ``(cs, Ly, Lx)`` float array (cs = frames in this chunk; may be < t1-t0 when
+    the source iterator decimates). The arithmetic is identical whether the
+    chunks come from a reconstructed residual view (production) or a raw
+    ``data.bin`` reader (scout) — only the source differs.
+
+    Returns dict with keys 'mean', 'max', 'std', 'vcorr', each (Ly, Lx) float32.
     """
-    T, Ly, Lx = residual_view.shape
+    if neighbors == 4:
+        offsets = _VCORR_OFFSETS_4
+    elif neighbors == 8:
+        offsets = _VCORR_OFFSETS_8
+    else:
+        raise ValueError(f"neighbors must be 4 or 8 (got {neighbors})")
 
     # First pass: running sum, sum-of-squares, max
     sum_ = np.zeros((Ly, Lx), dtype=np.float64)
     sumsq = np.zeros((Ly, Lx), dtype=np.float64)
     max_ = np.full((Ly, Lx), -np.inf, dtype=np.float32)
 
-    # 8-neighbor Vcorr: 4 unique direction pairs (each pixel's correlation with
-    # each of 8 neighbors is symmetric, so we accumulate directed pairs and
-    # each pixel ends up averaged over its valid 8 neighbors).
-    # Offsets: (dy, dx) for the 8 neighbors
-    offsets = [(-1, -1), (-1, 0), (-1, 1),
-               ( 0, -1),          ( 0, 1),
-               ( 1, -1), ( 1, 0), ( 1, 1)]
     # Per-offset accumulators: sum_x, sum_y, sum_xx, sum_yy, sum_xy, count
     # where x is the shifted source and y is the reference.
     # Maintaining these in float64 avoids catastrophic cancellation.
@@ -350,11 +465,13 @@ def generate_summary_images(
     }
 
     t_total = 0
-    for t0, t1, chunk_arr in _iter_S_chunks(residual_view, chunk):
-        cs = t1 - t0
+    for t0, t1, chunk_arr in chunk_iter:
+        cs = int(chunk_arr.shape[0])
+        if cs == 0:
+            continue
         t_total += cs
 
-        # Single float64 cast per chunk — shared by sumsq and all 8 Vcorr offsets
+        # Single float64 cast per chunk — shared by sumsq and all Vcorr offsets
         # below. Slicing chunk64 below yields views (no additional copy).
         chunk64 = chunk_arr.astype(np.float64)
 
@@ -420,6 +537,67 @@ def generate_summary_images(
             "std": std, "vcorr": vcorr}
 
 
+def generate_summary_images(
+    residual_view,
+    chunk: int = 500,
+) -> dict:
+    """Compute mean, max, std, and 8-neighbor Vcorr projections of residual S.
+
+    All accumulators run in a single pass through the residual view (each chunk
+    reconstructed on demand). Memory per projection is ~1 MB (H,W float64/32).
+    Vcorr needs 5 accumulators × 8 neighbors ≈ 40 MB.
+
+    Returns dict with keys 'mean', 'max', 'std', 'vcorr', each a (Ly, Lx) float32.
+    """
+    _, Ly, Lx = residual_view.shape
+    return _accumulate_summaries(
+        _iter_S_chunks(residual_view, chunk), Ly, Lx, neighbors=8,
+    )
+
+
+def vcorr_on_movie(
+    data_bin_path: Path,
+    Ly: int,
+    Lx: int,
+    T: int,
+    *,
+    stride: int = 1,
+    neighbors: int = 8,
+    chunk: int = 128,
+) -> dict:
+    """Scout-mode summaries: mean/Vcorr on the *registered movie* (no residual).
+
+    Streams ``data.bin`` directly — no SVD, no L+S, no per-chunk low-rank
+    reconstruction matmul. Channel 2 for Cellpose becomes a correlation map on
+    the raw registered movie rather than the background-subtracted residual,
+    which is adequate for FOV-clarity triage and model A/B testing but is *not*
+    a substitute for a production run (cells over bright background are less
+    crisp).
+
+    Parameters
+    ----------
+    stride    : frame decimation (1 = every frame). Vcorr is stable under mild
+                decimation; >1 trades a little contrast for speed.
+    neighbors : 8 (full) or 4 (von Neumann, ~half the arithmetic).
+    chunk     : frames read per ``data.bin`` slice before decimation.
+
+    Returns dict with keys 'mean', 'max', 'std', 'vcorr', each (Ly, Lx) float32.
+    The 'mean' falls out of the same pass, so it doubles as ``mean_M``.
+    """
+    movie = _open_data_bin(data_bin_path, Ly, Lx)
+    stride = max(1, int(stride))
+
+    def _iter():
+        for t0 in range(0, T, chunk):
+            t1 = min(t0 + chunk, T)
+            sub = movie[t0:t1]
+            if stride > 1:
+                sub = sub[::stride]
+            yield t0, t1, np.asarray(sub, dtype=np.float32)
+
+    return _accumulate_summaries(_iter(), Ly, Lx, neighbors=neighbors)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Nuclear shadow (DoG) map
 # ─────────────────────────────────────────────────────────────────────────
@@ -451,10 +629,87 @@ def compute_nuclear_shadow_map(
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────
 
+def _run_foundation_scout(
+    tif_path: Path,
+    cfg: PipelineConfig,
+    output_dir: Path,
+    ops: dict,
+    data_bin_path: Path,
+    motion_x: np.ndarray,
+    motion_y: np.ndarray,
+    T: int,
+    Ly: int,
+    Lx: int,
+) -> FOVData:
+    """Fast scout Foundation — Cellpose-only triage path (see ``vcorr_on_movie``).
+
+    Skips SVD / L+S / residual reconstruction entirely. A single ``data.bin``
+    pass yields ``mean_M`` (Cellpose channel 1) and ``vcorr`` on the registered
+    movie (channel 2). No residual view, no ``svd_factors.npz``: a scout FOV is
+    *not* resumable into a full run.
+    """
+    print(fmt.stage_header("F", "SCOUT: Vcorr on registered movie "
+                           f"(stride={cfg.scout_vcorr_stride}, "
+                           f"neighbors={cfg.scout_vcorr_neighbors}) — "
+                           "no SVD/L+S"), flush=True)
+    print(fmt.sub_phase(
+        "scout mode: channel 2 is correlation on the raw registered movie, "
+        "not the background-subtracted residual. Masks are for FOV/model "
+        "triage only — re-run without scout for analysis-grade output."
+    ), flush=True)
+    t0 = time.time()
+    summaries = vcorr_on_movie(
+        data_bin_path, Ly, Lx, T,
+        stride=cfg.scout_vcorr_stride,
+        neighbors=cfg.scout_vcorr_neighbors,
+    )
+    mean_M = summaries["mean"]      # raw registered-movie mean = morphological channel
+    vcorr_S = summaries["vcorr"]    # correlation on M; reuses the vcorr_S field/contract
+    print(fmt.sub_phase("scout summary images", time.time() - t0), flush=True)
+
+    print(fmt.sub_phase("DoG (nuclear shadow) map on mean_M"), flush=True)
+    dog_map = compute_nuclear_shadow_map(mean_M)
+
+    # Write only the channels scout produces.
+    summary_dir = output_dir / "summary"
+    summary_dir.mkdir(exist_ok=True)
+    for name, arr in [("mean_M", mean_M), ("vcorr_S", vcorr_S),
+                      ("dog_map", dog_map)]:
+        tifffile.imwrite(str(summary_dir / f"{name}.tif"), arr.astype(np.float32))
+
+    ops_snapshot = {k: v for k, v in ops.items()
+                    if isinstance(v, (int, float, str, bool, list, tuple))}
+
+    # mean_S kept as a zeros stand-in so the (Ly, Lx) shape contract holds for
+    # any downstream `.shape` reference; max_S/std_S/mean_L/residual_view absent.
+    return FOVData(
+        raw_path=tif_path,
+        output_dir=output_dir,
+        data_bin_path=data_bin_path,
+        shape=(T, Ly, Lx),
+        residual_view=None,
+        mean_M=mean_M,
+        mean_S=np.zeros_like(mean_M),
+        max_S=None,
+        std_S=None,
+        vcorr_S=vcorr_S,
+        dog_map=dog_map,
+        mean_L=None,
+        svd_factors_path=None,
+        motion_x=motion_x,
+        motion_y=motion_y,
+        k_background=0,
+        rois=[],
+        stage_counts={},
+        ops=ops_snapshot,
+    )
+
+
 def run_foundation(
     tif_path: Path,
     cfg: PipelineConfig,
     output_dir: Path,
+    gpu_lock=None,
 ) -> FOVData:
     """Run Foundation: motion correction + L+S + summary images + DoG.
 
@@ -471,8 +726,12 @@ def run_foundation(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary").mkdir(exist_ok=True)
 
-    print(fmt.stage_header("F", "Motion correction"), flush=True)
-    ops, data_bin_path, motion_x, motion_y = run_motion_correction(tif_path, cfg, output_dir)
+    # Header reflects the actual mode: a pre-corrected input runs Suite2p in
+    # detection-only mode (cfg.do_registration is False across all three backends),
+    # so don't imply registration happened when it didn't.
+    print(fmt.stage_header("F", _mc_stage_label(cfg.do_registration)), flush=True)
+    ops, data_bin_path, motion_x, motion_y = run_motion_correction(
+        tif_path, cfg, output_dir, gpu_lock=gpu_lock)
     Ly = int(ops["Ly"]); Lx = int(ops["Lx"])
     # Determine T from data.bin size (more reliable than ops fields across Suite2p versions)
     T = Path(data_bin_path).stat().st_size // (Ly * Lx * 2)
@@ -484,6 +743,12 @@ def run_foundation(
     # Persist motion traces (spec §3.1 Blindspot 9 — for future Gate 4)
     np.savez(str(output_dir / "motion_trace.npz"),
              xoff=motion_x, yoff=motion_y, fs=np.float32(cfg.fs))
+
+    if getattr(cfg, "scout_mode", False):
+        return _run_foundation_scout(
+            tif_path, cfg, output_dir, ops, data_bin_path,
+            motion_x, motion_y, T, Ly, Lx,
+        )
 
     print(fmt.stage_header("F", f"L+S background separation (k={cfg.k_background}, n_svd={cfg.n_svd})"),
           flush=True)
