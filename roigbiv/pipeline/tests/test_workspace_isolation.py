@@ -99,6 +99,87 @@ def test_explicit_cfg_takes_precedence_over_env(tmp_path):
     assert not wrong_db.exists(), "Registry.db must NOT be created at the env-var path"
 
 
+def _make_two_tif_workspace(tmp_path: Path):
+    """Workspace with two distinct pre-corrected stacks (a_mc, b_mc)."""
+    import numpy as np
+    import tifffile
+
+    for name in ("a_mc.tif", "b_mc.tif"):
+        tifffile.imwrite(str(tmp_path / name),
+                         np.zeros((6, 32, 32), dtype=np.uint16))
+    return resolve_workspace(tmp_path)
+
+
+def test_run_with_workspace_selected_subset(tmp_path, monkeypatch):
+    """selected_tifs restricts the run to that subset and sizes the log/results
+    from it — without mutating the frozen workspace."""
+    import roigbiv.pipeline.workspace as wsmod
+
+    workspace = _make_two_tif_workspace(tmp_path)
+    cfg = _make_cfg(tmp_path)
+    assert len(workspace.tifs) == 2
+
+    seen: list[Path] = []
+
+    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg):
+        seen.append(tif)
+        return wsmod.FOVRunResult(tif=tif, output_dir=ws.output_root / tif.stem)
+
+    monkeypatch.setattr(wsmod, "_process_one", _stub)
+    logs: list[str] = []
+    target = workspace.tifs[0]
+    results = wsmod.run_with_workspace(
+        workspace, {}, log_cb=logs.append,
+        registry_config=cfg, skip_registry=True, skip_backfill=True,
+        selected_tifs=[target],
+    )
+    assert seen == [target]
+    assert len(results) == 1 and results[0].tif == target
+    assert any("Found 1 TIF stack(s)" in line for line in logs)
+    # Frozen workspace is untouched.
+    assert len(workspace.tifs) == 2
+
+
+def test_run_with_workspace_selected_none_runs_all(tmp_path, monkeypatch):
+    """Omitting selected_tifs (the CLI path) still runs every TIF."""
+    import roigbiv.pipeline.workspace as wsmod
+
+    workspace = _make_two_tif_workspace(tmp_path)
+    cfg = _make_cfg(tmp_path)
+
+    seen: list[Path] = []
+
+    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg):
+        seen.append(tif)
+        return wsmod.FOVRunResult(tif=tif, output_dir=ws.output_root / tif.stem)
+
+    monkeypatch.setattr(wsmod, "_process_one", _stub)
+    results = wsmod.run_with_workspace(
+        workspace, {}, registry_config=cfg,
+        skip_registry=True, skip_backfill=True,
+    )
+    assert set(seen) == set(workspace.tifs)
+    assert len(results) == 2
+
+
+def test_runner_start_sizes_n_fovs_from_selection(tmp_path, monkeypatch):
+    """PipelineRunner.start sizes the progress denominator from the subset."""
+    import threading
+
+    import roigbiv.ui.services.pipeline_runner as runner_mod
+
+    workspace = _make_two_tif_workspace(tmp_path)
+    # Stub the heavy run so the daemon thread returns immediately.
+    monkeypatch.setattr(runner_mod, "run_with_workspace",
+                        lambda *a, **k: [])
+    runner = runner_mod.PipelineRunner(threading.Lock())
+    ok = runner.start(workspace, {}, selected_tifs=[workspace.tifs[0]])
+    assert ok is True
+    assert runner.snapshot().n_fovs == 1
+    if runner._thread is not None:
+        runner._thread.join(timeout=5)
+
+
 def test_secret_key_warning(monkeypatch):
     """build_app() must emit a UserWarning when ROIGBIV_SECRET_KEY is absent."""
     monkeypatch.delenv("ROIGBIV_SECRET_KEY", raising=False)

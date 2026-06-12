@@ -36,7 +36,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -195,6 +195,7 @@ def run_with_workspace(
     resume: bool = False,
     n_workers: int = 1,
     registry_config: Optional["RegistryConfig"] = None,
+    selected_tifs: Optional[Sequence[Path]] = None,
 ) -> list[FOVRunResult]:
     """Run the pipeline + registry over every TIF in ``workspace``.
 
@@ -214,9 +215,13 @@ def run_with_workspace(
     a per-FOV resume if the config or input has changed since those
     artifacts were written. See ``roigbiv.pipeline.resume`` for details.
 
-    Returns one :class:`FOVRunResult` per TIF, in the same order as
-    ``workspace.tifs``. Failed FOVs have ``error`` populated; successful ones
-    have ``fov`` and ``registry``.
+    When ``selected_tifs`` is supplied (UI subset selection), only those TIFs
+    are run; the frozen ``workspace`` is never mutated. ``None`` (the default,
+    and the CLI path) runs every TIF.
+
+    Returns one :class:`FOVRunResult` per *run* TIF, in the same order as the
+    selected subset of ``workspace.tifs``. Failed FOVs have ``error`` populated;
+    successful ones have ``fov`` and ``registry``.
     """
     if registry_config is not None:
         cfg = registry_config
@@ -228,28 +233,37 @@ def run_with_workspace(
     if resume:
         cfg_overrides.setdefault("resume", True)
 
+    # Honor a UI-selected subset without mutating the frozen workspace. Resolve
+    # both sides so a non-resolved selection still matches workspace.tifs.
+    if selected_tifs is None:
+        tifs_to_run = workspace.tifs
+    else:
+        selected_set = {Path(t).resolve() for t in selected_tifs}
+        tifs_to_run = tuple(t for t in workspace.tifs
+                            if Path(t).resolve() in selected_set)
+
     log(f"Workspace: {workspace.input_root}")
     log(f"Output:    {workspace.output_root}")
     log(f"Registry:  {workspace.db_path}")
     if resume:
         log("Resume:    enabled (skipping completed stages per FOV)")
-    log(f"Found {len(workspace.tifs)} TIF stack(s) to process.")
+    log(f"Found {len(tifs_to_run)} TIF stack(s) to process.")
 
     _ensure_registry_schema(log, cfg)
 
-    parallel = n_workers > 1 and len(workspace.tifs) > 1
+    parallel = n_workers > 1 and len(tifs_to_run) > 1
     if parallel:
         log(f"Parallel:  n_workers={n_workers} (capped at 2)")
-        results = _run_parallel(workspace, cfg_overrides, log,
+        results = _run_parallel(workspace, tifs_to_run, cfg_overrides, log,
                                 skip_registry=skip_registry,
                                 n_workers=n_workers,
                                 registry_cfg=cfg)
     else:
         results = []
-        for idx, tif in enumerate(workspace.tifs, start=1):
+        for idx, tif in enumerate(tifs_to_run, start=1):
             if idx > 1:
                 log(fmt.fov_separator())
-            log(fmt.fov_banner(tif.name, idx, len(workspace.tifs)))
+            log(fmt.fov_banner(tif.name, idx, len(tifs_to_run)))
             results.append(_process_one(tif, workspace, cfg_overrides, log,
                                         skip_registry=skip_registry,
                                         registry_cfg=cfg))
@@ -262,6 +276,7 @@ def run_with_workspace(
 
 def _run_parallel(
     workspace: WorkspacePaths,
+    tifs: tuple[Path, ...],
     cfg_overrides: dict,
     log: LogCallback,
     *,
@@ -277,9 +292,9 @@ def _run_parallel(
     jobs: list[tuple[Path, PipelineConfig]] = []
     out_dirs: list[Path] = []
     valid_indices: list[int] = []
-    results: list[Optional[FOVRunResult]] = [None] * len(workspace.tifs)
+    results: list[Optional[FOVRunResult]] = [None] * len(tifs)
 
-    for idx, tif in enumerate(workspace.tifs):
+    for idx, tif in enumerate(tifs):
         stem = tif.stem.replace("_mc", "")
         out_dir = workspace.output_root / stem
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -310,7 +325,7 @@ def _run_parallel(
 
     def _log_cb(slot: int, line: str) -> None:
         idx = valid_indices[slot]
-        log(f"[FOV {idx + 1}/{len(workspace.tifs)}] {line}")
+        log(f"[FOV {idx + 1}/{len(tifs)}] {line}")
 
     def _on_complete(slot: int, fov: Optional[FOVData],
                      exc: Optional[BaseException]) -> None:
@@ -344,14 +359,20 @@ def _run_parallel(
             continue
 
         counts = _roi_counts(fov)
-        log(f"[FOV {idx + 1}/{len(workspace.tifs)}] "
+        log(f"[FOV {idx + 1}/{len(tifs)}] "
             f"pipeline OK ({duration:.1f}s) — "
             f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
             f"reject={counts.get('reject', 0)}")
 
         stem = tif.stem.replace("_mc", "")
         registry: Optional[dict] = None
-        if not skip_registry:
+        if (skip_registry or getattr(cfg, "scout_mode", False)
+                or getattr(cfg, "foundation_only", False)):
+            if getattr(cfg, "scout_mode", False):
+                log("  registry: skipped (scout run — triage only)")
+            elif getattr(cfg, "foundation_only", False):
+                log("  registry: skipped (foundation-only dry run)")
+        else:
             try:
                 registry = _register_session(stem, fov, log, registry_cfg)
             except Exception as exc:  # noqa: BLE001
@@ -429,7 +450,13 @@ def _process_one(
         f"reject={counts.get('reject', 0)}")
 
     registry: Optional[dict] = None
-    if not skip_registry:
+    if (skip_registry or getattr(cfg, "scout_mode", False)
+            or getattr(cfg, "foundation_only", False)):
+        if getattr(cfg, "scout_mode", False):
+            log("  registry: skipped (scout run — triage only)")
+        elif getattr(cfg, "foundation_only", False):
+            log("  registry: skipped (foundation-only dry run)")
+    else:
         try:
             registry = _register_session(stem, fov, log, registry_cfg)
         except Exception as exc:  # noqa: BLE001
