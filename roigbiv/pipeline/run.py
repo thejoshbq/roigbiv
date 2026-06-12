@@ -241,6 +241,19 @@ def print_detection_summary(fov: FOVData) -> list[str]:
     return warnings
 
 
+def _write_scout_overlay(fov: FOVData, output_dir: Path, cfg: PipelineConfig) -> None:
+    """Render the Stage 1 + Gate 1 masks over mean_M as a PNG (scout mode)."""
+    from roigbiv import overlay as _overlay
+    fov_stem = Path(fov.raw_path).stem.replace("_mc", "")
+    try:
+        png = _overlay.render_overlay(
+            fov, output_dir, Path(cfg.cellpose_model).name, fov_stem,
+        )
+        print(fmt.sub_phase(f"scout overlay → {png}"), flush=True)
+    except Exception as exc:  # noqa: BLE001 — overlay is best-effort in triage
+        print(fmt.sub_phase(f"scout overlay skipped ({exc})"), flush=True)
+
+
 def _write_stage4_outputs(
     fov: FOVData,
     stage4_rois: list,
@@ -329,12 +342,18 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if cfg.output_dir is None:
         cfg.output_dir = _default_output_dir(tif_path)
 
-    # Enable motion correction for stacks that aren't pre-corrected.
-    # Pre-corrected stacks carry the _mc suffix convention; everything else needs
-    # Suite2p registration. This makes the _mc flag the canonical signal rather
-    # than requiring callers to know about do_registration.
-    if "_mc" not in tif_path.stem:
+    # Enable motion correction for stacks that aren't already pre-corrected.
+    # Detection is content-first (embedded TIFF Software tag on roigbiv-produced
+    # movies) with a strict ``_mc`` filename fallback for external/legacy inputs —
+    # see roigbiv.io.detect_motion_corrected. Callers need not know about
+    # do_registration; the input itself is the canonical signal.
+    from roigbiv.io import detect_motion_corrected
+    _pre_corrected, _mc_signal = detect_motion_corrected(tif_path)
+    if not _pre_corrected:
         cfg.do_registration = True
+    else:
+        print(f"  pre-corrected input detected via {_mc_signal}; "
+              f"Suite2p registration disabled", flush=True)
 
     # Frame-size sanity warn: defaults are tuned for 512×512 GRIN. On larger
     # frames (prism, 1024×1024) the GRIN diameter starves Cellpose and the
@@ -425,7 +444,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # ── Foundation ────────────────────────────────────────────────────────
     if rp.should_run("foundation"):
         t_start = time.time()
-        fov = run_foundation(tif_path, cfg, output_dir)
+        fov = run_foundation(tif_path, cfg, output_dir, gpu_lock=gpu_lock)
         stage_timings["foundation_s"] = time.time() - t_start
         update_manifest(output_dir, "foundation", cfg, tif_path)
         print(fmt.sub_phase(
@@ -439,6 +458,31 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"Resume: foundation skipped "
             f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
         ), flush=True)
+
+    # ── Foundation-only short-circuit ─────────────────────────────────────
+    # Stop before any ROI detection so the motion-corrected FOV + summary
+    # images can be inspected first. A sentinel marks the dry run; the
+    # "foundation" manifest entry is already written, so a later --resume run
+    # (without --foundation-only) continues from Stage 1.
+    if getattr(cfg, "foundation_only", False):
+        (output_dir / "foundation_only.json").write_text(json.dumps({
+            "mode": "foundation_only",
+            "backend": getattr(cfg, "motion_correction_backend", "phasecorr"),
+            "shape": list(fov.shape),
+            "note": ("Foundation only: motion correction + SVD/L+S + summary "
+                     "images. No ROI detection / traces / QC / registry. "
+                     "Re-run with --resume (without --foundation-only) to "
+                     "continue from Stage 1."),
+        }, indent=2))
+        print(fmt.sub_phase(
+            "Foundation-only dry run: stopping before Stage 1. "
+            f"Preview summary/*.tif + {tif_path.stem.replace('_mc', '')}_mc.tif."
+        ), flush=True)
+        if not cfg.no_viewer:
+            print("\nLaunching Napari viewer (foundation-only)...", flush=True)
+            from roigbiv.pipeline.napari_viewer import display_pipeline_results
+            display_pipeline_results(fov, review_queue=[])
+        return fov
 
     # ── Stage 1 Cellpose detection ────────────────────────────────────────
     if rp.should_run("stage1"):
@@ -489,7 +533,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         _mem_snapshot("post-stage1+gate1")
 
         # Save Stage 1 mask image (accepted + flagged only — rejects not subtracted)
-        stage1_mask_img = np.zeros(fov.mean_S.shape, dtype=np.uint16)
+        stage1_mask_img = np.zeros(fov.mean_M.shape, dtype=np.uint16)
         for r in rois:
             if r.gate_outcome in ("accept", "flag"):
                 stage1_mask_img[r.mask] = r.label_id
@@ -523,6 +567,29 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         ), flush=True)
 
     _mem_snapshot("pre-stage1-subtract")
+
+    # ── Scout short-circuit ───────────────────────────────────────────────
+    # Cellpose-only triage: masks + overlay are written, everything residual-
+    # dependent (subtraction, Stages 2-4, traces, QC, classify, HITL, registry)
+    # is skipped. See foundation._run_foundation_scout.
+    if cfg.scout_mode:
+        _write_scout_overlay(fov, output_dir, cfg)
+        # Sentinel so the UI / registry can tell a triage run from a full one.
+        (output_dir / "scout.json").write_text(json.dumps({
+            "mode": "scout",
+            "vcorr_stride": cfg.scout_vcorr_stride,
+            "vcorr_neighbors": cfg.scout_vcorr_neighbors,
+            "note": ("Cellpose-only triage: channel 2 is correlation on the "
+                     "registered movie, not the residual. No traces/QC/"
+                     "registry; re-run without scout for analysis-grade output."),
+            "n_rois": len(fov.rois),
+        }, indent=2))
+        print_final_summary(fov, review_queue=[], output_dir=output_dir)
+        if not cfg.no_viewer:
+            print("\nLaunching Napari viewer (scout)...", flush=True)
+            from roigbiv.pipeline.napari_viewer import display_pipeline_results
+            display_pipeline_results(fov, review_queue=[])
+        return fov
 
     # ── Source subtraction (on accept + flag only) ────────────────────────
     if rp.should_run("stage1_subtract"):
@@ -1071,10 +1138,14 @@ def main(argv: "list[str] | None" = None) -> int:
     """Entry point for the ``roigbiv-pipeline`` console script.
 
     Exit codes:
-        0  pipeline succeeded; email succeeded (or was not requested)
+        0  pipeline succeeded; notifications succeeded (or were not requested)
         1  all FOVs failed
         2  bad input (missing path, no TIFs found)
         3  pipeline succeeded but SMTP delivery failed (overlays preserved)
+        4  pipeline succeeded but Slack delivery failed (overlays preserved)
+
+    When both email and Slack fail, 3 (email) takes precedence; pipeline (1)
+    and bad-input (2) always dominate notifier codes.
     """
     import sys
 
@@ -1091,11 +1162,14 @@ def main(argv: "list[str] | None" = None) -> int:
             "default. One-time Bridge setup is documented in\n"
             "docs/email-notifications.md; copy the per-mailbox password\n"
             "into ROIGBIV_SMTP_PASSWORD.\n\n"
+            "Slack posts a summary + overlay PNGs via a bot token in\n"
+            "ROIGBIV_SLACK_TOKEN (one-time setup in docs/slack-notifications.md).\n\n"
             "Examples:\n"
             "  roigbiv-pipeline --input stack_mc.tif --fs 7.5\n"
             "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --n-workers 2\n"
             "  roigbiv-pipeline --input fov_dir/ --fs 7.5 \\\n"
             "      --email-to me@example.com --smtp-user me@proton.me\n"
+            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --slack-channel C0123ABCD\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1184,6 +1258,19 @@ def main(argv: "list[str] | None" = None) -> int:
                               "Never pass the password on the command line."))
     parser.add_argument("--no-email", dest="no_email", action="store_true",
                         help="Skip email even when --email-to is set.")
+    parser.add_argument("--slack-channel", dest="slack_channel", type=str,
+                        default=None,
+                        help=("Slack channel ID (e.g. C0123ABCD) to post a run "
+                              "summary + overlay PNGs to. Omit to skip Slack. "
+                              "On send failure exit code is 4; overlays are "
+                              "preserved on disk. See docs/slack-notifications.md."))
+    parser.add_argument("--slack-token-env", dest="slack_token_env",
+                        type=str, default="ROIGBIV_SLACK_TOKEN",
+                        help=("Env-var name holding the Slack bot token "
+                              "(xoxb-…). Never pass the token on the command "
+                              "line."))
+    parser.add_argument("--no-slack", dest="no_slack", action="store_true",
+                        help="Skip Slack even when --slack-channel is set.")
     parser.add_argument("--overlay-outcomes", dest="overlay_outcomes",
                         type=_parse_overlay_outcomes,
                         default=("accept", "flag", "reject"),
@@ -1192,6 +1279,33 @@ def main(argv: "list[str] | None" = None) -> int:
                               "the overlay PNG. Default: all three (every "
                               "detected ROI). Example: --overlay-outcomes "
                               "accept,flag to hide rejects."))
+    # Scout mode — Cellpose-only fast triage (skips SVD/L+S/residual; stops
+    # after Stage 1 + Gate 1; no traces/QC/registry; not resumable).
+    parser.add_argument("--scout", dest="scout_mode", action="store_true",
+                        help=("SCOUT mode: fast FOV-clarity / model triage. "
+                              "Computes Cellpose channel 2 as a correlation map "
+                              "on the registered movie (no SVD/L+S/residual), "
+                              "runs only Stage 1 + Gate 1, writes masks + "
+                              "overlay. NOT analysis-grade (no traces, QC, or "
+                              "registry; not resumable). Incompatible with "
+                              "--no-stage-2/3/4 toggles and --resume."))
+    parser.add_argument("--scout-stride", dest="scout_vcorr_stride", type=int,
+                        default=1, help=("Frame decimation for scout Vcorr "
+                                         "(1 = every frame; only with --scout)."))
+    parser.add_argument("--scout-neighbors", dest="scout_vcorr_neighbors",
+                        type=int, choices=(4, 8), default=8,
+                        help="Vcorr stencil for --scout: 8 (full) or 4. Default 8.")
+    # Foundation-only "dry run" — motion correction + SVD/L+S + summary images,
+    # then stop before Stage 1 so the corrected FOV can be inspected first.
+    parser.add_argument("--foundation-only", dest="foundation_only",
+                        action="store_true", default=False,
+                        help=("FOUNDATION-ONLY dry run: run stacking + motion "
+                              "correction + SVD/L+S + summary images, then STOP "
+                              "before Stage 1. Writes summary/*.tif + {stem}_mc.tif "
+                              "for FOV preview (no ROI detection / traces / QC / "
+                              "registry). A later --resume run (without this flag) "
+                              "continues from Stage 1. Incompatible with --scout, "
+                              "--resume, and --no-stage-N toggles."))
     # Per-stage flags. BooleanOptionalAction gives us --stage-N / --no-stage-N.
     parser.add_argument("--stage-2", dest="enable_stage_2",
                         action=argparse.BooleanOptionalAction, default=None,
@@ -1221,6 +1335,75 @@ def main(argv: "list[str] | None" = None) -> int:
                         type=int, default=None,
                         help=("Max IRLS iterations for --subtract-solver robust "
                               "(default: 5)."))
+    parser.add_argument("--motion-correction", dest="motion_correction_backend",
+                        choices=("rowwise-pcc", "phasecorr", "legacy"), default=None,
+                        help=("Motion-correction backend. 'phasecorr': Suite2p "
+                              "rigid+non-rigid registration (default; robust on "
+                              "dim/low-SNR data). 'rowwise-pcc': GPU row-wise "
+                              "phase correlation (opt-in; fast but degrades "
+                              "low-SNR FOVs). 'legacy': genuine SIMA "
+                              "HiddenMarkov2D in the sima-legacy conda env "
+                              "(opt-in; CPU, slow — exact legacy-notebook repro; "
+                              "build it with bash envs/build_sima_legacy.sh). "
+                              "All write a {stem}_mc.tif."))
+    parser.add_argument("--mc-sima-env", dest="mc_sima_env", default=None,
+                        help=("legacy: conda env hosting SIMA 1.3.2 "
+                              "(default 'sima-legacy')."))
+    parser.add_argument("--mc-granularity", dest="mc_granularity", default=None,
+                        help=("legacy: SIMA HMM2D granularity, 'row' (non-rigid, "
+                              "default) or 'frame' (rigid)."))
+    parser.add_argument("--mc-max-displacement", dest="mc_max_displacement",
+                        type=int, default=None,
+                        help=("rowwise-pcc: max per-frame/per-strip shift in px "
+                              "(default 50)."))
+    parser.add_argument("--mc-strip-height", dest="mc_strip_height",
+                        type=int, default=None,
+                        help=("rowwise-pcc: horizontal strip height in rows for "
+                              "the non-rigid step (default 32; try 48 on dim "
+                              "1024² prism FOVs)."))
+    parser.add_argument("--mc-template-iters", dest="mc_n_template_iters",
+                        type=int, default=None,
+                        help=("rowwise-pcc: template refinement iterations "
+                              "(default 2)."))
+    parser.add_argument("--mc-prefilter", dest="mc_prefilter",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("rowwise-pcc: DoG band-pass on shift-estimation "
+                              "inputs that suppresses noise-driven per-row warps "
+                              "and holds phasecorr quality parity. Default: on. "
+                              "Pass --no-mc-prefilter to measure the unregularized "
+                              "regression."))
+    parser.add_argument("--mc-smooth-rows", dest="mc_smooth_sigma_rows",
+                        type=float, default=None,
+                        help=("rowwise-pcc: per-row displacement-field smoothing "
+                              "sigma in rows (default 6.0). Higher = stiffer warp "
+                              "field, more noise rejection."))
+    # phasecorr (Suite2p) registration knobs — see scripts/sweep_suite2p_reg.py.
+    parser.add_argument("--mc-block-size", dest="mc_s2p_block_size",
+                        type=int, nargs=2, metavar=("H", "W"), default=None,
+                        help=("phasecorr: non-rigid block size in px (tuned "
+                              "default 64 64). Pass 128 128 for the old default; "
+                              "[32,32] over-fits dim FOVs — do not go finer."))
+    parser.add_argument("--mc-smooth-sigma-time", dest="mc_s2p_smooth_sigma_time",
+                        type=float, default=None,
+                        help=("phasecorr: temporal smoothing for shift estimation "
+                              "(default 0). Raises SNR on dim frames but can blur "
+                              "fast motion; bench showed it net-hurt on prism."))
+    parser.add_argument("--mc-1preg", dest="mc_s2p_one_photon_reg",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("phasecorr: 1-photon-style spatial high-pass before "
+                              "registration (Suite2p 1Preg). Improves shift "
+                              "estimation on dim/low-contrast GRIN/prism frames. "
+                              "Tuned default: ON (load-bearing for legacy parity); "
+                              "pass --no-mc-1preg for bright high-SNR 2P data."))
+    parser.add_argument("--mc-maxregshift-nr", dest="mc_s2p_maxregshift_nr",
+                        type=int, default=None,
+                        help=("phasecorr: max non-rigid block shift in px "
+                              "(default 5). Raise for larger field-dependent "
+                              "deformation."))
+    parser.add_argument("--mc-two-step-reg", dest="mc_s2p_two_step_registration",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("phasecorr: rigid pass then non-rigid (default off). "
+                              "Keeps the raw movie for the second pass."))
     parser.add_argument("--cpu", dest="force_cpu", action="store_true",
                         default=False,
                         help=("Force CPU-only execution for all Torch and "
@@ -1256,11 +1439,52 @@ def main(argv: "list[str] | None" = None) -> int:
                               "auto from --stage3-chunk-budget-gb). Set "
                               "explicitly only to override the budget "
                               "formula."))
+    parser.add_argument("--template-threshold", dest="template_threshold",
+                        type=float, default=None,
+                        help=("Stage 3 event-detection threshold in σ (default "
+                              "6.0). On structured, non-Gaussian residuals "
+                              "(e.g. 1024² prism FOVs where GRIN-tuned "
+                              "templates match everywhere) 6σ saturates; raise "
+                              "(8–10) to suppress spurious events. The event "
+                              "accumulator is hard-capped regardless, so a low "
+                              "threshold degrades gracefully instead of OOM-ing."))
+    parser.add_argument("--stage3-max-events", dest="stage3_max_events",
+                        type=int, default=None,
+                        help=("Hard cap on retained Stage 3 events (default "
+                              "2,000,000). The accumulator prunes to the "
+                              "top-N by score, bounding peak host RAM at ~2× "
+                              "this count × ~21 B/event regardless of how many "
+                              "suprathreshold events the threshold emits."))
 
     args = parser.parse_args(argv)
 
     if args.email_to and not args.no_email and not args.smtp_user:
         parser.error("--smtp-user is required when --email-to is set")
+
+    if args.scout_mode:
+        if any(v is False for v in (args.enable_stage_2, args.enable_stage_3,
+                                    args.enable_stage_4)) or any(
+                v is True for v in (args.enable_stage_2, args.enable_stage_3,
+                                    args.enable_stage_4)):
+            parser.error("--scout already runs only Stage 1; do not combine it "
+                         "with --stage-2/3/4 toggles.")
+        if args.resume:
+            parser.error("--scout runs are not resumable; drop --resume.")
+        if args.scout_vcorr_stride < 1:
+            parser.error("--scout-stride must be >= 1.")
+
+    if args.foundation_only:
+        if args.scout_mode:
+            parser.error("--foundation-only and --scout are mutually exclusive "
+                         "(both stop the pipeline early at different points).")
+        if args.resume:
+            parser.error("--foundation-only is itself the dry run; drop --resume "
+                         "(re-run later with --resume and without --foundation-only "
+                         "to continue from Stage 1).")
+        if any(v is not None for v in (args.enable_stage_2, args.enable_stage_3,
+                                       args.enable_stage_4)):
+            parser.error("--foundation-only already skips all stages; do not "
+                         "combine it with --stage-N / --no-stage-N toggles.")
 
     try:
         input_path = args.input.resolve(strict=True)
@@ -1305,9 +1529,12 @@ def _run_single(
         fmt_duration,
         send_email,
     )
+    from roigbiv.pipeline._slack import SlackParams, send_slack
 
-    # Email path implies headless: never open Napari.
-    no_viewer = args.no_viewer or bool(args.email_to and not args.no_email)
+    # Email or Slack path implies headless: never open Napari.
+    email_active = bool(args.email_to and not args.no_email)
+    slack_active = bool(args.slack_channel and not args.no_slack)
+    no_viewer = args.no_viewer or email_active or slack_active
 
     if args.force_cpu:
         import os
@@ -1330,6 +1557,25 @@ def _run_single(
         }.items()
         if v is not None
     }
+    mc_overrides = {
+        k: v
+        for k, v in {
+            "motion_correction_backend": args.motion_correction_backend,
+            "mc_max_displacement": args.mc_max_displacement,
+            "mc_strip_height": args.mc_strip_height,
+            "mc_n_template_iters": args.mc_n_template_iters,
+            "mc_prefilter": args.mc_prefilter,
+            "mc_smooth_sigma_rows": args.mc_smooth_sigma_rows,
+            "mc_sima_env": args.mc_sima_env,
+            "mc_granularity": args.mc_granularity,
+            "mc_s2p_block_size": args.mc_s2p_block_size,
+            "mc_s2p_smooth_sigma_time": args.mc_s2p_smooth_sigma_time,
+            "mc_s2p_one_photon_reg": args.mc_s2p_one_photon_reg,
+            "mc_s2p_maxregshift_nr": args.mc_s2p_maxregshift_nr,
+            "mc_s2p_two_step_registration": args.mc_s2p_two_step_registration,
+        }.items()
+        if v is not None
+    }
     stage1_overrides = {
         k: v
         for k, v in {
@@ -1348,6 +1594,8 @@ def _run_single(
                 if args.stage3_chunk_budget_gb is not None else None
             ),
             "stage3_pixel_chunk_rows": args.stage3_pixel_chunk_rows,
+            "template_threshold": args.template_threshold,
+            "stage3_max_events": args.stage3_max_events,
         }.items()
         if v is not None
     }
@@ -1366,8 +1614,13 @@ def _run_single(
         no_viewer=no_viewer,
         resume=args.resume,
         force_cpu=args.force_cpu,
+        scout_mode=args.scout_mode,
+        scout_vcorr_stride=args.scout_vcorr_stride,
+        scout_vcorr_neighbors=args.scout_vcorr_neighbors,
+        foundation_only=args.foundation_only,
         **stage_overrides,
         **solver_overrides,
+        **mc_overrides,
         **stage1_overrides,
         **gate2_overrides,
         **stage3_overrides,
@@ -1382,7 +1635,7 @@ def _run_single(
         import traceback as _tb
         _tb.print_exc()
         duration = time.perf_counter() - t0
-        if args.email_to and not args.no_email:
+        if email_active or slack_active:
             failure_result = EmailFOVResult(
                 tif=tif_path,
                 output_dir=args.output_dir or tif_path.parent,
@@ -1390,12 +1643,21 @@ def _run_single(
                 error=f"{type(exc).__name__}: {exc}",
                 roi_counts={"accept": 0, "flag": 0, "reject": 0},
             )
-            params = EmailParams(
-                email_to=args.email_to, smtp_host=args.smtp_host,
-                smtp_port=args.smtp_port, smtp_user=args.smtp_user,
-                smtp_password_env=args.smtp_password_env,
-            )
-            send_email([failure_result], params, _build_pipeline_summary(cfg, args))
+            summary = _build_pipeline_summary(cfg, args)
+            if email_active:
+                params = EmailParams(
+                    email_to=args.email_to, smtp_host=args.smtp_host,
+                    smtp_port=args.smtp_port, smtp_user=args.smtp_user,
+                    smtp_password_env=args.smtp_password_env,
+                )
+                send_email([failure_result], params, summary)
+            if slack_active:
+                slack_params = SlackParams(
+                    channel=args.slack_channel,
+                    token_env=args.slack_token_env,
+                )
+                send_slack([failure_result], slack_params, summary)
+        # Pipeline-crash exit (1) dominates any notifier-delivery code.
         return 1
     duration = time.perf_counter() - t0
 
@@ -1429,23 +1691,37 @@ def _run_single(
         f"reject={counts['reject']}  [{fmt_duration(duration)}]  → {png_name}"
     ), flush=True)
 
-    if args.email_to and not args.no_email:
+    email_failed = False
+    slack_failed = False
+    results = [EmailFOVResult(
+        tif=tif_path, output_dir=fov.output_dir,
+        duration_s=duration, png_path=png_path, roi_counts=counts,
+    )]
+    summary = _build_pipeline_summary(cfg, args)
+    if email_active:
         params = EmailParams(
             email_to=args.email_to, smtp_host=args.smtp_host,
             smtp_port=args.smtp_port, smtp_user=args.smtp_user,
             smtp_password_env=args.smtp_password_env,
         )
-        results = [EmailFOVResult(
-            tif=tif_path, output_dir=fov.output_dir,
-            duration_s=duration, png_path=png_path, roi_counts=counts,
-        )]
-        if not send_email(results, params, _build_pipeline_summary(cfg, args)):
+        if not send_email(results, params, summary):
             print("Email FAILED — overlay remains on disk.",
                   file=sys.stderr, flush=True)
-            return 3
+            email_failed = True
     elif args.no_email:
         print("--no-email set; skipping email dispatch.", flush=True)
-    return 0
+    if slack_active:
+        slack_params = SlackParams(
+            channel=args.slack_channel, token_env=args.slack_token_env,
+        )
+        if not send_slack(results, slack_params, summary):
+            print("Slack FAILED — overlay remains on disk.",
+                  file=sys.stderr, flush=True)
+            slack_failed = True
+    elif args.no_slack:
+        print("--no-slack set; skipping Slack dispatch.", flush=True)
+    # Email (3) takes precedence over Slack (4) when both fail.
+    return 3 if email_failed else (4 if slack_failed else 0)
 
 
 def _run_workspace(
@@ -1463,6 +1739,7 @@ def _run_workspace(
         fmt_duration,
         send_email,
     )
+    from roigbiv.pipeline._slack import SlackParams, send_slack
     from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
 
     try:
@@ -1492,6 +1769,25 @@ def _run_workspace(
         }.items()
         if v is not None
     }
+    ws_mc_overrides = {
+        k: v
+        for k, v in {
+            "motion_correction_backend": args.motion_correction_backend,
+            "mc_max_displacement": args.mc_max_displacement,
+            "mc_strip_height": args.mc_strip_height,
+            "mc_n_template_iters": args.mc_n_template_iters,
+            "mc_prefilter": args.mc_prefilter,
+            "mc_smooth_sigma_rows": args.mc_smooth_sigma_rows,
+            "mc_sima_env": args.mc_sima_env,
+            "mc_granularity": args.mc_granularity,
+            "mc_s2p_block_size": args.mc_s2p_block_size,
+            "mc_s2p_smooth_sigma_time": args.mc_s2p_smooth_sigma_time,
+            "mc_s2p_one_photon_reg": args.mc_s2p_one_photon_reg,
+            "mc_s2p_maxregshift_nr": args.mc_s2p_maxregshift_nr,
+            "mc_s2p_two_step_registration": args.mc_s2p_two_step_registration,
+        }.items()
+        if v is not None
+    }
     ws_stage1_overrides = {
         k: v
         for k, v in {
@@ -1510,6 +1806,8 @@ def _run_workspace(
                 if args.stage3_chunk_budget_gb is not None else None
             ),
             "stage3_pixel_chunk_rows": args.stage3_pixel_chunk_rows,
+            "template_threshold": args.template_threshold,
+            "stage3_max_events": args.stage3_max_events,
         }.items()
         if v is not None
     }
@@ -1527,8 +1825,10 @@ def _run_workspace(
         "no_viewer": True,    # workspace runs are headless
         "resume": args.resume,
         "force_cpu": args.force_cpu,
+        "foundation_only": args.foundation_only,
         **stage_overrides,
         **ws_solver_overrides,
+        **ws_mc_overrides,
         **ws_stage1_overrides,
         **ws_gate2_overrides,
         **ws_stage3_overrides,
@@ -1579,38 +1879,55 @@ def _run_workspace(
     if not successes:
         return 1
 
-    if args.email_to and not args.no_email:
+    email_active = bool(args.email_to and not args.no_email)
+    slack_active = bool(args.slack_channel and not args.no_slack)
+    if not (email_active or slack_active):
+        return 0
+
+    # Synthesize a representative cfg for the body summary (workspace
+    # configs are per-FOV; the run-level params we want to echo are the
+    # CLI-set overrides, which are uniform across FOVs).
+    cfg_for_summary = PipelineConfig(
+        fs=args.fs, frame_averaging=args.frame_averaging, tau=args.tau,
+        k_background=args.k, cellpose_model=args.model,
+        diameter=args.diameter, cellprob_threshold=args.cellprob_threshold,
+        flow_threshold=args.flow_threshold, channels=args.channels,
+        **stage_overrides,
+    )
+    summary = _build_pipeline_summary(cfg_for_summary, args)
+    email_results = [
+        EmailFOVResult(
+            tif=r.tif, output_dir=r.output_dir,
+            duration_s=r.duration_s, error=r.error,
+            png_path=r.png_path,
+            roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
+        )
+        for r in ws_results
+    ]
+
+    email_failed = False
+    slack_failed = False
+    if email_active:
         params = EmailParams(
             email_to=args.email_to, smtp_host=args.smtp_host,
             smtp_port=args.smtp_port, smtp_user=args.smtp_user,
             smtp_password_env=args.smtp_password_env,
         )
-        # Synthesize a representative cfg for the body summary (workspace
-        # configs are per-FOV; the run-level params we want to echo are the
-        # CLI-set overrides, which are uniform across FOVs).
-        cfg_for_summary = PipelineConfig(
-            fs=args.fs, frame_averaging=args.frame_averaging, tau=args.tau,
-            k_background=args.k, cellpose_model=args.model,
-            diameter=args.diameter, cellprob_threshold=args.cellprob_threshold,
-            flow_threshold=args.flow_threshold, channels=args.channels,
-            **stage_overrides,
-        )
-        email_results = [
-            EmailFOVResult(
-                tif=r.tif, output_dir=r.output_dir,
-                duration_s=r.duration_s, error=r.error,
-                png_path=r.png_path,
-                roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
-            )
-            for r in ws_results
-        ]
-        if not send_email(email_results, params,
-                          _build_pipeline_summary(cfg_for_summary, args)):
+        if not send_email(email_results, params, summary):
             print("Email FAILED — overlays remain on disk.",
                   file=sys.stderr, flush=True)
-            return 3
+            email_failed = True
+    if slack_active:
+        slack_params = SlackParams(
+            channel=args.slack_channel, token_env=args.slack_token_env,
+        )
+        if not send_slack(email_results, slack_params, summary):
+            print("Slack FAILED — overlays remain on disk.",
+                  file=sys.stderr, flush=True)
+            slack_failed = True
 
-    return 0
+    # Email (3) takes precedence over Slack (4) when both fail.
+    return 3 if email_failed else (4 if slack_failed else 0)
 
 
 def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":
