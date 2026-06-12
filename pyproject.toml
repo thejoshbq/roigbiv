@@ -50,6 +50,7 @@ embeddings = ["roicat>=1.5", "torch>=2.0", "torchvision"]
 roigbiv-pipeline = "roigbiv.pipeline.run:main"
 roigbiv-registry = "roigbiv.cli_registry:main"
 roigbiv-reingest = "roigbiv.cli_reingest:main"
+roigbiv-export = "roigbiv.cli_export:main"
 roigbiv-ui = "roigbiv.ui.__main__:main"
 
 [tool.setuptools.packages.find]
