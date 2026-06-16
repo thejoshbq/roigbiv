@@ -418,6 +418,23 @@ class PipelineConfig:
     stage4_pixel_chunk_rows: int = 16   # rows per spatial chunk for sosfiltfilt
     stage4_n_workers: int = 3   # parallel bandpass windows; 1 disables the pool
 
+    # ── PMD spatiotemporal denoise (Phase 2, OPTIONAL; OFF by default) ─────
+    # Patch-wise penalized-matrix-decomposition denoiser (Buchanan et al.
+    # lineage) applied to the residual that feeds Stages 3 and 4. When True it
+    # materializes a denoised (T,H,W) float32 memmap and swaps fov.residual_view
+    # for a dense-backed ResidualView at the single insertion point in run.py
+    # (see docs/phase2_pmd_insertion_point.md). The L+S decomposition, Stage 2's
+    # Suite2p reuse, and the ResidualView reconstruction contract are untouched.
+    # Full view swap: the denoised residual also feeds trace extraction and the
+    # Stage-3 subtraction std (decision D1-b). Implemented in torch (reuses the
+    # cu130/sm_120 GPU stack) with CPU fallback. No default flip in this phase.
+    use_pmd_denoise: bool = False
+    pmd_patch_size: int = 32             # spatial patch edge (px)
+    pmd_patch_overlap: int = 8           # patch overlap (px) for averaged blending
+    pmd_max_rank: int = 30               # cap on components retained per patch
+    pmd_rank_margin: float = 0.0         # extra margin (×) above the MP noise edge
+    pmd_band_budget_bytes: int = 1_073_741_824   # ~1GB soft cap on per-band RAM (warns if exceeded)
+
     # ── Batch execution (Phase B) ─────────────────────────────────────────
     batch_n_workers: int = 1    # 1 = sequential (current); 2 = parallel FOV pool (hard-capped at 2)
 

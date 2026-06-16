@@ -326,6 +326,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     from roigbiv.pipeline.gate3 import evaluate_gate3
     from roigbiv.pipeline.stage4 import run_stage4
     from roigbiv.pipeline.gate4 import evaluate_gate4
+    from roigbiv.pipeline.pmd import pmd_denoise_view
     from roigbiv.pipeline.traces import extract_all_traces
     from roigbiv.pipeline.overlap_correction import (
         find_overlap_groups, correct_overlapping_traces,
@@ -772,6 +773,21 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         )
 
     _mem_snapshot("pre-stage3")
+
+    # ── PMD spatiotemporal denoise (Phase 2, optional; OFF by default) ─────
+    # Single insertion point (docs/phase2_pmd_insertion_point.md): swap the live
+    # residual view for a dense-backed view over a PMD-denoised memmap. Stage 4
+    # inherits it automatically — the Stage-3 source subtraction advances the
+    # view via with_source, which carries the dense base forward. L+S, Stage 1,
+    # and Stage 2 ran already and are unaffected.
+    if cfg.use_pmd_denoise and rp.should_run("stage3"):
+        print(fmt.stage_header("PMD", "Spatiotemporal denoise of residual (Stage 3/4 input)"),
+              flush=True)
+        t_pmd = time.time()
+        with _gpu_section(gpu_lock):
+            fov.residual_view = pmd_denoise_view(fov.residual_view, output_dir, cfg)
+        stage_timings["pmd_denoise_s"] = time.time() - t_pmd
+        _mem_snapshot("post-pmd")
 
     # ── Stage 3 Template Sweep ────────────────────────────────────────────
     template_bank = build_template_bank(cfg.fs, cfg.tau)
