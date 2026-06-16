@@ -233,6 +233,16 @@ def test_fingerprint_still_changes_for_parameter_knobs(workspace):
     assert fp_a != fp_b
 
 
+def test_fingerprint_changes_on_background_method(workspace):
+    """Switching the Foundation background method must invalidate resume — an
+    svd workspace cannot be continued under rpca (different substrate)."""
+    cfg_svd = PipelineConfig(fs=7.5, background_method="svd")
+    cfg_rpca = PipelineConfig(fs=7.5, background_method="rpca")
+    fp_svd = compute_cfg_fingerprint(cfg_svd, workspace["tif_path"])
+    fp_rpca = compute_cfg_fingerprint(cfg_rpca, workspace["tif_path"])
+    assert fp_svd != fp_rpca
+
+
 # ─────────────────────── manifest IO tests ─────────────────────────────────
 
 

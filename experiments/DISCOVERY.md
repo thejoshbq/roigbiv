@@ -13,16 +13,25 @@ Branch: `feat/robust-subtraction-and-baselines`
 | Driver | 580.159.03 |
 | System RAM | 123 GiB total, ~106 GiB available |
 | CPU cores | 32 |
-| PyTorch CUDA version | 12.6 |
+| PyTorch CUDA version | 13.0 (`torch 2.12.0+cu130`) |
 | CUDA compute capability | sm_120 |
 
-**BLOCKER (non-fatal):** `cuda_compute_capable()` returns `False`. The installed PyTorch
-build (sm_50–sm_90) does not include kernel images for sm_120 (Blackwell). All
-`torch.linalg.solve()` operations in the subtraction engine fall back to CPU. Pipeline
-runs correctly on CPU — only performance is affected, not correctness. To restore GPU
-acceleration, install pytorch-nightly with CUDA 13 support (`pytorch>=2.7+cu131`).
-Until then, all end-to-end runs are CPU-only. Chunk size (`subtract_chunk_frames=2000`)
-is sized for the full 123 GiB RAM; no tiling required.
+**RESOLVED (2026-06-16):** The GPU is fully usable. `roigbiv` now ships
+`torch 2.12.0+cu130`; `torch.cuda.get_arch_list()` includes **`sm_120`**,
+`cuda_compute_capable()` returns **`True`**, and real ops run on `cuda:0`
+(`svd_lowrank` 4000×4000 q=30 in ~0.06 s). The earlier "sm_50–sm_90 build, install
+nightly" conclusion was a **stale** snapshot of an older cu126 wheel.
+
+The real cause of the earlier CPU-only runs was **VRAM contention, not the build**:
+the local-Qwen MCP server keeps a large model (e.g. `qwen3-coder:30b` ≈ 18 GB) resident
+on the 16 GB card for minutes after each call, leaving the pipeline ~0.7 GB free → it
+OOM'd and fell back to CPU. `cuda_compute_capable()` caught that transient OOM and
+`stage1.py` misreported it as an sm/CC mismatch, which made the GPU look permanently
+broken. Mitigations now in place: a per-run VRAM preflight (`pipeline/gpuguard.py`,
+default on; `--no-free-gpu` to disable) that unloads ollama's model before GPU stages,
+an OOM-vs-sm_mismatch-aware probe (`pipeline/device.py::cuda_unavailable_reason`), and
+`OLLAMA_KEEP_ALIVE=0` on the ollama daemon so models don't squat. Chunk size
+(`subtract_chunk_frames=2000`) is sized for the full 123 GiB RAM; no tiling required.
 
 ---
 

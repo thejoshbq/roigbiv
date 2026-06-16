@@ -6,7 +6,10 @@ GT format: manually annotated uint16 label TIFFs (Cellpose training masks).
 IoU matching threshold: 0.3 (greedy one-to-one, `roigbiv.eval.match`).  
 Activity-type stratification: derived from roigbiv(ridge) reference run; tonic/silent
 recall is a **lower bound** — FN ROIs have no assigned type (Blindspot 13).  
-GPU: RTX 5080 sm_120 (`cuda_compute_capable()=False`); all runs CPU-only.  
+GPU: RTX 5080 sm_120 — **GPU-enabled** under `torch 2.12.0+cu130`
+(`cuda_compute_capable()=True`). The runs below were CPU-only because the GPU was
+VRAM-starved by the local-Qwen MCP model at the time, not because sm_120 is
+unsupported (see DISCOVERY.md §Hardware, RESOLVED).  
 
 ---
 
@@ -133,8 +136,10 @@ the negative residual pool.
 
 ## 5. Environment Notes
 
-- All pipeline runs: CPU-only (RTX 5080 sm_120 not supported by current PyTorch build;
-  see DISCOVERY.md §Hardware). Results are correct; solver difference isolated.
+- All pipeline runs here were CPU-only due to transient VRAM contention with the
+  local-Qwen MCP model, **not** a missing PyTorch build — RTX 5080 sm_120 is supported
+  under `torch 2.12.0+cu130` (see DISCOVERY.md §Hardware, RESOLVED). Results are correct;
+  solver difference isolated.
 - CNMF-E: isolated `caiman` conda env (CaImAn 1.13.1, NumPy 2.2.6). Not installed
   into roigbiv env (version isolation approach per Phase 3 plan).
 - `use_cnn=False` set in initial `CNMFParams` dict (CaImAn 1.13 limitation: `change_params`

@@ -174,6 +174,28 @@ class PipelineConfig:
     svd_bin_frames: int = 5000              # target binned frame count
     reconstruct_chunk: int = 500            # temporal chunk size for L+S streaming
 
+    # ── Background separation method ──────────────────────────────────────
+    # "svd"  (default): plain top-k truncated SVD. Fast, but its leading
+    #         components absorb per-pixel mean brightness, so bright/tonic
+    #         somata get pulled into L and mean_S ≈ 0 (see foundation.py).
+    # "rpca" (opt-in): robust low-rank + sparse decomposition
+    #         (roigbiv/pipeline/rpca.py). L stops absorbing localized bright/
+    #         tonic sources, restoring a structured non-zero mean_S/std_S and
+    #         keeping those cells in the residual. L stays low-rank, so the
+    #         emitted U/S/V_bin factors and the virtual-residual contract are
+    #         byte-identical to the svd path. A/B before flipping the default.
+    background_method: str = "svd"
+    rpca_method: str = "ialm"               # "ialm" (PCP) | "godec" (fallback)
+    rpca_bin_frames: int = 2000             # RPCA-specific binning; coarser than
+                                            # svd_bin_frames to bound GPU memory
+                                            # (IALM holds ~5 live copies). The
+                                            # background is slow, so this is safe.
+    rpca_max_rank: int = 30                 # rank cap on robust L (mirrors k_background)
+    rpca_max_iter: int = 100                # iteration backstop
+    rpca_tol: float = 1e-3                  # ‖M−L−S‖/‖M‖ convergence tol
+    rpca_lambda: Optional[float] = None     # PCP sparsity weight; None → 1/√max(T_bin,N_pix)
+    rpca_mu: Optional[float] = None         # ALM penalty; None → 1.25/‖M_bin‖₂
+
     # ── Scout mode (Cellpose-only triage) ─────────────────────────────────
     # Skip SVD/L+S/residual; compute Cellpose channel 2 as a correlation map on
     # the registered movie. Stops after Stage 1 + Gate 1. Fast FOV-clarity and
@@ -188,6 +210,15 @@ class PipelineConfig:
     # before committing to ROI detection. Writes a foundation_only.json sentinel.
     # Resumable: a later --resume run (without the flag) continues from Stage 1.
     foundation_only: bool = False
+
+    # ── CV-only mode (Stage 1 computer-vision detection only) ─────────────
+    # Forces enable_stage_{2,3,4}=False so the pipeline stops after Stage 1 +
+    # Gate 1, but — unlike scout_mode — keeps the full Foundation SVD/L+S
+    # summary images and runs trace extraction + QC post-detection. This is the
+    # barebones path for the stage-by-stage CV strategy: detect ROIs from
+    # summary images alone, analysis-grade outputs, resumable into the full
+    # pipeline later via --resume.
+    cv_only: bool = False
 
     # ── Motion correction backend ─────────────────────────────────────────
     # "phasecorr":   Suite2p rigid + non-rigid registration (default). Robust on
@@ -268,9 +299,14 @@ class PipelineConfig:
     diameter_auto: bool = False
     cellprob_threshold: float = -2.0
     flow_threshold: float = 0.4
-    channels: tuple = (1, 2)
+    channels: tuple = (1, 2)                # (0,0)=single grayscale; (1,2)=dual [mean, Vcorr]
     tile_norm_blocksize: int = 128
     use_denoise: bool = True                # Cellpose3 denoise_cyto3
+
+    # Acquisition/lens profile — provenance + logging only. The concrete profile
+    # name is resolved in the CLI/UI (auto→grin|prism|generic) and its bundle is
+    # merged into this config *before* construction; this field records the choice.
+    profile: str = "grin"
 
     # ── Gate 1 (Morphology) ───────────────────────────────────────────────
     min_area: int = 80
@@ -278,6 +314,10 @@ class PipelineConfig:
     min_solidity: float = 0.55
     max_eccentricity: float = 0.90
     min_contrast: float = 0.10
+    # When True, Gate-1 (and Gate-3/4) scale thresholds derive from the effective
+    # diameter + image-contrast distribution instead of fixed px (Layer 2).
+    # Default-off keeps the GRIN path byte-identical.
+    adaptive_gates: bool = False
     # Per-criterion absolute margins for marginal flagging
     flag_area_margin: int = 20
     flag_solidity_margin: float = 0.05
@@ -408,6 +448,11 @@ class PipelineConfig:
     enable_stage_3: bool = True
     enable_stage_4: bool = True
     force_cpu: bool = False
+    # GPU VRAM preflight: when free_gpu is True, a best-effort preflight unloads
+    # ollama's resident model(s) before GPU-heavy stages if free VRAM is below
+    # gpu_min_free_gb (see pipeline/gpuguard.py). No-op under force_cpu.
+    free_gpu: bool = True
+    gpu_min_free_gb: float = 8.0
 
     def summary_for_log(self) -> dict:
         """JSON-serializable snapshot of all config values for pipeline_log.json."""

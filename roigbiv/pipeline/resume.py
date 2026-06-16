@@ -132,6 +132,15 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # the "foundation" manifest entry, then a later --resume run (with the flag
     # off) must continue from Stage 1 without a fingerprint mismatch.
     "foundation_only",
+    # CV-only is a stop-point too: it forces stages 2-4 off (already excluded),
+    # so a later --resume run with the flag off must continue into them without
+    # a fingerprint mismatch. Same rationale as foundation_only.
+    "cv_only",
+    # The profile is a *label*; the concrete params it expands to (diameter,
+    # channels, cellpose_model, …) are already in the fingerprint. Excluding the
+    # label lets an "auto"-resolved run and an explicit "--profile X" run that
+    # resolve to identical params resume each other.
+    "profile",
 })
 
 

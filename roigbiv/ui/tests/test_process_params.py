@@ -29,7 +29,6 @@ PARAM_IDS = [
     "roigbiv-param-stage-3",
     "roigbiv-param-stage-4",
     "roigbiv-param-resume",
-    "roigbiv-param-slack-channel",
 ]
 
 
@@ -118,14 +117,16 @@ def test_every_param_has_a_tooltip_icon():
 
 def test_every_param_field_has_help_text():
     # _field_row / _switch_row hard-subscript HELP_TEXT[target_id]; a field added
-    # without a HELP_TEXT entry 500s the whole Process page on render (this is
-    # what KeyError: 'roigbiv-param-slack-channel' was). Auto-discover the field
-    # ids from the rendered form rather than trusting a hand-kept list — the list
-    # is exactly what drifted last time.
+    # without a HELP_TEXT entry 500s the whole Process page on render. Auto-discover
+    # the field ids from the rendered form rather than trusting a hand-kept list —
+    # the list is exactly what drifted last time.
     field_ids = {
         cid for cid in _ids(_params_form())
         if isinstance(cid, str) and cid.startswith("roigbiv-param-")
         and not cid.endswith("-help-icon") and not cid.endswith("-help")
+        # `-section` ids are layout containers (e.g. the RPCA knob group), not
+        # tooltip-bearing inputs.
+        and not cid.endswith("-section")
     }
     missing = sorted(cid for cid in field_ids if cid not in HELP_TEXT)
     assert not missing, f"form fields missing HELP_TEXT copy: {missing}"
@@ -217,22 +218,24 @@ def test_mc_preview_is_enlarged(monkeypatch):
 
 
 def test_stage_control_reactivity():
-    # The form must mirror _on_run's early-stop precedence: scout / foundation-only
-    # force stage 2/3/4 + resume off+disabled; scout takes precedence over
-    # foundation-only. Tuple order:
-    #   (fo_disabled, s2_disabled, s2_value, s3_disabled, s3_value,
+    # The form must mirror _on_run's precedence: scout > foundation-only > cv-only.
+    # All three force stage 2/3/4 off+disabled; only scout / foundation-only also
+    # lock resume (cv-only stays resumable). Tuple order:
+    #   (fo_disabled, cv_disabled, s2_disabled, s2_value, s3_disabled, s3_value,
     #    s4_disabled, s4_value, resume_disabled, resume_value)
     from roigbiv.ui.pages.process import _stage_control_reactivity as react
 
-    neither = (False, False, True, False, True, False, True, False, False)
-    scout   = (True,  True,  False, True,  False, True,  False, True,  False)
-    found   = (False, True,  False, True,  False, True,  False, True,  False)
+    neither = (False, False, False, True, False, True, False, True, False, False)
+    scout   = (True,  True,  True,  False, True,  False, True,  False, True,  False)
+    found   = (False, True,  True,  False, True,  False, True,  False, True,  False)
+    cv_only = (False, False, True,  False, True,  False, True,  False, False, False)
 
-    assert react(False, False) == neither
-    assert react(True, False) == scout
-    assert react(False, True) == found
-    assert react(True, True) == scout          # scout precedence over foundation-only
-    assert react(None, None) == neither        # None (unset switch) coerces to off
+    assert react(False, False, False) == neither
+    assert react(True, False, False) == scout
+    assert react(False, True, False) == found
+    assert react(False, False, True) == cv_only   # cv-only forces stages off, keeps resume
+    assert react(True, True, True) == scout        # scout precedence over the rest
+    assert react(None, None, None) == neither      # None (unset switch) coerces to off
 
 
 def test_mc_preview_figure_input_branch(monkeypatch):

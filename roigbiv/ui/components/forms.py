@@ -83,6 +83,28 @@ HELP_TEXT: dict[str, str] = {
         "Background SVD rank for Foundation's low-rank + sparse (L+S) "
         "separation. Higher captures more slow background structure but risks "
         "absorbing real signal; 20–50 is typical (default 30).",
+    "roigbiv-param-bg-method":
+        "Foundation background separation. 'Truncated SVD' (default) is fast "
+        "but its leading components absorb per-pixel mean brightness, pulling "
+        "bright/tonic somata into the background (mean_S ≈ 0). 'Robust PCA' is "
+        "an opt-in low-rank+sparse decomposition that keeps those cells in the "
+        "residual — A/B before relying on it.",
+    "roigbiv-param-rpca-max-rank":
+        "RPCA: rank cap on the robust background L (default 30, mirrors "
+        "k_background).",
+    "roigbiv-param-rpca-max-iter":
+        "RPCA: maximum IALM/GoDec iterations before stopping (default 100).",
+    "roigbiv-param-rpca-tol":
+        "RPCA: ‖M−L−S‖/‖M‖ convergence tolerance (default 1e-3). Tighter is "
+        "more accurate but slower.",
+    "roigbiv-param-rpca-lambda":
+        "RPCA: PCP sparsity weight. Leave blank to auto-compute as "
+        "1/√max(T_bin, N_pix); lower suppresses noise, higher keeps more sparse "
+        "structure.",
+    "roigbiv-param-rpca-bin-frames":
+        "RPCA: temporal binning for the decomposition (default 2000). Leave "
+        "blank to auto-tune; it auto-shrinks to fit GPU memory on large FOVs to "
+        "avoid out-of-memory, then retries coarser / on CPU if needed.",
     "roigbiv-param-mc-backend":
         "Motion-correction algorithm run in Foundation. phasecorr is the "
         "default — Suite2p rigid/non-rigid phase correlation, tuned to "
@@ -113,6 +135,11 @@ HELP_TEXT: dict[str, str] = {
         "Dry run: motion correction + SVD/L+S + summary images, then stop "
         "before ROI detection so you can inspect the corrected FOV in Review. "
         "Re-run with Resume to continue. Overrides the stage toggles.",
+    "roigbiv-param-cv-only":
+        "Computer-vision-only path: Foundation + Stage 1 (Cellpose) + Gate 1, "
+        "then trace extraction + QC. Forces the temporal stages 2-4 off. Unlike "
+        "Scout this keeps the full SVD/L+S summaries and produces analysis-grade "
+        "traces/QC, and is resumable into the full pipeline later.",
     "roigbiv-param-stage-2":
         "Stage 2 — Suite2p temporal detection. Catches burst-firing and "
         "task-locked neurons that Cellpose misses on the spatial pass.",
@@ -127,12 +154,6 @@ HELP_TEXT: dict[str, str] = {
         "Skip stages already completed when the config and input are "
         "unchanged, reusing prior outputs. Ignored under scout / "
         "foundation-only.",
-    # Pipeline · Notifications
-    "roigbiv-param-slack-channel":
-        "Posts a run summary and overlay PNGs to this Slack channel when the "
-        "run finishes. Leave blank to disable. Requires ROIGBIV_SLACK_TOKEN in "
-        "the environment that launched roigbiv-ui. See "
-        "docs/slack-notifications.md.",
     # Review · view controls
     "roigbiv-review-kind":
         "Trace normalization. F corrected (neuropil-subtracted fluorescence) "

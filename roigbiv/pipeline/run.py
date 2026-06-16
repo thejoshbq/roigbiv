@@ -2,13 +2,12 @@
 ROI G. Biv pipeline — CLI entry point + orchestrator.
 
 Wires Foundation → Stage 1 Cellpose → Stage 2 Suite2p → Stage 3 FFT sweep →
-Stage 4 tonic search → outputs → optional Napari + overlay PNG + email.
+Stage 4 tonic search → outputs → optional Napari + overlay PNG.
 
 The ``roigbiv-pipeline`` console script accepts either a single ``.tif``
 file (classic single-FOV mode) or a directory of stacks (workspace mode:
 in-input ``output/``, ``registry.db``, auto-migrate, auto-backfill). All
-four stages run by default; pass ``--no-stage-N`` to skip. See
-``docs/email-notifications.md`` for the optional email-on-done path.
+four stages run by default; pass ``--no-stage-N`` to skip.
 
 Non-flag parameters are hardcoded in :class:`PipelineConfig` per spec §18.
 """
@@ -26,6 +25,13 @@ import numpy as np
 import tifffile
 
 from roigbiv.pipeline import fmt
+from roigbiv.pipeline.profiles import (
+    AUTO,
+    STAGE1_CLI_DEFAULTS,
+    get_profile,
+    list_profiles,
+    merged_overrides,
+)
 from roigbiv.pipeline.types import FOVData, PipelineConfig
 
 
@@ -56,6 +62,26 @@ def _build_gate2_overrides(args: "argparse.Namespace") -> dict:
     if g2_max is not None:
         out["gate2_max_area"] = g2_max
     return out
+
+
+def _build_foundation_overrides(args: "argparse.Namespace") -> dict:
+    """Collect set --background-method / --rpca-* flags into a cfg override dict.
+
+    Only keys the user explicitly set (non-None) are returned, so omitting every
+    flag leaves the PipelineConfig defaults (i.e. a byte-identical svd run).
+    """
+    return {
+        k: v
+        for k, v in {
+            "background_method": args.background_method,
+            "rpca_max_rank": args.rpca_max_rank,
+            "rpca_max_iter": args.rpca_max_iter,
+            "rpca_tol": args.rpca_tol,
+            "rpca_lambda": args.rpca_lambda,
+            "rpca_bin_frames": args.rpca_bin_frames,
+        }.items()
+        if v is not None
+    }
 
 
 def _mem_snapshot(label: str) -> None:
@@ -342,6 +368,18 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if cfg.output_dir is None:
         cfg.output_dir = _default_output_dir(tif_path)
 
+    # ── CV-only mode ──────────────────────────────────────────────────────
+    # Stop after Stage 1 + Gate 1 by forcing the temporal stages off, but keep
+    # the full Foundation SVD/L+S summaries and the post-detection trace/QC
+    # path (unlike scout_mode). Resolved here so the stage conditionals below
+    # and the disk-budget preflight see the disabled flags.
+    if getattr(cfg, "cv_only", False):
+        cfg.enable_stage_2 = False
+        cfg.enable_stage_3 = False
+        cfg.enable_stage_4 = False
+        print("CV-only mode: Foundation + Stage 1 detection + traces/QC; "
+              "stages 2-4 disabled.", flush=True)
+
     # Enable motion correction for stacks that aren't already pre-corrected.
     # Detection is content-first (embedded TIFF Software tag on roigbiv-produced
     # movies) with a strict ``_mc`` filename fallback for external/legacy inputs —
@@ -438,6 +476,18 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     n2_sub_pass = 0
     s3_subtract: list = []
     n3_sub_pass = 0
+
+    # ── GPU VRAM preflight ────────────────────────────────────────────────
+    # Before any GPU-heavy stage, reclaim VRAM held by the local-Qwen MCP
+    # server (ollama) so Cellpose / Foundation SVD run on the GPU instead of
+    # OOM-ing into the CPU fallback. Best-effort and never fatal.
+    if not getattr(cfg, "force_cpu", False) and getattr(cfg, "free_gpu", True):
+        from roigbiv.pipeline import gpuguard
+        gpuguard.free_gpu_for_run(
+            min_free_gb=getattr(cfg, "gpu_min_free_gb", 8.0),
+            enabled=True,
+            log_cb=lambda m: print(m, flush=True),
+        )
 
     _mem_snapshot("pre-foundation")
 
@@ -1118,34 +1168,13 @@ def _resolve_model(spec: str) -> str:
     return spec
 
 
-def _stage_flags(cfg: PipelineConfig) -> dict[int, bool]:
-    return {2: cfg.enable_stage_2, 3: cfg.enable_stage_3, 4: cfg.enable_stage_4}
-
-
-def _build_pipeline_summary(cfg: PipelineConfig, args: argparse.Namespace) -> dict:
-    return {
-        "model_name": Path(cfg.cellpose_model).name,
-        "fs": cfg.fs,
-        "tau": cfg.tau,
-        "diameter": args.diameter,
-        "cellprob_threshold": args.cellprob_threshold,
-        "flow_threshold": args.flow_threshold,
-        "stage_flags": _stage_flags(cfg),
-    }
-
-
 def main(argv: "list[str] | None" = None) -> int:
     """Entry point for the ``roigbiv-pipeline`` console script.
 
     Exit codes:
-        0  pipeline succeeded; notifications succeeded (or were not requested)
+        0  pipeline succeeded
         1  all FOVs failed
         2  bad input (missing path, no TIFs found)
-        3  pipeline succeeded but SMTP delivery failed (overlays preserved)
-        4  pipeline succeeded but Slack delivery failed (overlays preserved)
-
-    When both email and Slack fail, 3 (email) takes precedence; pipeline (1)
-    and bad-input (2) always dominate notifier codes.
     """
     import sys
 
@@ -1158,18 +1187,10 @@ def main(argv: "list[str] | None" = None) -> int:
             "All four stages run by default; pass --no-stage-N to skip."
         ),
         epilog=(
-            "Email goes through Proton Mail Bridge on 127.0.0.1:1025 by\n"
-            "default. One-time Bridge setup is documented in\n"
-            "docs/email-notifications.md; copy the per-mailbox password\n"
-            "into ROIGBIV_SMTP_PASSWORD.\n\n"
-            "Slack posts a summary + overlay PNGs via a bot token in\n"
-            "ROIGBIV_SLACK_TOKEN (one-time setup in docs/slack-notifications.md).\n\n"
             "Examples:\n"
             "  roigbiv-pipeline --input stack_mc.tif --fs 7.5\n"
             "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --n-workers 2\n"
-            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 \\\n"
-            "      --email-to me@example.com --smtp-user me@proton.me\n"
-            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --slack-channel C0123ABCD\n"
+            "  roigbiv-pipeline --input fov_dir/ --fs 7.5 --cv-only\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1184,28 +1205,39 @@ def main(argv: "list[str] | None" = None) -> int:
                         help=("Temporal binning factor that produced --fs "
                               "(default 1 = un-averaged). Recorded in "
                               "traces_meta.json for pynapse handoff."))
-    parser.add_argument("--model", type=str, default=_DEFAULT_MODEL,
+    parser.add_argument("--profile", choices=list_profiles(), default=AUTO,
+                        help=("Acquisition/lens profile bundling Stage-1 model + "
+                              "diameter + gate defaults. 'grin' (512² bright), "
+                              "'prism' (1024² dim/diffuse), 'generic' "
+                              "(single-channel cyto3 + auto-diameter), or 'auto'. "
+                              "Explicit flags below always override the profile. "
+                              "Default: auto."))
+    # The Stage-1 args below default to None so a --profile bundle can set them;
+    # when a flag is omitted AND the profile does not set the key, the historical
+    # CLI default (profiles.STAGE1_CLI_DEFAULTS) is backfilled — preserving exact
+    # prior GRIN behavior. (See _build_explicit_stage1.)
+    parser.add_argument("--model", type=str, default=None,
                         help=("Cellpose model path, built-in name, or "
                               "'latest' (newest mtime in "
                               "models/checkpoints/models/). "
-                              f"Default: {_DEFAULT_MODEL}"))
+                              f"Default (no profile override): {_DEFAULT_MODEL}"))
     parser.add_argument("--tau", type=float, default=1.0,
                         help="Indicator decay constant (default: 1.0, GCaMP6s).")
-    parser.add_argument("--diameter", type=int, default=12,
-                        help="Cellpose diameter (default 12).")
+    parser.add_argument("--diameter", type=int, default=None,
+                        help="Cellpose diameter (default 12 unless --profile sets it).")
     parser.add_argument("--diameter-auto", dest="diameter_auto",
-                        action="store_true", default=False,
+                        action=argparse.BooleanOptionalAction, default=None,
                         help=("Override --diameter with an image-based "
                               "estimate (DoG peaks + Otsu sizing on mean_M) "
                               "computed at the start of Stage 1. Use when "
                               "frame size or cell scale is unknown."))
     parser.add_argument("--cellprob-threshold", dest="cellprob_threshold",
-                        type=float, default=-2.0,
+                        type=float, default=None,
                         help="Cellpose cell-probability threshold (default -2.0).")
     parser.add_argument("--flow-threshold", dest="flow_threshold",
-                        type=float, default=0.6,
+                        type=float, default=None,
                         help="Cellpose flow threshold (default 0.6).")
-    parser.add_argument("--channels", type=_parse_channels, default=(1, 2),
+    parser.add_argument("--channels", type=_parse_channels, default=None,
                         help="Cellpose channels as 'cyto,nucleus' (default 1,2).")
     parser.add_argument("--min-area", dest="min_area", type=int, default=None,
                         help=("Gate 1 minimum ROI area in px² (default 80, "
@@ -1221,14 +1253,36 @@ def main(argv: "list[str] | None" = None) -> int:
                               "128). Roughly double for 1024×1024 inputs."))
     parser.add_argument("--k", type=int, default=30,
                         help="Background components for L+S separation (default 30).")
+    parser.add_argument("--background-method", dest="background_method",
+                        choices=("svd", "rpca"), default=None,
+                        help=("Foundation background separation. 'svd' (default) "
+                              "is the plain truncated SVD; 'rpca' is robust low-"
+                              "rank+sparse (keeps bright/tonic somata out of L, "
+                              "restores mean_S). Opt-in; A/B before relying on it."))
+    parser.add_argument("--rpca-max-rank", dest="rpca_max_rank", type=int,
+                        default=None,
+                        help="RPCA: rank cap on the robust background L (default 30).")
+    parser.add_argument("--rpca-max-iter", dest="rpca_max_iter", type=int,
+                        default=None,
+                        help="RPCA: max IALM/GoDec iterations (default 100).")
+    parser.add_argument("--rpca-tol", dest="rpca_tol", type=float, default=None,
+                        help="RPCA: ‖M−L−S‖/‖M‖ convergence tolerance (default 1e-3).")
+    parser.add_argument("--rpca-lambda", dest="rpca_lambda", type=float,
+                        default=None,
+                        help=("RPCA: PCP sparsity weight (default 1/√max(T_bin,"
+                              "N_pix))."))
+    parser.add_argument("--rpca-bin-frames", dest="rpca_bin_frames", type=int,
+                        default=None,
+                        help=("RPCA: temporal binning for the decomposition "
+                              "(default 2000; coarser than --svd to bound GPU "
+                              "memory)."))
     parser.add_argument("--output-dir", type=Path, default=None,
                         help=("Output directory for single-FOV runs (default: "
                               "inference/pipeline/{stem}/). Ignored in "
                               "workspace mode."))
     parser.add_argument("--no-viewer", action="store_true",
                         help=("Skip Napari display at the end of single-FOV "
-                              "runs. Implied when --email-to is set or "
-                              "input is a directory."))
+                              "runs. Implied when input is a directory."))
     parser.add_argument("--registry", action="store_true",
                         help=("Register/match this FOV against the cross-"
                               "session registry (single-FOV mode only — "
@@ -1240,37 +1294,6 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--n-workers", dest="n_workers", type=int, default=1,
                         help=("Parallel FOV workers for directory inputs "
                               "(capped at 2). Ignored for single-TIF input."))
-    parser.add_argument("--email-to", dest="email_to", type=str, default=None,
-                        help=("Recipient email. Omit to skip email entirely. "
-                              "On SMTP failure exit code is 3; overlays are "
-                              "preserved on disk."))
-    parser.add_argument("--smtp-host", dest="smtp_host", type=str,
-                        default="127.0.0.1",
-                        help=("SMTP host. Default targets a local Proton "
-                              "Mail Bridge instance."))
-    parser.add_argument("--smtp-port", dest="smtp_port", type=int, default=1025,
-                        help="SMTP port (STARTTLS).")
-    parser.add_argument("--smtp-user", dest="smtp_user", type=str, default=None,
-                        help="SMTP username. Required when --email-to is set.")
-    parser.add_argument("--smtp-password-env", dest="smtp_password_env",
-                        type=str, default="ROIGBIV_SMTP_PASSWORD",
-                        help=("Env-var name holding the SMTP password. "
-                              "Never pass the password on the command line."))
-    parser.add_argument("--no-email", dest="no_email", action="store_true",
-                        help="Skip email even when --email-to is set.")
-    parser.add_argument("--slack-channel", dest="slack_channel", type=str,
-                        default=None,
-                        help=("Slack channel ID (e.g. C0123ABCD) to post a run "
-                              "summary + overlay PNGs to. Omit to skip Slack. "
-                              "On send failure exit code is 4; overlays are "
-                              "preserved on disk. See docs/slack-notifications.md."))
-    parser.add_argument("--slack-token-env", dest="slack_token_env",
-                        type=str, default="ROIGBIV_SLACK_TOKEN",
-                        help=("Env-var name holding the Slack bot token "
-                              "(xoxb-…). Never pass the token on the command "
-                              "line."))
-    parser.add_argument("--no-slack", dest="no_slack", action="store_true",
-                        help="Skip Slack even when --slack-channel is set.")
     parser.add_argument("--overlay-outcomes", dest="overlay_outcomes",
                         type=_parse_overlay_outcomes,
                         default=("accept", "flag", "reject"),
@@ -1306,6 +1329,16 @@ def main(argv: "list[str] | None" = None) -> int:
                               "registry). A later --resume run (without this flag) "
                               "continues from Stage 1. Incompatible with --scout, "
                               "--resume, and --no-stage-N toggles."))
+    # CV-only mode — Stage 1 computer-vision detection only (forces stages 2-4
+    # off), but keeps full Foundation summaries + trace/QC (unlike --scout).
+    parser.add_argument("--cv-only", dest="cv_only",
+                        action="store_true", default=False,
+                        help=("CV-ONLY mode: Foundation (motion correction + "
+                              "SVD/L+S + summary images) + Stage 1 Cellpose "
+                              "detection + Gate 1, then trace extraction + QC. "
+                              "Forces stages 2-4 off. Unlike --scout this is "
+                              "analysis-grade (traces/QC/registry) and resumable "
+                              "into the full pipeline via --resume."))
     # Per-stage flags. BooleanOptionalAction gives us --stage-N / --no-stage-N.
     parser.add_argument("--stage-2", dest="enable_stage_2",
                         action=argparse.BooleanOptionalAction, default=None,
@@ -1410,6 +1443,19 @@ def main(argv: "list[str] | None" = None) -> int:
                               "Cellpose operations. Overrides CUDA "
                               "auto-detection. Useful on non-CUDA machines "
                               "or when GPU memory is unavailable."))
+    parser.add_argument("--no-free-gpu", dest="free_gpu",
+                        action="store_false", default=True,
+                        help=("Disable the GPU VRAM preflight. By default, "
+                              "before GPU-heavy stages the run unloads any "
+                              "resident ollama model (local-Qwen MCP) if free "
+                              "VRAM is below --gpu-min-free-gb, so the pipeline "
+                              "gets the GPU instead of falling back to CPU. "
+                              "No-op under --cpu."))
+    parser.add_argument("--gpu-min-free-gb", dest="gpu_min_free_gb",
+                        type=float, default=8.0,
+                        help=("VRAM headroom target in GB for the GPU preflight "
+                              "(default 8.0). If less is free, the preflight "
+                              "evicts ollama's model to reclaim it."))
     # Gate 2 area overrides — escape hatch only; the common case derives
     # Gate 2 bounds automatically from --min-area / --max-area (×0.75 / ×0.667).
     parser.add_argument("--gate2-min-area", dest="gate2_min_area", type=int,
@@ -1458,9 +1504,6 @@ def main(argv: "list[str] | None" = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if args.email_to and not args.no_email and not args.smtp_user:
-        parser.error("--smtp-user is required when --email-to is set")
-
     if args.scout_mode:
         if any(v is False for v in (args.enable_stage_2, args.enable_stage_3,
                                     args.enable_stage_4)) or any(
@@ -1484,6 +1527,15 @@ def main(argv: "list[str] | None" = None) -> int:
         if any(v is not None for v in (args.enable_stage_2, args.enable_stage_3,
                                        args.enable_stage_4)):
             parser.error("--foundation-only already skips all stages; do not "
+                         "combine it with --stage-N / --no-stage-N toggles.")
+
+    if args.cv_only:
+        if args.scout_mode or args.foundation_only:
+            parser.error("--cv-only is mutually exclusive with --scout and "
+                         "--foundation-only (each is a distinct run mode).")
+        if any(v is not None for v in (args.enable_stage_2, args.enable_stage_3,
+                                       args.enable_stage_4)):
+            parser.error("--cv-only already forces stages 2-4 off; do not "
                          "combine it with --stage-N / --no-stage-N toggles.")
 
     try:
@@ -1513,6 +1565,49 @@ def main(argv: "list[str] | None" = None) -> int:
     return 2
 
 
+def _resolve_profile_name(name: str, input_path: Path) -> str:
+    """Resolve ``--profile`` to a concrete profile name.
+
+    Diameter-primary ``auto`` detection lands in Layer 1; until then ``auto``
+    resolves to ``grin`` (preserves current behavior). PRISM users pass
+    ``--profile prism`` explicitly for now.
+    """
+    if name == AUTO:
+        print(
+            "profile=auto: lens auto-detection not yet wired (Layer 1); using "
+            "'grin'. Pass --profile prism for dim/diffuse PRISM FOVs.",
+            flush=True,
+        )
+        return "grin"
+    return name
+
+
+def _build_explicit_stage1(args: argparse.Namespace, profile_bundle: dict) -> dict:
+    """None-filtered Stage-1 overrides with historical-default backfill.
+
+    Within Stage 1: explicit flag > profile bundle > historical CLI default. The
+    returned dict is merged AFTER the profile bundle so explicit flags win, while
+    omitted flags whose key the profile does not set fall back to the exact prior
+    CLI default (keeping GRIN byte-identical).
+    """
+    out: dict = {}
+    # Model: explicit --model wins (resolve 'latest'); else, only if the profile
+    # does not set a model, pin the exact historical default string so the resume
+    # fingerprint and logs stay byte-identical for GRIN.
+    if args.model is not None:
+        out["cellpose_model"] = _resolve_model(args.model)
+    elif "cellpose_model" not in profile_bundle:
+        out["cellpose_model"] = _resolve_model(_DEFAULT_MODEL)
+    for key in ("diameter", "diameter_auto", "cellprob_threshold",
+                "flow_threshold", "channels"):
+        val = getattr(args, key)
+        if val is not None:
+            out[key] = val
+        elif key not in profile_bundle:
+            out[key] = STAGE1_CLI_DEFAULTS[key]
+    return out
+
+
 def _run_single(
     args: argparse.Namespace,
     tif_path: Path,
@@ -1523,18 +1618,8 @@ def _run_single(
     import time
 
     from roigbiv import overlay as _overlay
-    from roigbiv.pipeline._email import (
-        EmailFOVResult,
-        EmailParams,
-        fmt_duration,
-        send_email,
-    )
-    from roigbiv.pipeline._slack import SlackParams, send_slack
 
-    # Email or Slack path implies headless: never open Napari.
-    email_active = bool(args.email_to and not args.no_email)
-    slack_active = bool(args.slack_channel and not args.no_slack)
-    no_viewer = args.no_viewer or email_active or slack_active
+    no_viewer = args.no_viewer
 
     if args.force_cpu:
         import os
@@ -1586,6 +1671,7 @@ def _run_single(
         if v is not None
     }
     gate2_overrides = _build_gate2_overrides(args)
+    foundation_overrides = _build_foundation_overrides(args)
     stage3_overrides = {
         k: v
         for k, v in {
@@ -1599,32 +1685,34 @@ def _run_single(
         }.items()
         if v is not None
     }
-    cfg = PipelineConfig(
-        fs=args.fs,
-        frame_averaging=args.frame_averaging,
-        tau=args.tau,
-        k_background=args.k,
-        cellpose_model=args.model,
-        diameter=args.diameter,
-        diameter_auto=args.diameter_auto,
-        cellprob_threshold=args.cellprob_threshold,
-        flow_threshold=args.flow_threshold,
-        channels=args.channels,
-        output_dir=args.output_dir,
-        no_viewer=no_viewer,
-        resume=args.resume,
-        force_cpu=args.force_cpu,
-        scout_mode=args.scout_mode,
-        scout_vcorr_stride=args.scout_vcorr_stride,
-        scout_vcorr_neighbors=args.scout_vcorr_neighbors,
-        foundation_only=args.foundation_only,
-        **stage_overrides,
-        **solver_overrides,
-        **mc_overrides,
-        **stage1_overrides,
-        **gate2_overrides,
-        **stage3_overrides,
-    )
+    profile_name = _resolve_profile_name(args.profile, tif_path)
+    profile_bundle = get_profile(profile_name)
+    explicit_stage1 = _build_explicit_stage1(args, profile_bundle)
+    base_kwargs = {
+        "fs": args.fs,
+        "frame_averaging": args.frame_averaging,
+        "tau": args.tau,
+        "k_background": args.k,
+        "output_dir": args.output_dir,
+        "no_viewer": no_viewer,
+        "resume": args.resume,
+        "force_cpu": args.force_cpu,
+        "free_gpu": args.free_gpu,
+        "gpu_min_free_gb": args.gpu_min_free_gb,
+        "scout_mode": args.scout_mode,
+        "scout_vcorr_stride": args.scout_vcorr_stride,
+        "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
+        "foundation_only": args.foundation_only,
+        "cv_only": args.cv_only,
+    }
+    # Precedence: base < profile bundle < explicit user flags. Merge into one dict
+    # (last wins) — profile and the override dicts share keys (e.g. min_area), so
+    # they cannot be separate ** splats.
+    cfg = PipelineConfig(**merged_overrides(
+        profile_name, base_kwargs,
+        [stage_overrides, solver_overrides, mc_overrides, stage1_overrides,
+         gate2_overrides, foundation_overrides, stage3_overrides, explicit_stage1],
+    ))
 
     fov_stem = tif_path.stem.replace("_mc", "")
     print(fmt.fov_banner(tif_path.name, 1, 1), flush=True)
@@ -1634,30 +1722,6 @@ def _run_single(
     except BaseException as exc:  # noqa: BLE001
         import traceback as _tb
         _tb.print_exc()
-        duration = time.perf_counter() - t0
-        if email_active or slack_active:
-            failure_result = EmailFOVResult(
-                tif=tif_path,
-                output_dir=args.output_dir or tif_path.parent,
-                duration_s=duration,
-                error=f"{type(exc).__name__}: {exc}",
-                roi_counts={"accept": 0, "flag": 0, "reject": 0},
-            )
-            summary = _build_pipeline_summary(cfg, args)
-            if email_active:
-                params = EmailParams(
-                    email_to=args.email_to, smtp_host=args.smtp_host,
-                    smtp_port=args.smtp_port, smtp_user=args.smtp_user,
-                    smtp_password_env=args.smtp_password_env,
-                )
-                send_email([failure_result], params, summary)
-            if slack_active:
-                slack_params = SlackParams(
-                    channel=args.slack_channel,
-                    token_env=args.slack_token_env,
-                )
-                send_slack([failure_result], slack_params, summary)
-        # Pipeline-crash exit (1) dominates any notifier-delivery code.
         return 1
     duration = time.perf_counter() - t0
 
@@ -1688,40 +1752,9 @@ def _run_single(
     png_name = png_path.name if png_path else "<no overlay>"
     print(fmt.sub_phase(
         f"{tif_path.name}: accept={counts['accept']} flag={counts['flag']} "
-        f"reject={counts['reject']}  [{fmt_duration(duration)}]  → {png_name}"
+        f"reject={counts['reject']}  [{fmt.fmt_duration(duration)}]  → {png_name}"
     ), flush=True)
-
-    email_failed = False
-    slack_failed = False
-    results = [EmailFOVResult(
-        tif=tif_path, output_dir=fov.output_dir,
-        duration_s=duration, png_path=png_path, roi_counts=counts,
-    )]
-    summary = _build_pipeline_summary(cfg, args)
-    if email_active:
-        params = EmailParams(
-            email_to=args.email_to, smtp_host=args.smtp_host,
-            smtp_port=args.smtp_port, smtp_user=args.smtp_user,
-            smtp_password_env=args.smtp_password_env,
-        )
-        if not send_email(results, params, summary):
-            print("Email FAILED — overlay remains on disk.",
-                  file=sys.stderr, flush=True)
-            email_failed = True
-    elif args.no_email:
-        print("--no-email set; skipping email dispatch.", flush=True)
-    if slack_active:
-        slack_params = SlackParams(
-            channel=args.slack_channel, token_env=args.slack_token_env,
-        )
-        if not send_slack(results, slack_params, summary):
-            print("Slack FAILED — overlay remains on disk.",
-                  file=sys.stderr, flush=True)
-            slack_failed = True
-    elif args.no_slack:
-        print("--no-slack set; skipping Slack dispatch.", flush=True)
-    # Email (3) takes precedence over Slack (4) when both fail.
-    return 3 if email_failed else (4 if slack_failed else 0)
+    return 0
 
 
 def _run_workspace(
@@ -1733,13 +1766,6 @@ def _run_workspace(
     import sys
 
     from roigbiv import overlay as _overlay
-    from roigbiv.pipeline._email import (
-        EmailFOVResult,
-        EmailParams,
-        fmt_duration,
-        send_email,
-    )
-    from roigbiv.pipeline._slack import SlackParams, send_slack
     from roigbiv.pipeline.workspace import resolve_workspace, run_with_workspace
 
     try:
@@ -1798,6 +1824,7 @@ def _run_workspace(
         if v is not None
     }
     ws_gate2_overrides = _build_gate2_overrides(args)
+    ws_foundation_overrides = _build_foundation_overrides(args)
     ws_stage3_overrides = {
         k: v
         for k, v in {
@@ -1811,28 +1838,29 @@ def _run_workspace(
         }.items()
         if v is not None
     }
-    overrides = {
+    profile_name = _resolve_profile_name(args.profile, input_path)
+    profile_bundle = get_profile(profile_name)
+    explicit_stage1 = _build_explicit_stage1(args, profile_bundle)
+    ws_base = {
         "fs": args.fs,
         "frame_averaging": args.frame_averaging,
         "tau": args.tau,
         "k_background": args.k,
-        "cellpose_model": args.model,
-        "diameter": args.diameter,
-        "diameter_auto": args.diameter_auto,
-        "cellprob_threshold": args.cellprob_threshold,
-        "flow_threshold": args.flow_threshold,
-        "channels": args.channels,
         "no_viewer": True,    # workspace runs are headless
         "resume": args.resume,
         "force_cpu": args.force_cpu,
+        "free_gpu": args.free_gpu,
+        "gpu_min_free_gb": args.gpu_min_free_gb,
         "foundation_only": args.foundation_only,
-        **stage_overrides,
-        **ws_solver_overrides,
-        **ws_mc_overrides,
-        **ws_stage1_overrides,
-        **ws_gate2_overrides,
-        **ws_stage3_overrides,
+        "cv_only": args.cv_only,
     }
+    # Precedence: base < profile bundle < explicit user flags (merged_overrides).
+    overrides = merged_overrides(
+        profile_name, ws_base,
+        [stage_overrides, ws_solver_overrides, ws_mc_overrides, ws_stage1_overrides,
+         ws_gate2_overrides, ws_foundation_overrides, ws_stage3_overrides,
+         explicit_stage1],
+    )
 
     ws_results = run_with_workspace(
         workspace, overrides,
@@ -1841,7 +1869,7 @@ def _run_workspace(
         n_workers=args.n_workers,
     )
 
-    model_name = Path(args.model).name
+    model_name = Path(overrides["cellpose_model"]).name
     for wr in ws_results:
         if wr.error is not None or wr.fov is None:
             continue
@@ -1871,63 +1899,14 @@ def _run_workspace(
             print(fmt.sub_phase(
                 f"{r.tif.name}: accept={c.get('accept', 0)} "
                 f"flag={c.get('flag', 0)} reject={c.get('reject', 0)}  "
-                f"[{fmt_duration(r.duration_s)}]  → {png}"
+                f"[{fmt.fmt_duration(r.duration_s)}]  → {png}"
             ), flush=True)
     print(fmt.sub_phase(f"{len(successes)} succeeded, {len(failures)} failed."),
           flush=True)
 
     if not successes:
         return 1
-
-    email_active = bool(args.email_to and not args.no_email)
-    slack_active = bool(args.slack_channel and not args.no_slack)
-    if not (email_active or slack_active):
-        return 0
-
-    # Synthesize a representative cfg for the body summary (workspace
-    # configs are per-FOV; the run-level params we want to echo are the
-    # CLI-set overrides, which are uniform across FOVs).
-    cfg_for_summary = PipelineConfig(
-        fs=args.fs, frame_averaging=args.frame_averaging, tau=args.tau,
-        k_background=args.k, cellpose_model=args.model,
-        diameter=args.diameter, cellprob_threshold=args.cellprob_threshold,
-        flow_threshold=args.flow_threshold, channels=args.channels,
-        **stage_overrides,
-    )
-    summary = _build_pipeline_summary(cfg_for_summary, args)
-    email_results = [
-        EmailFOVResult(
-            tif=r.tif, output_dir=r.output_dir,
-            duration_s=r.duration_s, error=r.error,
-            png_path=r.png_path,
-            roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
-        )
-        for r in ws_results
-    ]
-
-    email_failed = False
-    slack_failed = False
-    if email_active:
-        params = EmailParams(
-            email_to=args.email_to, smtp_host=args.smtp_host,
-            smtp_port=args.smtp_port, smtp_user=args.smtp_user,
-            smtp_password_env=args.smtp_password_env,
-        )
-        if not send_email(email_results, params, summary):
-            print("Email FAILED — overlays remain on disk.",
-                  file=sys.stderr, flush=True)
-            email_failed = True
-    if slack_active:
-        slack_params = SlackParams(
-            channel=args.slack_channel, token_env=args.slack_token_env,
-        )
-        if not send_slack(email_results, slack_params, summary):
-            print("Slack FAILED — overlays remain on disk.",
-                  file=sys.stderr, flush=True)
-            slack_failed = True
-
-    # Email (3) takes precedence over Slack (4) when both fail.
-    return 3 if email_failed else (4 if slack_failed else 0)
+    return 0
 
 
 def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":

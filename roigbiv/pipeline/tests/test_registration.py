@@ -510,6 +510,42 @@ def test_phasecorr_forwards_reg_cfg():
         s2p.run_suite2p_fov = orig
 
 
+def test_suppress_tifffile_uic_divide_is_scoped():
+    """The Suite2p call-site filter swallows tifffile's benign UIC divide warning
+    but leaves a same-message warning from another module visible.
+
+    Guards the fix for the upstream MetaMorph/UIC RATIONAL tag (0 denominator)
+    that emits ``invalid value encountered in divide`` during Suite2p's TIFF
+    load — the warning must be silenced without masking genuine numerical
+    warnings from Suite2p's own math (same message, different origin module).
+    """
+    import warnings
+    from roigbiv.suite2p import _suppress_tifffile_uic_divide
+
+    # 1) tifffile-origin warning is swallowed
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        with _suppress_tifffile_uic_divide():
+            warnings.warn_explicit(
+                "invalid value encountered in divide", RuntimeWarning,
+                filename="tifffile.py", lineno=20158, module="tifffile")
+        leaked = [str(w.message) for w in rec]
+        assert not leaked, f"tifffile UIC divide warning leaked: {leaked}"
+
+    # 2) same message from a different module still surfaces (narrow scope)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        with _suppress_tifffile_uic_divide():
+            warnings.warn_explicit(
+                "invalid value encountered in divide", RuntimeWarning,
+                filename="suite2p/detection.py", lineno=1,
+                module="suite2p.detection")
+        assert len(rec) == 1 and issubclass(rec[0].category, RuntimeWarning), (
+            f"non-tifffile divide warning was wrongly suppressed: {rec}")
+    print("  [PASS] test_suppress_tifffile_uic_divide_is_scoped "
+          "(tifffile silenced, other modules surface)")
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Legacy (SIMA) backend
 # ─────────────────────────────────────────────────────────────────────────
@@ -671,6 +707,7 @@ if __name__ == "__main__":
         test_s2p_reg_default_is_tuned_config,
         test_build_ops_injects_reg_keys,
         test_phasecorr_forwards_reg_cfg,
+        test_suppress_tifffile_uic_divide_is_scoped,
         test_legacy_backend_in_validated_set,
         test_legacy_missing_env_raises_actionable,
         test_legacy_config_fields_forwarded,

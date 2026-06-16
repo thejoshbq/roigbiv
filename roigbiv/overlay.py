@@ -2,7 +2,7 @@
 
 Renders `fov.mean_M` (contrast-stretched) as a grayscale base with ROI contours
 drawn on top. Used by `roigbiv.pipeline.run` after a pipeline run to produce an image
-suitable for email attachment and quick visual inspection. Pure rendering —
+for quick visual inspection. Pure rendering —
 no pipeline calls, no disk I/O besides the final PNG write.
 """
 from __future__ import annotations

@@ -282,6 +282,14 @@ localized, temporally structured cellular signals.
 downstream stage. See Blindspots 3 and 4 for detailed failure modes and
 the required calibration procedure.
 
+**Robust variant (opt-in):** `background_method="rpca"` replaces the plain
+top-k projection with a robust low-rank+sparse decomposition (PCP/IALM;
+`roigbiv/pipeline/rpca.py`) so bright sparse sources are not absorbed into L
+and the residual mean is restored. The robust L stays low-rank and is factored
+back into the same U_k Σ_k V_k^T form, so the residual contract and all
+downstream stages are unchanged. Opt-in pending a held-out A/B; it does not by
+itself solve the tonic (constant-in-time) regime.
+
 **Calibration procedure:**
 1. Compute S at k = 10, 20, 30, 50, 100
 2. For each k, generate the mean projection of S and the mean projection

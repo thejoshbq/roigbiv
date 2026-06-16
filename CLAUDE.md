@@ -36,7 +36,6 @@ When in doubt about *behavior*, the spec wins over code comments or this file.
 | Astrocyte / dual-channel extension | `docs/ASTROCYTE_PLAN.md` |
 | Data format for external collaborators | `docs/RESEARCHER_DATA_GUIDE.md` |
 | External-editor (Fiji/ImageJ) handoff | `docs/external-editing.md` |
-| Email notifications on pipeline completion | `docs/email-notifications.md` |
 | Regression investigation audit trail | `diagnostics/regression/0{1..10}_*.md` |
 | Version history | `docs/CHANGELOG.md` |
 
@@ -49,7 +48,7 @@ conda activate roigbiv              # always first
 pip install -e .                    # editable install (already in environment.yml)
 ```
 
-GPU: RTX 5080 16 GB. Cellpose inference is GPU; Suite2p is CPU-only.
+GPU: RTX 5080 16 GB (Blackwell, sm_120). Working under `torch 2.12.0+cu130` — Cellpose/Foundation run on GPU; Suite2p is CPU-only. The card is shared with the local-Qwen MCP server (ollama), whose large models can monopolize the 16 GB; a per-run VRAM preflight (`pipeline/gpuguard.py`, default on, `--no-free-gpu` to disable) unloads ollama before GPU stages, and the ollama daemon runs `OLLAMA_KEEP_ALIVE=0`. A CPU-fallback warning now distinguishes OOM (VRAM contention) from a real sm/CC mismatch (`pipeline/device.py::cuda_unavailable_reason`).
 
 ## Common commands
 
@@ -63,9 +62,9 @@ roigbiv-ui --host 0.0.0.0                          # LAN access
 roigbiv-pipeline --input PATH --fs 7.5 [--model PATH]
 roigbiv-pipeline --input fov_dir/ --fs 7.5 --n-workers 2     # parallel batch
 
-# Email a PNG overlay per FOV when done (via local Proton Mail Bridge by default)
-roigbiv-pipeline --input test_raw/ --fs 7.5 \
-    --email-to user@x --smtp-user user@proton.me
+# CV-only path: Foundation summaries + Stage 1 detection + traces/QC; skips
+# temporal stages 2–4 (resumable into the full pipeline later)
+roigbiv-pipeline --input fov_dir/ --fs 7.5 --cv-only
 
 # Skip slower stages for the fast path (~10–25 min/FOV faster)
 roigbiv-pipeline --input PATH --fs 7.5 --no-stage-3 --no-stage-4
@@ -110,7 +109,7 @@ Provenance is tracked per ROI (`source_stage`, `gate_outcome`, `confidence`, per
 
 - `roigbiv/pipeline/` — sequential pipeline. Entry: `run.py::run_pipeline`. Stages `stage1.py`…`stage4.py` with matching `gate1.py`…`gate4.py`. `foundation.py` does motion correction + SVD + L+S. `subtraction.py` removes detected sources from the residual movie on disk. `batch.py` runs ≥2 FOVs concurrently with a shared GPU lock. `napari_viewer.py` / `hitl.py` handle review.
 - `roigbiv/registry/` — cross-session FOV + cell tracking. `orchestrator.py::register_or_match` returns `hash_match | auto_match | review | new_fov`. Storage: SQLAlchemy store + filesystem blob store. Matching: ROICaT embeddings with calibrated logistic posterior. Alembic migrations in `migrations/versions/`.
-- `roigbiv/ui/` — Dash + Plotly frontend (pages: Process, Review/HITL). Entry: `roigbiv-ui`. Reuses `workspace.py`; writes additive HITL corrections under each FOV's `corrections/` subdir without mutating pipeline outputs. Registry browsing/maintenance is CLI-only via `roigbiv-registry`.
+- `roigbiv/ui/` — Dash + Plotly frontend (pages: Process, Review/HITL). Entry: `roigbiv-ui`. Reuses `workspace.py`; writes additive HITL corrections under each FOV's `corrections/` subdir without mutating pipeline outputs. The Process form exposes the Foundation background method (svd/rpca) + RPCA knobs at CLI parity. Registry browsing/maintenance is CLI-only via `roigbiv-registry`.
 - `roigbiv/pipeline/workspace.py` — `resolve_workspace` + `run_with_workspace`: in-input `output/`, `registry.db`, auto-migrate, auto-backfill.
 - `roigbiv/pipeline/corrections.py` — HITL ops (add / delete / merge / split / edit / relabel) as a JSONL append log with idempotent replay.
 - `roigbiv/` top level — CLI entry points (`cli.py`, `cli_registry.py`, `cli_reingest.py`, all wired in `pyproject.toml [project.scripts]`) plus shared utilities used across subpackages: `io.py` (TIF discovery/validation, used by `pipeline/workspace.py` and `ui/pages/process.py`), `suite2p.py` (Suite2p batch runner, used by `pipeline/foundation.py`), `overlay.py` (report rendering, used by `cli.py`).

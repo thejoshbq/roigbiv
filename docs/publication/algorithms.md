@@ -15,6 +15,13 @@
 > `PipelineConfig`). The legacy YAML at `configs/pipeline.yaml` describes the
 > superseded consensus architecture and is *not* authoritative for the sequential
 > pipeline documented here.
+>
+> **Audience & last sync.** Written for engineers maintaining or extending the
+> pipeline: every section pairs the *what/how* (math + `file:line`) with a **Design
+> rationale** note recording *why the method was chosen over the alternatives*.
+> Appendix A collapses those choices into one decision-record table. Defaults and
+> line citations were last reconciled against `types.py` on **2026-06-15**; when in
+> doubt, `grep` the field name in `types.py` — it is the only source of truth.
 
 ---
 
@@ -37,6 +44,7 @@
 15. [Cross-session FOV and cell registry](#15-cross-session-fov-and-cell-registry)
 16. [Parameter reference (master table)](#16-parameter-reference-master-table)
 17. [Bibliography](#17-bibliography)
+- [Appendix A — Decision record (alternatives considered)](#appendix-a--decision-record-alternatives-considered)
 
 ---
 
@@ -56,7 +64,7 @@ which gate outcome, at which confidence).
 input TIF  ─►  Foundation  (motion correction → SVD L+S → summary images → DoG)
                    │
                    ▼
-               Stage 1  (Cellpose on {mean_M, vcorr_S})   ─►  Gate 1  (morphology)
+               Stage 1  (Cellpose on {denoised mean_S, vcorr_S}) ─► Gate 1 (morphology)
                    │                                              │
                    ▼                                              ▼
                subtract_1                                 accept | flag ⟶ subtract
@@ -121,43 +129,68 @@ Implementation: `roigbiv/pipeline/foundation.py`.
 
 The foundation stage produces (a) a rigidly- and non-rigidly-registered movie
 $M \in \mathbb{R}^{T \times H \times W}$, stored as an `int16` memory-map; (b) a
-low-rank-plus-sparse decomposition $M = L + S$ with $S$ persisted as a `float32`
-memory-map; (c) five summary images (mean_M, mean_S, max_S, std_S, vcorr_S); and
-(d) a difference-of-Gaussians (DoG) nuclear-shadow map. All arrays larger than
-$H \cdot W$ are streamed through temporal chunks so peak RAM is bounded by a single
-chunk.
+low-rank-plus-sparse decomposition $M = L + S$ where $S$ is a *virtual* residual
+reconstructed on demand (§2.3) rather than materialised to disk; (c) five summary
+images (mean_M, mean_S, max_S, std_S, vcorr_S); and (d) a difference-of-Gaussians
+(DoG) nuclear-shadow map. All arrays larger than $H \cdot W$ are streamed through
+temporal chunks so peak RAM is bounded by a single chunk.
 
-### 2.1 Motion correction (Suite2p phase-correlation)
+### 2.1 Motion correction (three selectable backends)
 
-Motion correction is delegated to Suite2p [Pachitariu et al. 2017], invoked through
-`run_motion_correction` at `foundation.py:38-95`. Suite2p performs rigid
-registration by FFT subpixel phase correlation to a reference image computed from
-`nimg_init = 300` frames, followed by optional non-rigid registration over blocks of
-$128 \times 128$ pixels. When the input filename ends in `_mc.tif` the pipeline
-assumes the movie is pre-registered and disables this step (`do_registration=False`,
-`types.py:153`); in that case only the existing displacement fields (if any) are
-loaded. Suite2p writes a contiguous `int16` `data.bin` which is subsequently opened
-as an `np.memmap` (`foundation.py:102-113`).
+Motion correction is dispatched by `run_motion_correction` (`foundation.py`) on the
+`motion_correction_backend` field (`types.py:210`, default `"phasecorr"`). Three
+backends share a uniform `(ops, data_bin_path, motion_x, motion_y)` return contract:
 
-Relevant defaults (`types.py:151-157`, `pipeline.yaml:51-71`):
+| backend | method | when to use |
+|:---|:---|:---|
+| `phasecorr` (default) | Suite2p [Pachitariu et al. 2017] rigid FFT phase correlation + non-rigid block registration | general use; robust on dim, shot-noise-dominated GRIN/Prism frames |
+| `rowwise-pcc` | in-house GPU row-wise non-rigid phase correlation (`registration.py::run_rowwise_pcc_register`) | opt-in; ~10–14× faster but regresses edge anisotropy — validate parity first |
+| `legacy` | genuine SIMA `HiddenMarkov2D(granularity='row')` run in a `sima-legacy` py3.8 sidecar conda env via subprocess (`legacy_mc.py::run_sima_legacy_register`) | opt-in; exact reproduction of the legacy notebook (CPU-only, tens of min–hours/FOV) |
+
+When the input filename ends in `_mc.tif` the movie is assumed pre-registered and
+registration is disabled (`do_registration=False`, `types.py:170`); only existing
+displacement fields are loaded. All backends write a contiguous `int16` `data.bin`
+opened as an `np.memmap`, and run Suite2p's detection pass so that `stat.npy` /
+`iscell.npy` are available for Stage 2.
+
+**`phasecorr` registration knobs (`types.py:231-260`).** The two values marked
+*tuned* deviate from Suite2p stock defaults:
 
 | parameter | default | purpose |
 |:---|:---|:---|
-| `batch_size` | 500 | GPU frames per registration batch |
-| `nonrigid` | True | enable piecewise non-rigid block registration |
-| `nimg_init` | 300 | frames used to compute reference image |
-| `smooth_sigma` | 1.15 px | reference-image Gaussian smoothing |
-| `maxregshift` | 0.1 | maximum shift as fraction of frame size |
-| `block_size` | 128 × 128 px | non-rigid block size |
+| `mc_s2p_block_size` | **[64, 64]** px *(tuned)* | non-rigid block size |
+| `mc_s2p_one_photon_reg` | **True** *(tuned)* → ops `"1Preg"` | 1-photon-style spatial high-pass before shift estimation |
+| `mc_s2p_smooth_sigma` | 1.15 px | reference-image Gaussian smoothing |
+| `mc_s2p_maxregshift` | 0.1 | rigid shift clamp (fraction of frame) |
+| `mc_s2p_maxregshift_nr` | 5 px | max non-rigid block shift |
+| `mc_s2p_nimg_init` | 300 | frames used to compute the reference image |
+| `mc_s2p_spatial_hp_reg` | 42 px | spatial high-pass window for `1Preg` |
+| `mc_max_displacement` | 50 px | displacement clamp (shared with `rowwise-pcc`/`legacy`) |
 
-Suite2p's internal ROI-detection pass is also executed at this point and its
-outputs (`stat.npy`, `iscell.npy`) are retained for reuse by Stage 2.
+> **Design rationale — why `phasecorr` is the default.** Full-session validation on
+> the Logan Prism FOV (2271-frame mean vs a grid-aligned legacy SIMA mean) showed the
+> stock `[128,128]` / no-`1Preg` configuration reached only **58 %** of legacy
+> cell-sharpness; the tuned `[64,64]` + `1Preg` pair reaches **~103 %** with no
+> over-fit banding (`[64,64]` alone gets 91 %; `1Preg` — a 1-photon high-pass that
+> raises shift-estimation SNR on dim, low-contrast frames — supplies the rest). The
+> tuning sweep lives in `scripts/sweep_suite2p_reg.py`. *Caveat:* `1Preg` is a
+> high-pass; on bright high-SNR (non-Prism) 2P data pass `--no-mc-1preg` and/or
+> `--mc-block-size 128 128`.
+>
+> *Alternatives considered.* `rowwise-pcc` is the in-house GPU path; it is 10–14×
+> faster but its per-row warps smear horizontal edges on dim data (lowest
+> `grad_anisotropy_xy` in the bench), so it remains opt-in until it reaches phasecorr
+> parity on the scale-invariant discriminators (see `docs/foundation-preprocessing.md`
+> §5). `legacy` SIMA HMM is retained only for exact reproduction of historical runs —
+> it is correct but CPU-bound and orders of magnitude slower. A NoRMCorre/CaImAn
+> backend was not adopted: Suite2p already supplies registration *and* the SVD
+> detection pass Stage 2 reuses, so phasecorr avoids a second dependency for no gain.
 
 ### 2.2 Temporally binned truncated SVD
 
 The decomposition operates on a temporally binned copy of the movie to bound
 compute. Given target $T_\text{bin} \approx 5000$ frames
-(`svd_bin_frames=5000`, `types.py:156`), the bin width is
+(`svd_bin_frames=5000`, `types.py:174`), the bin width is
 $b = \lceil T / T_\text{bin} \rceil$ and the binned movie is
 
 $$
@@ -167,43 +200,77 @@ $$
 
 computed at `foundation.py:116-141`.
 
-A rank-$n_\text{svd}$ truncated SVD (`n_svd=200`, `types.py:150`) is computed on
+A rank-$n_\text{svd}$ truncated SVD (`n_svd=200`, `types.py:167`) is computed on
 $\tilde M^\top$ via `torch.svd_lowrank(A, q, niter=2)` — two power iterations of
-randomised subspace SVD [Halko et al. 2011] — at `foundation.py:144-181`. The
-transpose orientation is deliberate: we factor $\tilde M^\top \in
-\mathbb{R}^{N_\text{pix} \times T_\text{bin}}$ so that the returned $U$ indexes pixels
-directly (convenient for spatial reconstruction). On a `torch.cuda.OutOfMemoryError`
-the computation falls back transparently to CPU.
+randomised subspace SVD [Halko et al. 2011]. The transpose orientation is
+deliberate: we factor $\tilde M^\top \in \mathbb{R}^{N_\text{pix} \times T_\text{bin}}$
+so that the returned $U$ indexes pixels directly (convenient for spatial
+reconstruction). The RNG is **seeded** on both the GPU and CPU paths: `svd_lowrank`
+is randomised, and without a fixed seed the top-$k$ subspace drifts run-to-run
+(~0.65 mean principal-angle cosine), which propagates into `vcorr_S` and shifts
+borderline Cellpose detections. On a `torch.cuda.OutOfMemoryError` the computation
+falls back transparently to CPU (still seeded).
 
 The temporal components are then nearest-neighbour upsampled from $T_\text{bin}$ to
-$T$ (`_upsample_V` at `foundation.py:184-202`). This is an acceptable approximation
-for the background subspace because the binning already preserves its dominant
-low-frequency structure.
+$T$ (`_upsample_V`). This is an acceptable approximation for the background subspace
+because the binning already preserves its dominant low-frequency structure.
 
 ### 2.3 Low-rank / sparse decomposition
 
-Denote the top $k = k_\text{background}$ SVD factors (default $k=30$, `types.py:149`)
+Denote the top $k = k_\text{background}$ SVD factors (default $k=30$, `types.py:166`)
 as $U_k \in \mathbb{R}^{N_\text{pix} \times k}$, $\Sigma_k \in \mathbb{R}^{k \times k}$
 diagonal, $V_k \in \mathbb{R}^{T \times k}$ (upsampled). The background and
 residual at each frame $t$ are
 
 $$
 L_t \;=\; U_k \, \Sigma_k \, V_k^{(t)\top}, \qquad
-S_t \;=\; M_t - L_t,
+S_t \;=\; M_t - L_t.
 $$
 
-implemented as a streamed chunked reconstruction with chunk width
-`reconstruct_chunk=500` (`types.py:157`, `foundation.py:274-291`). Throughout the
-codebase we refer to this as a *truncated-SVD L+S decomposition*: it is not the
-iterative principal component pursuit of Candès et al. [2011] (no nuclear-norm or
-$\ell_1$ objective), but rather a direct rank-$k$ projection that achieves the same
-separation of slowly-varying photobleach / neuropil / illumination drift ($L$) from
-the sparse cellular signal ($S$). The choice $k=30$ is validated empirically
-against summary-image contrast (internal design doc, spec §3.3).
+Throughout the codebase we refer to this as a *truncated-SVD L+S decomposition*: it
+is not the iterative principal component pursuit of Candès et al. [2011] (no
+nuclear-norm or $\ell_1$ objective), but a direct rank-$k$ projection that achieves
+the same separation of slowly-varying photobleach / neuropil / illumination drift
+($L$) from the sparse cellular signal ($S$). The choice $k=30$ is validated
+empirically against summary-image contrast (spec §3.3). This is the default,
+selected by `background_method="svd"` (`types.py`).
 
-The SVD factors ($U$, $\Sigma$, $V_\text{bin}$) are persisted to `svd_factors.npz`
-for reuse by later stages; $S$ is persisted to `residual_S.dat` as a `float32`
-memory-map alongside a JSON metadata sidecar.
+**Robust alternative (`background_method="rpca"`).** The truncated SVD's leading
+components align with per-pixel brightness, so high-baseline sources are pulled
+into $L$ (the absorption regression; §11). An opt-in robust path
+(`roigbiv/pipeline/rpca.py`) instead solves a low-rank + sparse decomposition
+$\tilde M = L + S$ by inexact-ALM principal component pursuit (Candès et al. 2011;
+GoDec fallback), so spatially-sparse, temporally-distinct sources land in $S$
+rather than $L$ and the residual mean is no longer driven to zero. Crucially the
+robust $L$ is still genuinely rank $\le$ `rpca_max_rank`, so its exact SVD is
+factored back into the *identical* $US_k$ / $V_k$ form
+(`rpca._factor_from_robust_L`) — the `svd_factors.npz` and `ResidualView`
+contracts below are byte-compatible and unchanged. RPCA runs on its own coarser
+`rpca_bin_frames` binning to bound GPU memory. It is opt-in pending an A/B on the
+held-out set; note that plain PCP fixes *sparse-source* absorption, not the
+*tonic* (constant-in-time) regime, which requires a spatial-continuity prior
+(the planned $T$-term; §11).
+
+**Virtual residual.** $S$ is **not** materialised to disk. `compute_background_separation`
+returns a `ResidualView` (`roigbiv/pipeline/residual.py`) that reconstructs any
+temporal chunk, spatial band, or pixel set on demand from `data.bin` (the int16
+movie memmap) plus the SVD factors $US_k$ / $V_k$ — using chunk width
+`reconstruct_chunk=500` (`types.py:175`). Only the SVD factors (`svd_factors.npz`)
+and a tiny `residual_S.meta.json` marker (`kind: "virtual"`) are written.
+
+> **Design rationale — why truncated SVD is the default, and why virtual.** A
+> direct rank-$k$ projection gives a background/signal split at a fraction of the
+> cost of an iterative solver and with no parameters to tune, which is why it
+> remains the default. Its known weakness — leading components absorbing bright
+> baselines — is addressed by the opt-in `background_method="rpca"` path above
+> (robust-PCA / PCP, [Candès et al. 2011]), kept opt-in until it clears an A/B on
+> the held-out set so the default never silently changes substrate. The
+> `ResidualView`
+> replaced a dense `residual_S.dat` write: materialising every link of the
+> destructive chain $S\!\to\!S_1\!\to\!S_2\!\to\!S_3$ cost ~10–19 GB *each* and
+> peaked at 40–60 GB, which silently `SIGBUS`-crashed the process when the disk
+> filled mid-write (`residual.py` module docstring). Reconstructed values match the
+> old `.dat` within float32 tolerance, so downstream math is unchanged.
 
 ### 2.4 Streaming summary images
 
@@ -240,10 +307,13 @@ estimator but requires only one pass over the data.
 
 **Raw morphological mean (mean_M).** The mean of the *registered* movie (not the
 residual) is read from Suite2p's `meanImg` field or reconstructed from `data.bin`
-if absent (`foundation.py:516-525`). Under a top-$k$ SVD L+S decomposition the
-first few components absorb per-pixel brightness, so `mean_S ≈ 0` and is unsuitable
-as a morphological channel. `mean_M` preserves the raw anatomical contrast that
-Cellpose's training regime expects.
+if absent (`foundation.py:516-525`). Under the default top-$k$ SVD L+S
+decomposition the first few components absorb per-pixel brightness, so
+`mean_S ≈ 0` and is unsuitable as a morphological channel. `mean_M` preserves the
+raw anatomical contrast that Cellpose's training regime expects. (Under
+`background_method="rpca"` the residual mean is restored, but Stage 1 still uses
+`mean_M` by design — its input is intentionally independent of the background
+method, so the absorption fix and the morphological channel stay decoupled.)
 
 ### 2.5 Difference-of-Gaussians nuclear-shadow map
 
@@ -280,33 +350,64 @@ misses bright but silent cells; the pair is complementary.
 
 ### 3.1 Preprocessing and model
 
-The first channel is `mean_S` optionally passed through Cellpose 3's
-`denoise_cyto3` image-restoration model [Pachitariu & Stringer 2022]
-(`denoise_mean_S`, `stage1.py:45-77`; enabled via `use_denoise=True`,
-`types.py:166`). The restoration output is reshaped to `(H, W)` and cast to
-`float32`. The second channel is `vcorr_S` unchanged.
+The first channel is `mean_S` passed through Cellpose 3's `denoise_cyto3`
+image-restoration model [Pachitariu & Stringer 2022] (`denoise_mean_S`, `stage1.py`;
+on by default, `use_denoise=True`, `types.py:273`). The restoration output is
+reshaped to `(H, W)` and cast to `float32`. The second channel is `vcorr_S`
+unchanged. (Note: the *morphological* channel is `mean_S`, not `mean_M`; `mean_M`
+serves Gate 4's intensity floor and the DoG map, where `mean_S ≈ 0` — §2.4, §11.)
 
-Inference is carried out by `CellposeModel` loaded either from a deployed checkpoint
-path (`models/deployed/current_model`, `types.py:160`) or — if the path fails to
-load — from the built-in `cyto3` model. The input is stacked as
-$x \in \mathbb{R}^{H \times W \times 2}$ with `channel_axis=-1`, and inference is
-called with the parameters in Table 3.1.
+The model spec is resolved by `_resolve_model_path` (`stage1.py:40-76`): a built-in
+name (`cyto3`, `cpsam`, …) is passed straight to `CellposeModel(model_type=…)`;
+otherwise the path is tried as-given, then relative to cwd, then relative to the
+package root. An unresolvable path **raises `FileNotFoundError`** — there is
+deliberately *no* silent fallback to stock `cyto3`, because falling back would run
+the wrong model without warning (the exact bug this guards against). The input is
+stacked as $x \in \mathbb{R}^{H \times W \times 2}$ with `channel_axis=-1`, and
+inference is called with the parameters in Table 3.1.
 
-**Table 3.1 — Cellpose parameters (`types.py:160-166`, `pipeline.yaml:5-25`).**
+**Table 3.1 — Cellpose parameters (`types.py:263-273`).**
 
 | parameter | default | meaning |
 |:---|:---|:---|
+| `cellpose_model` | `models/deployed/current_model` | deployed CP3 checkpoint (`types.py:263`) |
 | `diameter` | 12 px | expected soma diameter under GRIN-lens optics |
+| `diameter_auto` | False | when True, override `diameter` with a Cellpose SizeModel estimate (below) |
 | `cellprob_threshold` | $-2.0$ | permissive cell-probability cut to maximise recall |
-| `flow_threshold` | 0.6 | flow-field error threshold |
+| `flow_threshold` | 0.4 | flow-field error threshold |
 | `channels` | $(1, 2)$ | 1-indexed Cellpose channel roles: cyto=mean, nucleus=vcorr |
 | `tile_norm_blocksize` | 128 px | tile-normalisation block size (counters GRIN vignetting) |
+| `use_denoise` | True | apply `denoise_cyto3` to channel 1 |
+
+**Diameter auto-calibration.** With `diameter_auto=True` (`types.py:268`), Stage 1
+estimates the diameter from the image itself rather than trusting the static
+`diameter` (`_estimate_diameter_px`, `stage1.py:145-192`): a difference-of-Gaussians
+(low σ 3, high σ 15 px — spanning GRIN→Prism cell radii) feeds `peak_local_max` to
+locate up to 30 candidate somata; each peak's 40 px crop is Otsu-thresholded and the
+peak-containing component's `regionprops` equivalent-diameter is taken (areas
+30–8000 px). The effective diameter is the median over ≥5 reliable peaks, else the
+static `diameter` is kept. (Cellpose's own `SizeModel` is *not* used — it is only
+attached to the `Cellpose(...)` wrapper, not the `CellposeModel` instance Stage 1
+loads.)
 
 Cellpose returns a uint16 label image, a list of XY flow maps, and the cell-probability
 map $\Pi \in \mathbb{R}^{H \times W}$ (`flows[2]` in Cellpose 3.x). For each
 non-zero label $\ell$, the binary mask is $M_\ell = \{p : L(p) = \ell\}$ and the
-per-ROI probability is $\Pi_\ell = (|M_\ell|)^{-1} \sum_{p \in M_\ell} \Pi(p)$
-(`stage1.py:154-166`).
+per-ROI probability is $\Pi_\ell = (|M_\ell|)^{-1} \sum_{p \in M_\ell} \Pi(p)$.
+
+> **Design rationale — why Cellpose, dual-channel, first.** Cellpose is a generalist
+> flow-field segmenter that, unlike Suite2p's activity-driven SVD detector, finds
+> cells from *morphology alone* — so it recovers bright-but-silent somata that carry
+> no temporal signal, and it runs first because morphologically-clear cells are the
+> highest-confidence detections and clearing them simplifies every later residual.
+> The second channel (`vcorr_S`) is complementary: the mean projection misses
+> dim/tonic cells (low spatial contrast) while local-correlation misses bright-silent
+> cells, so the pair maximises recall. *Alternatives considered:* a Suite2p-only
+> front end would miss silent cells; classical watershed/StarDist on the mean
+> projection underperforms Cellpose on the irregular, low-SNR GRIN somata the
+> deployed CP3 checkpoint was fine-tuned for. `denoise_cyto3` is preferred over a
+> hand-tuned denoiser because it is the restoration regime Cellpose's segmentation
+> head expects.
 
 ---
 
@@ -334,7 +435,7 @@ $$
 $$
 
 with `annulus_inner_buffer=2 px`, `annulus_outer_radius=15 px`
-(`types.py:183-184`; `gate1.py:29-43`). Exclusion of other ROI pixels prevents
+(`types.py:290-291`; `gate1.py:29-43`). Exclusion of other ROI pixels prevents
 neighbour-soma contamination of the annular background. Contrast is
 
 $$
@@ -352,7 +453,7 @@ robust to labelling jitter (`gate1.py:128`).
 ### 4.2 Decision logic
 
 Define a "strongly negative DoG" threshold as the `dog_strong_negative_percentile`
-(default 10th, `types.py:180`) of the DoG map over the FOV. A candidate's failure
+(default 10th, `types.py:287`) of the DoG map over the FOV. A candidate's failure
 set collects criteria that breach their thresholds (`gate1.py:131-141`).
 
 The decision (`gate1.py:143-178`) is:
@@ -369,7 +470,7 @@ out-of-focus ghost" while treating DoG as advisory: a dim cell with negative DoG
 healthy contrast is not penalised. Marginal flagging preserves borderline cells for
 review rather than discarding them, consistent with the recall-first principle.
 
-**Table 4.1 — Gate 1 thresholds (`types.py:169-180`).**
+**Table 4.1 — Gate 1 thresholds (`types.py:276-287`).**
 
 | threshold | default | action if breached |
 |:---|:---|:---|
@@ -380,7 +481,7 @@ review rather than discarding them, consistent with the recall-first principle.
 | `min_contrast` | 0.10 | reject; also triggers DoG conjunction check |
 | `dog_strong_negative_percentile` | 10.0 | DoG rejection if contrast also fails |
 
-**Table 4.2 — Per-criterion flag margins (`types.py:175-178`).**
+**Table 4.2 — Per-criterion flag margins (`types.py:282-285`).**
 
 | criterion | flag margin |
 |:---|:---|
@@ -443,17 +544,43 @@ solve one linear system per temporal chunk on the GPU
 $$
 \lambda \;=\; \rho \cdot \frac{\operatorname{tr}(W^\top W)}{N},
 \qquad \rho = \text{`subtract\_ridge\_lambda\_scale`} = 10^{-6}
-\;(\text{\texttt{types.py:203}}).
+\;(\text{\texttt{types.py:310}}).
 $$
 
 Scaling $\lambda$ by the trace of $W^\top W$ keeps regularisation strength
 proportional to the data scale, so the same $\rho$ works across ROI counts and
-profile norms. The GPU path uses `torch.linalg.solve`; CUDA OOM falls back to CPU
-(`subtraction.py:153-174`).
+profile norms. The GPU path uses `torch.linalg.solve`; CUDA OOM falls back to CPU.
 
-Temporal chunking (`subtract_chunk_frames=2000`, `types.py:202`) streams the
-residual memory-map through RAM to avoid materialising the full $(|P|, T)$ design
-response.
+Temporal chunking (`subtract_chunk_frames=2000`, `types.py:309`) streams the
+residual through RAM to avoid materialising the full $(|P|, T)$ design response.
+
+> **Design rationale — why simultaneous ridge, not sequential or plain NNLS.**
+> Subtracting ROIs one at a time would let an early, mis-estimated trace corrupt its
+> neighbours; solving all $N$ traces over the shared union $P$ *simultaneously*
+> de-mixes overlapping footprints in one shot. Ridge ($\lambda > 0$) keeps
+> $W^\top W$ well-conditioned when profiles overlap heavily (near-collinear columns),
+> which an unregularised least-squares or a blanket non-negativity constraint does
+> not guarantee. `std_S` is the profile source (§5.1) rather than the spec's
+> $\mu_t[S]$ because the top-$k$ SVD components absorb per-pixel mean, leaving
+> $\mu_t[S] \approx 0$ with no spatial structure to weight by.
+
+### 5.2.1 Robust (one-sided Huber IRLS) solver
+
+When `subtract_solver="robust"` (`types.py:314`) the trace solve switches from the
+plain ridge normal equations to an iteratively-reweighted least-squares (IRLS) scheme
+(`solve_traces_robust_irls`, `subtraction.py`). Each iteration down-weights *positive*
+residuals via a one-sided Huber loss with knee `subtract_robust_kappa = 0.5` σ
+(`types.py:315`), where the noise scale σ is estimated from the *negative* residuals
+only (those are unaffected by ghost contamination). Up to
+`subtract_robust_max_iter = 5` (`types.py:316`) iterations run.
+
+> **Design rationale — why one-sided.** Subtraction errors are asymmetric: a residual
+> ghost or a too-bright neighbour shows up as a *positive* excursion the solver should
+> discount, whereas genuine signal dips are negative and must be preserved. A symmetric
+> robust loss would wrongly down-weight both. The robust path is opt-in because it is
+> several× slower than the closed-form ridge solve and only pays off on
+> outlier-contaminated data (Prism scatter, bright debris); the cheaper per-ROI NNLS
+> fallback (§5.5) handles the common case.
 
 ### 5.3 Rank-1 streaming subtraction
 
@@ -463,12 +590,16 @@ $$
 S_\text{out}(p, t) \;=\; S_\text{in}(p, t) - \sum_{i} w_i(p)\, \hat c_i(t).
 $$
 
-Pixels outside $P$ are copied unchanged (`subtract_sources`,
-`subtraction.py:224-283`). The operation is streamed: one sequential read of the
-input memory-map, an in-RAM rank-1 update, one sequential write to the output
-memory-map. The new residual is written to a fresh memory-map
-(`residual_S1.dat`, `residual_S2.dat`, `residual_S3.dat`); the predecessor is
-retained for validation and is optionally unlinked after NNLS fallback completes.
+Pixels outside $P$ are copied unchanged. Subtraction is **virtual**: rather than
+writing a new dense residual, `subtract_sources` appends a `SourceLayer` — the union
+pixel indices, the spatial design $W$, and the estimated traces $\hat c$ — to the
+`ResidualView` chain (`subtraction.py`, `residual.py::SourceLayer`). Reading any chunk
+of the advanced view applies all accumulated layers in order, so $S_n$ is reconstructed
+on demand and matches the old materialised value within float32 tolerance. Each layer
+is persisted as a small `{name}.sources.npz` (a few MB); the chain $S\!\to\!S_1\!\to\!S_2\!\to\!S_3$
+therefore costs MB, not the 40–60 GB of dense per-stage `.dat` files it replaced
+(§2.3). On `--resume`, the chain is rebuilt by loading the `.sources.npz` sidecars in
+stage order.
 
 ### 5.4 Post-subtraction validation
 
@@ -482,7 +613,7 @@ Three per-ROI ratios are tested on the residual *after* subtraction
 | anti-correlation | Pearson $r\bigl(\mu(S_\text{out}[\text{mask}])_t,\; \hat c_i(t)\bigr)$ | $> \rho_\text{anti}$ |
 
 with $\rho_\text{anti} = \text{`subtract\_anticorr\_threshold`} = -0.3$
-(`types.py:204`). All three ratios must hold for `pass=True`. Values are
+(`types.py:311`). All three ratios must hold for `pass=True`. Values are
 accumulated in `float64` moments during one streaming pass through the post-subtraction
 residual; Pearson correlations are computed from second moments
 (`subtraction.py:458-466`).
@@ -495,8 +626,8 @@ cancelled into the noise rather than extracting a true source.
 ### 5.5 Single-variable NNLS fallback
 
 If the anti-correlation failure fraction exceeds
-`subtract_anticorr_failure_fraction = 0.10` (`types.py:205`), up to
-`subtract_nnls_fallback_max_rois = 30` (`types.py:206`) flagged ROIs are
+`subtract_anticorr_failure_fraction = 0.10` (`types.py:312`), up to
+`subtract_nnls_fallback_max_rois = 30` (`types.py:313`) flagged ROIs are
 re-estimated with a non-negativity constraint. Because each ROI's profile is
 localised, the problem reduces to single-variable non-negative least squares on
 the local support:
@@ -529,7 +660,7 @@ Re-running Suite2p would duplicate foundation cost; instead, Stage 2 reads the
 (`_load_suite2p_outputs`, `stage2.py:93-116`). Each entry in `stat` is converted to
 a dense binary mask by indexing `ypix`/`xpix` and clipping to the FOV
 (`_stat_entries_to_masks`, `stage2.py:119-145`). Entries with
-`iscell[i, 1] < iscell_threshold = 0.3` (`types.py:210`) are dropped.
+`iscell[i, 1] < iscell_threshold = 0.3` (`types.py:320`) are dropped.
 
 ### 6.2 IoU novelty filter
 
@@ -540,10 +671,18 @@ $$
 $$
 
 and retain only those Stage 2 candidates whose maximum IoU against any Stage 1 mask
-does not exceed `gate2_iou_threshold = 0.3` (`types.py:213`, `stage2.py:161-183`).
+does not exceed `gate2_iou_threshold = 0.3` (`types.py:323`, `stage2.py:161-183`).
 The 0.3 cut-off is within the 0.3–0.5 literature range for consensus ROI matching
 [Giovannucci et al. 2019] and is conservative for Suite2p's irregular footprints
 against Cellpose's smooth contours.
+
+> **Design rationale — why reuse Suite2p, why temporal-first here.** Foundation
+> already ran Suite2p's full registration + SVD detection pass; re-running it in
+> Stage 2 would double the most expensive foundation cost for identical output, so
+> Stage 2 reads the cached `stat.npy`/`iscell.npy` instead. Suite2p is placed *after*
+> Cellpose because its activity-driven SVD detector recovers exactly the cells
+> morphology misses — burst-firers and neighbour-occluded somata — and the IoU filter
+> guarantees it contributes only genuinely new ROIs rather than re-finding Stage 1's.
 
 ### 6.3 Trace extraction on the residual
 
@@ -639,6 +778,15 @@ family parameterise single, doublet, and burst kinetics (Table 8.1), selected by
 decay-constant threshold of 0.75 s (`stage3_templates.py:33-36`): GCaMP6s
 [Chen et al. 2013] if $\tau \ge 0.75$ s, else jGCaMP8f [Zhang et al. 2023].
 
+> **Design rationale — why a matched-filter bank, why keyed on fs+τ.** Sparsely-firing
+> cells have too few transients to rank in Suite2p's SVD, but each transient has a
+> stereotyped shape — so a matched filter (the optimal linear detector for a known
+> waveform in noise) is the right tool, and the FFT makes it $O(N_\text{pix}\,T\log T)$
+> rather than per-pixel OASIS fitting. The bank is keyed on $f_s$ and $\tau$ because
+> template shape in *frames* depends on the acquisition rate, and the indicator family
+> sets the rise/decay constants; $L_2$-normalising every template makes their scores
+> directly comparable so one global threshold applies across the bank.
+
 **Table 8.1 — Template bank (`stage3_templates.py:18-30`).**
 
 | indicator | shape | $\tau_\text{rise}$ (s) | $\tau_\text{decay}$ (s) |
@@ -653,7 +801,7 @@ decay-constant threshold of 0.75 s (`stage3_templates.py:33-36`): GCaMP6s
 ### 8.2 FFT-based cross-correlation
 
 The residual $S_2$ is scanned in spatial row-chunks of
-`stage3_pixel_chunk_rows = 8` rows (`types.py:235`), which amounts to ~4 000
+`stage3_pixel_chunk_rows = 8` rows (`types.py:346`), which amounts to ~4 000
 pixels per chunk on a 512-wide FOV. For each chunk we move the pixel-traces tensor
 to the GPU, compute per-pixel noise scale
 
@@ -676,7 +824,7 @@ so no $(N_\text{pix}, K, T)$ array is ever materialised (`stage3.py:101-116`).
 
 **Spec deviation.** Spec §9.2 specifies a sliding-window local MAD
 $\sigma_\text{local}(p, t)$ with a `stage3_sigma_window_frames=500`-frame window
-(`types.py:236`); the current implementation uses a *global* per-pixel MAD to save
+(`types.py:348`); the current implementation uses a *global* per-pixel MAD to save
 ~300 MB of intermediate storage per chunk (`stage3.py:27-32`). The approximation
 is defensible: per-pixel global MAD already normalises away the dominant source of
 scale variation (pixel-wise brightness heterogeneity); temporal non-stationarity is
@@ -687,7 +835,7 @@ waveforms.
 
 A pixel-time pair $(p, t)$ is declared an *event* when
 $\text{score\_max}(p, t) > \theta$ with $\theta = $ `template_threshold = 6.0`
-(`types.py:230`). The 6σ threshold is at the top of spec §18.6's 3–6σ range
+(`types.py:341`). The 6σ threshold is at the top of spec §18.6's 3–6σ range
 because real residual distributions have heavier right tails than pure Gaussian
 noise (structured neuropil leakage).
 
@@ -695,14 +843,14 @@ To bound per-chunk memory we adaptively raise $\theta$ by 1.0σ per iteration (u
 to 8 iterations) if more than $2 \times 10^5$ events cross in a single chunk,
 effectively converting the test into a top-$K$ selector when the chunk is
 pathological (`stage3.py:118-131`). A global cap of `stage3_max_events =
-2 \times 10^6` (`types.py:237`) retains the top-$K$ events by score if exceeded
+2 \times 10^6` (`types.py:349`) retains the top-$K$ events by score if exceeded
 (`stage3.py:326-332`).
 
 ### 8.4 Spatial clustering
 
 Events are clustered in 2-D by single-linkage hierarchical clustering
 (`scipy.cluster.hierarchy.linkage` + `fcluster`) with distance threshold
-`cluster_distance = 12 px` (`types.py:233`). Above $2 \times 10^4$ events the
+`cluster_distance = 12 px` (`types.py:344`). Above $2 \times 10^4$ events the
 $O(n^2)$-memory `pdist` becomes prohibitive, so we switch to a grid-snap
 approximation: each event is assigned to a $d \times d$ grid cell where $d$ equals
 the distance threshold, and events in the same cell become the same cluster
@@ -715,7 +863,7 @@ cases.
 
 For each spatial cluster we greedily select events in descending score order,
 retaining an event only if no previously selected event is within
-`min_event_separation = 2.0 s` (`types.py:234`) — i.e.,
+`min_event_separation = 2.0 s` (`types.py:345`) — i.e.,
 $\lceil 2 f_s \rceil$ frames
 (`_count_temporally_independent`, `stage3.py:199-223`). The retained count is
 `event_count`; clusters with zero independent events are discarded.
@@ -723,7 +871,7 @@ $\lceil 2 f_s \rceil$ frames
 ### 8.6 Candidate packaging
 
 Each surviving cluster becomes a candidate ROI: mask is a filled disk of radius
-`spatial_pool_radius = 8 px` (`types.py:231`) centred on the cluster's mean
+`spatial_pool_radius = 8 px` (`types.py:342`) centred on the cluster's mean
 $(y, x)$; the trace is extracted from $S_2$ via the same matrix-vector extractor
 as Stage 2 (`stage3.py:382-394`); provisional `gate_outcome="accept"` pending
 Gate 3 (`stage3.py:395-426`).
@@ -747,7 +895,7 @@ $$
 $$
 
 where $L$ is the `gate3_waveform_window_tau_multiple = 5.0`-multiple of $\tau f_s$
-(`types.py:245`). For $\tau = 1$ s and $f_s = 30$ Hz, $L = 150$ frames. A baseline
+(`types.py:357`). For $\tau = 1$ s and $f_s = 30$ Hz, $L = 150$ frames. A baseline
 computed as the mean of the first 10 % of the window is subtracted to remove
 slow drift (`gate3.py:36-60`).
 
@@ -774,8 +922,8 @@ used for the gate decision. Thresholds:
 
 | criterion | threshold |
 |:---|:---|
-| single-event candidate | $R^2_{k^\star} \ge$ `gate3_min_waveform_r2_single_event = 0.5` (`types.py:241`) |
-| multi-event candidate | $R^2_{k^\star} \ge$ `gate3_min_waveform_r2 = 0.6` (`types.py:240`) |
+| single-event candidate | $R^2_{k^\star} \ge$ `gate3_min_waveform_r2_single_event = 0.5` (`types.py:353`) |
+| multi-event candidate | $R^2_{k^\star} \ge$ `gate3_min_waveform_r2 = 0.6` (`types.py:352`) |
 | marginal flag band | $[\min_r2,\; \min_r2 + 0.1)$ → flag rather than reject |
 
 ### 9.3 Rise/decay asymmetry
@@ -789,7 +937,7 @@ $$
 where $t_{10}, t_{90}, t_{37}$ are the first frame indices at which the waveform
 crosses 10 %, 90 %, and 37 % of peak amplitude (rise measured before the peak,
 decay after). Reject if $\rho \ge$ `gate3_max_rise_decay_ratio = 0.5`
-(`types.py:242`; `_rise_decay_ratio`, `gate3.py:116-154`). Slow-rise / fast-decay
+(`types.py:354`; `_rise_decay_ratio`, `gate3.py:116-154`). Slow-rise / fast-decay
 patterns (large $\rho$) indicate noise, astrocyte-slow events, or back-propagated
 motion artefacts.
 
@@ -800,12 +948,12 @@ surviving pixels of a partially-subtracted neighbour. For each candidate we find
 all prior-stage ROIs with centroid within `gate2_spatial_radius = 20 px` (the
 same radius used by Gate 2), compute Pearson correlations against their traces,
 and reject if the minimum is $\le$ `gate3_anticorr_threshold = -0.5`
-(`types.py:243`; `gate3.py:259-272`).
+(`types.py:355`; `gate3.py:259-272`).
 
 ### 9.5 Morphology and confidence grading
 
 Solidity of the disk mask, computed via `regionprops`, must meet
-`gate3_min_solidity = 0.5` (`types.py:244`). Confidence is graded by event count
+`gate3_min_solidity = 0.5` (`types.py:356`). Confidence is graded by event count
 (`gate3.py:274-280`):
 
 | `event_count` | confidence |
@@ -846,12 +994,26 @@ $$
 
 The intercept and slope are computed once and the detrended movie is written to a
 memory-map for reuse across bandpass windows. Chunking in space
-(`stage4_pixel_chunk_rows = 16`, `types.py:263`) bounds RAM independently of $T$.
+(`stage4_pixel_chunk_rows = 16`, `types.py:375`) bounds RAM independently of $T$.
+
+> **Design rationale — why correlation contrast for tonic cells.** Tonic neurons
+> defeat every earlier detector: low variance hides them from Suite2p, no discrete
+> transients hides them from Stage 3, and the low-rank $L$ partially absorbs their
+> near-DC fluctuation. What survives is a *spatially-confined* micro-fluctuation in
+> the calcium band. Stage 4 detects that signature directly — a pixel that correlates
+> with its immediate neighbourhood far more than with the surrounding annulus is a
+> coherent micro-region (a soma); neuropil correlates broadly at both radii and
+> scores ~0. Three bandpass windows cover the 3–5 Hz / 1–3 Hz / sub-1 Hz firing
+> regimes that pile up differently under τ≈1 s kinetics, and detecting in multiple
+> windows is positive evidence carried to review. Temporal compression (§10.3) shares
+> bin edges across pixels, so it preserves pairwise correlations *exactly* while
+> cutting the correlation cost from $O(T)$ to $O(D)$ — it is an orthogonal projection,
+> not a lossy SVD.
 
 ### 10.2 Zero-phase Butterworth bandpass at three windows
 
 Three bandpass windows isolate different tonic-firing rates
-(`bandpass_windows`, `types.py:248-252`):
+(`bandpass_windows`, `types.py:360-364`):
 
 | window | passband (Hz) | targets |
 |:---|:---|:---|
@@ -860,7 +1022,7 @@ Three bandpass windows isolate different tonic-firing rates
 | slow | 0.05–0.5 | < 1 Hz firing and slow modulation |
 
 Each window's filter is an order-4 zero-phase Butterworth
-(`bandpass_order = 4`, `types.py:253`) realised as a second-order-sections cascade
+(`bandpass_order = 4`, `types.py:365`) realised as a second-order-sections cascade
 applied with `scipy.signal.sosfiltfilt` (forward-then-reverse)
 (`bandpass_to_memmap`, `stage4.py:94-126`). Zero-phase filtering preserves the
 temporal alignment needed by the downstream correlation step; consequently the
@@ -872,7 +1034,7 @@ lower cutoff yields a required minimum recording length $> T / f_s$
 
 After filtering we compress the $(T, H, W)$ movie to a $(H \cdot W, D)$ matrix via
 binned temporal averaging with $D = \min($`n_svd_components_stage4 = 300`, $T)$
-bins (`types.py:254`; `compress_temporal`, `stage4.py:133-164`). Because every
+bins (`types.py:366`; `compress_temporal`, `stage4.py:133-164`). Because every
 pixel shares the same bin edges, pairwise correlations are preserved exactly — it
 is an orthogonal projection onto the constant-per-bin basis. This reduces the
 subsequent correlation computation from $O(T)$ to $O(D)$ per pixel pair.
@@ -892,9 +1054,9 @@ $$
 The inner sum is a spatial convolution of $z$ with a uniform disk kernel. Let
 
 - $K_\text{in}$ = disk of radius `corr_neighbor_radius_inner = 6` with the central
-  pixel excluded (`types.py:255`), normalised to unit $\ell_1$ norm,
+  pixel excluded (`types.py:367`), normalised to unit $\ell_1$ norm,
 - $K_\text{out}^\text{full}$ = disk of radius
-  `corr_neighbor_radius_outer = 15` (`types.py:256`), and
+  `corr_neighbor_radius_outer = 15` (`types.py:368`), and
 - $K_\text{in}^\text{full}$ = disk of radius 6 with centre included.
 
 The annulus mean is
@@ -923,7 +1085,7 @@ correlation to $O(D \cdot N_\text{pix} \cdot |\text{kernel}|)$ per radius.
 ### 10.5 Thresholding, morphological filter, cross-window merge
 
 The contrast map is thresholded at
-`corr_contrast_threshold = 0.10` (`types.py:257`) and labelled via connected
+`corr_contrast_threshold = 0.10` (`types.py:369`) and labelled via connected
 components (`scipy.ndimage.label`; `cluster_contrast_map`, `stage4.py:266-306`).
 Each component is kept if all of
 
@@ -931,12 +1093,12 @@ $$
 a \in [80, 350], \quad s \ge 0.6, \quad e \le 0.85
 $$
 
-hold (`types.py:258-261`), where $a$ is the pixel area, $s$ is regionprops
+hold (`types.py:370-373`), where $a$ is the pixel area, $s$ is regionprops
 solidity, $e$ is eccentricity.
 
 Candidates from the three windows are pooled and merged greedily in descending
 correlation-contrast order by IoU with the threshold
-`stage4_iou_merge_threshold = 0.3` (`types.py:262`;
+`stage4_iou_merge_threshold = 0.3` (`types.py:374`;
 `merge_across_windows`, `stage4.py:321-358`). Each winner records the set of
 windows in which it was detected (`bandpass_windows_detected` feature), which
 contributes evidence at review.
@@ -946,7 +1108,7 @@ contributes evidence at review.
 For every surviving candidate the trace is extracted from $S_3$ using the
 matrix-vector extractor (§6.3). The three bandpass windows are processed either
 serially or with a thread pool of up to `stage4_n_workers = 3` threads
-(`types.py:264`); `sosfiltfilt` and `ndi_convolve` release the GIL so parallelism
+(`types.py:376`); `sosfiltfilt` and `ndi_convolve` release the GIL so parallelism
 is real. BLAS threads per worker are capped to `cpu_count // n_workers` via
 `threadpool_limits` to prevent oversubscription (`stage4.py:482-497`).
 
@@ -969,26 +1131,39 @@ map is mandatory.
 The six checks (`gate4.py:107-172`):
 
 1. **Correlation contrast.** $C \ge$ `gate4_min_corr_contrast = 0.10`
-   (`types.py:270`).
+   (`types.py:382`).
 2. **Eccentricity.** $e \le$ `stage4_max_eccentricity = 0.85`.
 3. **Solidity.** $s \ge$ `stage4_min_solidity = 0.60`.
 4. **Motion correlation.** Pearson correlations of the raw ROI trace against the
    per-frame rigid displacement fields $(x_\text{off}, y_\text{off})$ from the
    Suite2p `ops`:
    $\max\bigl(\lvert r_x\rvert, \lvert r_y\rvert\bigr) <$
-   `gate4_max_motion_corr = 0.3` (`types.py:271`). Sub-pixel motion leaves
+   `gate4_max_motion_corr = 0.3` (`types.py:383`). Sub-pixel motion leaves
    fluctuating ring artefacts at soma boundaries that mimic tonic signals; the
    raw trace is used (not bandpass) because motion power spreads across
    frequencies.
 5. **Cascade anti-correlation.** For prior-stage ROIs with centroid within
-   `gate4_spatial_radius = 20 px` (`types.py:274`), the minimum Pearson
+   `gate4_spatial_radius = 20 px` (`types.py:386`), the minimum Pearson
    correlation against the candidate trace must exceed
-   `gate4_anticorr_threshold = -0.5` (`types.py:272`).
+   `gate4_anticorr_threshold = -0.5` (`types.py:384`).
 6. **Intensity floor on mean_M.** $\mu_{M}(\text{mask}) \ge$
    percentile($\mathrm{mean\_M}$, `gate4_min_mean_intensity_pct = 25`)
-   (`types.py:273`). The spec originally prescribed `mean_S`; we substitute
-   `mean_M` because `mean_S ≈ 0` under SVD L+S (`foundation.py:513-515`;
-   `gate4.py:14-24`) making a percentile filter on it meaningless.
+   (`types.py:385`). The spec originally prescribed `mean_S`; we substitute
+   `mean_M` because `mean_S ≈ 0` under SVD L+S (`gate4.py:14-24`) making a
+   percentile filter on it meaningless.
+
+> **Design rationale — why no accept tier, why a motion check unique to Gate 4.**
+> Tonic detection rests on a subtle second-order statistic (local correlation
+> contrast), not a crisp morphology or waveform, so the pipeline refuses to assert
+> *accept* on it automatically — every survivor is `flag` / `requires_review` and a
+> human inspects the bandpass trace plus correlation map. The motion-correlation
+> check exists only here because the tonic signature — a low-amplitude, broadband
+> fluctuation confined to a soma boundary — is exactly what residual sub-pixel
+> registration drift counterfeits; checking the *raw* trace against `ops` offsets
+> (not the bandpassed one, since motion power is broadband) is the cheapest way to
+> reject those impostors before they reach review. The `mean_M` floor (not `mean_S`)
+> is forced by the SVD L+S decomposition, which zeroes `mean_S` — only `mean_M`
+> retains the raw brightness a percentile threshold can act on.
 
 ---
 
@@ -1131,9 +1306,10 @@ container through them. GPU-heavy sections (Cellpose inference, Suite2p detectio
 Stage 3 FFT, subtraction ridge solve and NNLS) are wrapped in a `_gpu_section`
 context that acquires a shared `multiprocessing.Manager().Lock()` when the
 pipeline is invoked from `batch.py`, and is a zero-cost no-op otherwise
-(`run.py:32-40`). Between stages, the subtraction engine of §5 deletes the
-predecessor residual memory-map once validation and NNLS complete, keeping peak
-disk usage to one residual at a time.
+(`run.py:32-40`). Between stages, the subtraction engine of §5 advances a virtual
+`ResidualView` rather than writing a dense residual (§2.3, §5.3), so peak disk usage
+is bounded by the SVD factors plus a few-MB `.sources.npz` per stage — independent of
+$T$.
 
 ### 14.2 Monotonicity check
 
@@ -1149,11 +1325,10 @@ Per-FOV output directory (default
 
 ```
 suite2p/plane0/{ops.npy, data.bin, stat.npy, iscell.npy, ...}
-svd_factors.npz
-residual_S.dat                         (foundation output, float32 memmap)
-residual_S1.dat  /  residual_S2.dat  /  residual_S3.dat   (per-stage residuals)
-residual_S*.meta.json                  (shape + dtype)
-subtraction_report_residual_S*.json    (post-subtraction validation report)
+svd_factors.npz                        (U, Σ, V_bin — reconstructs the virtual residual)
+residual_S.meta.json                   (virtual-residual marker; kind: "virtual")
+*.sources.npz                          (per-stage SourceLayer: union pixels, W, traces)
+subtraction_report_*.json              (post-subtraction validation report per stage)
 motion_trace.npz                       (xoff, yoff, fs)
 summary/{mean_M, mean_S, max_S, std_S, vcorr_S, mean_L, dog_map}.tif
 
@@ -1451,126 +1626,147 @@ branch without writing new rows.
 ## 16. Parameter reference (master table)
 
 Every parameter below is a field of `PipelineConfig`
-(`roigbiv/pipeline/types.py:142-290`). All CLI flags override these defaults.
+(`roigbiv/pipeline/types.py:159-409`). All CLI flags override these defaults.
 
 ### Foundation
 
 | parameter | default | `types.py` line |
 |:---|:---|:---|
-| `k_background` | 30 | 149 |
-| `n_svd` | 200 | 150 |
-| `batch_size` | 500 | 151 |
-| `nonrigid` | True | 152 |
-| `do_registration` | False (True when input lacks `_mc`) | 153 |
-| `fs` | 30.0 Hz (CLI-required) | 154 |
-| `tau` | 1.0 s (GCaMP6s) | 155 |
-| `svd_bin_frames` | 5 000 | 156 |
-| `reconstruct_chunk` | 500 frames | 157 |
+| `k_background` | 30 | 166 |
+| `n_svd` | 200 | 167 |
+| `batch_size` | 500 | 168 |
+| `nonrigid` | True | 169 |
+| `do_registration` | False (True when input lacks `_mc`) | 170 |
+| `fs` | 30.0 Hz (CLI-required) | 171 |
+| `tau` | 1.0 s (GCaMP6s) | 173 |
+| `svd_bin_frames` | 5 000 | 174 |
+| `reconstruct_chunk` | 500 frames | 175 |
+
+### Motion correction
+
+| parameter | default | line |
+|:---|:---|:---|
+| `motion_correction_backend` | `phasecorr` (`rowwise-pcc` \| `legacy`) | 210 |
+| `mc_max_displacement` | 50 px (shared across backends) | 211 |
+| `mc_s2p_block_size` | [64, 64] px *(tuned)* | 246 |
+| `mc_s2p_one_photon_reg` | True *(tuned)* → ops `1Preg` | 257 |
+| `mc_s2p_smooth_sigma` | 1.15 px | 247 |
+| `mc_s2p_maxregshift` | 0.1 | 249 |
+| `mc_s2p_maxregshift_nr` | 5 px | 251 |
+| `mc_s2p_nimg_init` | 300 | 252 |
+| `mc_s2p_spatial_hp_reg` | 42 px | 258 |
+| `mc_sima_env` / `mc_granularity` | `sima-legacy` / `row` (legacy backend) | 228–229 |
 
 ### Stage 1 (Cellpose)
 
 | parameter | default | line |
 |:---|:---|:---|
-| `cellpose_model` | `models/deployed/current_model` | 160 |
-| `diameter` | 12 px | 161 |
-| `cellprob_threshold` | $-2.0$ | 162 |
-| `flow_threshold` | 0.6 | 163 |
-| `channels` | (1, 2) | 164 |
-| `tile_norm_blocksize` | 128 px | 165 |
-| `use_denoise` | True | 166 |
+| `cellpose_model` | `models/deployed/current_model` | 263 |
+| `diameter` | 12 px | 264 |
+| `diameter_auto` | False (Cellpose SizeModel estimate when True) | 268 |
+| `cellprob_threshold` | $-2.0$ | 269 |
+| `flow_threshold` | 0.4 | 270 |
+| `channels` | (1, 2) | 271 |
+| `tile_norm_blocksize` | 128 px | 272 |
+| `use_denoise` | True | 273 |
 
 ### Gate 1
 
 | parameter | default | line |
 |:---|:---|:---|
-| `min_area` / `max_area` | 80 / 600 px | 169–170 |
-| `min_solidity` | 0.55 | 171 |
-| `max_eccentricity` | 0.90 | 172 |
-| `min_contrast` | 0.10 | 173 |
-| `flag_area_margin` | 20 px | 175 |
-| `flag_solidity_margin` | 0.05 | 176 |
-| `flag_eccentricity_margin` | 0.03 | 177 |
-| `flag_contrast_margin` | 0.03 | 178 |
-| `dog_strong_negative_percentile` | 10.0 | 180 |
-| `annulus_inner_buffer` / `annulus_outer_radius` | 2 / 15 px | 183–184 |
+| `min_area` / `max_area` | 80 / 600 px | 276–277 |
+| `min_solidity` | 0.55 | 278 |
+| `max_eccentricity` | 0.90 | 279 |
+| `min_contrast` | 0.10 | 280 |
+| `flag_area_margin` | 20 px | 282 |
+| `flag_solidity_margin` | 0.05 | 283 |
+| `flag_eccentricity_margin` | 0.03 | 284 |
+| `flag_contrast_margin` | 0.03 | 285 |
+| `dog_strong_negative_percentile` | 10.0 | 287 |
+| `annulus_inner_buffer` / `annulus_outer_radius` | 2 / 15 px | 290–291 |
 
 ### Subtraction
 
 | parameter | default | line |
 |:---|:---|:---|
-| `subtract_chunk_frames` | 2 000 | 202 |
-| `subtract_ridge_lambda_scale` | $10^{-6}$ | 203 |
-| `subtract_anticorr_threshold` | $-0.3$ | 204 |
-| `subtract_anticorr_failure_fraction` | 0.10 | 205 |
-| `subtract_nnls_fallback_max_rois` | 30 | 206 |
+| `subtract_chunk_frames` | 2 000 | 309 |
+| `subtract_ridge_lambda_scale` | $10^{-6}$ | 310 |
+| `subtract_anticorr_threshold` | $-0.3$ | 311 |
+| `subtract_anticorr_failure_fraction` | 0.10 | 312 |
+| `subtract_nnls_fallback_max_rois` | 30 | 313 |
+| `subtract_solver` | `ridge` (\| `robust`) | 314 |
+| `subtract_robust_kappa` | 0.5 σ (one-sided Huber knee) | 315 |
+| `subtract_robust_max_iter` | 5 (IRLS cap) | 316 |
 
 ### Stage 2 / Gate 2
 
 | parameter | default | line |
 |:---|:---|:---|
-| `iscell_threshold` | 0.3 | 210 |
-| `gate2_iou_threshold` | 0.3 | 213 |
-| `gate2_max_correlation` | 0.7 | 214 |
-| `gate2_anticorr_threshold` | $-0.5$ | 215 |
-| `gate2_spatial_radius` | 20 px | 216 |
-| `gate2_min_area` / `gate2_max_area` | 60 / 400 px | 217–218 |
-| `gate2_min_solidity` | 0.4 | 219 |
-| `gate2_near_distance` | 5 px | 220 |
-| `gate2_near_corr_threshold` | 0.5 | 221 |
-| `gate2_flag_corr_threshold` | 0.5 | 222 |
+| `iscell_threshold` | 0.3 | 320 |
+| `gate2_iou_threshold` | 0.3 | 323 |
+| `gate2_max_correlation` | 0.7 | 324 |
+| `gate2_anticorr_threshold` | $-0.5$ | 325 |
+| `gate2_spatial_radius` | 20 px | 326 |
+| `gate2_min_area` / `gate2_max_area` | 60 / 400 px | 327–328 |
+| `gate2_min_solidity` | 0.4 | 329 |
+| `gate2_max_eccentricity` | 0.85 | 330 |
+| `gate2_near_distance` | 5 px | 331 |
+| `gate2_near_corr_threshold` | 0.5 | 332 |
+| `gate2_flag_corr_threshold` | 0.5 | 333 |
 
 ### Stage 3 / Gate 3
 
 | parameter | default | line |
 |:---|:---|:---|
-| `template_threshold` | 6.0 σ | 230 |
-| `spatial_pool_radius` | 8 px | 231 |
-| `cluster_distance` | 12 px | 233 |
-| `min_event_separation` | 2.0 s | 234 |
-| `stage3_pixel_chunk_rows` | 8 | 235 |
-| `stage3_max_events` | 2 000 000 | 237 |
-| `gate3_min_waveform_r2` | 0.6 | 240 |
-| `gate3_min_waveform_r2_single_event` | 0.5 | 241 |
-| `gate3_max_rise_decay_ratio` | 0.5 | 242 |
-| `gate3_anticorr_threshold` | $-0.5$ | 243 |
-| `gate3_min_solidity` | 0.5 | 244 |
-| `gate3_waveform_window_tau_multiple` | 5.0 | 245 |
+| `template_threshold` | 6.0 σ | 341 |
+| `spatial_pool_radius` | 8 px | 342 |
+| `cluster_distance` | 12 px | 344 |
+| `min_event_separation` | 2.0 s | 345 |
+| `stage3_pixel_chunk_rows` | 8 | 346 |
+| `stage3_chunk_budget_bytes` | 1 GiB | 347 |
+| `stage3_max_events` | 2 000 000 | 349 |
+| `gate3_min_waveform_r2` | 0.6 | 352 |
+| `gate3_min_waveform_r2_single_event` | 0.5 | 353 |
+| `gate3_max_rise_decay_ratio` | 0.5 | 354 |
+| `gate3_anticorr_threshold` | $-0.5$ | 355 |
+| `gate3_min_solidity` | 0.5 | 356 |
+| `gate3_waveform_window_tau_multiple` | 5.0 | 357 |
 
 ### Stage 4 / Gate 4
 
 | parameter | default | line |
 |:---|:---|:---|
-| `bandpass_windows` | {fast (0.5–2.0), medium (0.1–1.0), slow (0.05–0.5)} Hz | 248–252 |
-| `bandpass_order` | 4 | 253 |
-| `n_svd_components_stage4` | 300 | 254 |
-| `corr_neighbor_radius_inner` / `_outer` | 6 / 15 px | 255–256 |
-| `corr_contrast_threshold` | 0.10 | 257 |
-| `stage4_min_area` / `_max_area` | 80 / 350 px | 258–259 |
-| `stage4_min_solidity` | 0.60 | 260 |
-| `stage4_max_eccentricity` | 0.85 | 261 |
-| `stage4_iou_merge_threshold` | 0.3 | 262 |
-| `stage4_pixel_chunk_rows` | 16 | 263 |
-| `stage4_n_workers` | 3 | 264 |
-| `gate4_min_corr_contrast` | 0.10 | 270 |
-| `gate4_max_motion_corr` | 0.3 | 271 |
-| `gate4_anticorr_threshold` | $-0.5$ | 272 |
-| `gate4_min_mean_intensity_pct` | 25 | 273 |
-| `gate4_spatial_radius` | 20 px | 274 |
+| `bandpass_windows` | {fast (0.5–2.0), medium (0.1–1.0), slow (0.05–0.5)} Hz | 360–364 |
+| `bandpass_order` | 4 | 365 |
+| `n_svd_components_stage4` | 300 | 366 |
+| `corr_neighbor_radius_inner` / `_outer` | 6 / 15 px | 367–368 |
+| `corr_contrast_threshold` | 0.10 | 369 |
+| `stage4_min_area` / `_max_area` | 80 / 350 px | 370–371 |
+| `stage4_min_solidity` | 0.60 | 372 |
+| `stage4_max_eccentricity` | 0.85 | 373 |
+| `stage4_iou_merge_threshold` | 0.3 | 374 |
+| `stage4_pixel_chunk_rows` | 16 | 375 |
+| `stage4_n_workers` | 3 | 376 |
+| `gate4_min_corr_contrast` | 0.10 | 382 |
+| `gate4_max_motion_corr` | 0.3 | 383 |
+| `gate4_anticorr_threshold` | $-0.5$ | 384 |
+| `gate4_min_mean_intensity_pct` | 25 | 385 |
+| `gate4_spatial_radius` | 20 px | 386 |
 
 ### Classification / neuropil
 
 | parameter | default | line |
 |:---|:---|:---|
-| `neuropil_coeff` | 0.7 | 187 |
-| `neuropil_inner_buffer` / `_outer_radius` | 2 / 15 px | 188–189 |
-| `baseline_window_s` | 60.0 s | 190 |
-| `baseline_percentile` | 10 | 191 |
-| `tonic_baseline_window_s` | 120.0 s | 192 |
-| `phasic_min_transients` | 5 | 195 |
-| `phasic_min_skew` | 0.5 | 196 |
-| `sparse_min_transients` | 1 | 197 |
-| `sparse_min_skew` | 0.3 | 198 |
-| `tonic_bp_std_factor` | 2.0 | 199 |
+| `neuropil_coeff` | 0.7 | 294 |
+| `neuropil_inner_buffer` / `_outer_radius` | 2 / 15 px | 295–296 |
+| `baseline_window_s` | 60.0 s | 297 |
+| `baseline_percentile` | 10 | 298 |
+| `tonic_baseline_window_s` | 120.0 s | 299 |
+| `phasic_min_transients` | 5 | 302 |
+| `phasic_min_skew` | 0.5 | 303 |
+| `sparse_min_transients` | 1 | 304 |
+| `sparse_min_skew` | 0.3 | 305 |
+| `tonic_bp_std_factor` | 2.0 | 306 |
 
 ### Registry
 
@@ -1583,6 +1779,33 @@ Every parameter below is a field of `PipelineConfig`
 | ROICaT alignment method | `RoMa` | `roicat_adapter.py` |
 | ROICaT sequential-Hungarian cost | 0.6 | `roicat_adapter.py` |
 | ROICaT ROI-FOV mixing factor | 0.5 | `roicat_adapter.py` |
+
+---
+
+## Appendix A — Decision record (alternatives considered)
+
+A scannable index of the load-bearing algorithmic choices: what was chosen, what was
+rejected, why, and where to verify. The inline **Design rationale** notes in each
+section expand these.
+
+| Stage | Choice made | Alternatives rejected | Why | Evidence |
+|:---|:---|:---|:---|:---|
+| MC | Suite2p `phasecorr`, tuned `[64,64]`+`1Preg` | stock `[128,128]`/no-`1Preg`; `rowwise-pcc`; SIMA `legacy`; NoRMCorre | tuned reaches ~103 % legacy cell-sharpness vs 58 %; robust on dim frames; reuses Suite2p's detection pass | `types.py:210,238-257`; `docs/foundation-preprocessing.md` §5 |
+| MC | `rowwise-pcc` kept opt-in | make it the default | 10–14× faster but regresses edge anisotropy on dim data | `types.py:196-202`; `registration.py` |
+| Background | direct truncated-SVD L+S (default) | robust-PCA / PCP (nuclear-norm) — now available opt-in via `background_method="rpca"` | SVD is cheap/tuning-free default; robust PCP added to stop bright-source absorption, opt-in pending held-out A/B | §2.3; Candès 2011 |
+| Background | seeded `svd_lowrank` | unseeded randomised SVD | unseeded subspace drifts run-to-run, shifting borderline detections | §2.2 |
+| Residual | virtual `ResidualView` | dense `residual_S*.dat` memmaps | dense chain hit 40–60 GB → `SIGBUS` on full disk | §2.3, §5.3; `residual.py` |
+| Stage 1 | Cellpose 3, dual-channel, runs first | Suite2p-only; watershed / StarDist; single-channel | finds silent somata by morphology; dual channel maximises recall; CP3 fine-tuned on GRIN | §3.1; Stringer 2021 |
+| Stage 1 | raise on unresolvable model | silent `cyto3` fallback | fallback would run the wrong model unnoticed | `stage1.py:40-76` |
+| Subtraction | simultaneous ridge solve | sequential per-ROI; unregularised LS; blanket NNLS | de-mixes overlaps in one shot; ridge conditions near-collinear profiles | §5.2 |
+| Subtraction | profile source `std_S` | spec's $\mu_t[S]$ | $\mu_t[S]\approx 0$ under SVD L+S — no spatial structure | §5.1 |
+| Subtraction | one-sided Huber IRLS (opt-in) | symmetric robust loss; always-on | errors are asymmetric (positive ghosts); robust path is slower, only pays off on outliers | §5.2.1 |
+| Stage 2 | reuse cached Suite2p outputs | re-run Suite2p | avoids doubling the costliest foundation step | §6.1 |
+| Stage 3 | FFT matched-filter bank, keyed on fs+τ, $L_2$-normalised | per-pixel OASIS; single template | optimal known-waveform detector; one global threshold across the bank | §8.1 |
+| Stage 3 | global per-pixel MAD | spec's sliding-window $\sigma_\text{local}$ | saves ~300 MB/chunk; template matching absorbs non-stationarity | §8.2 |
+| Stage 4 | bandpass correlation-contrast | variance / transient detectors | tonic cells have neither variance nor discrete events; local coherence is the only signature | §10 |
+| Stage 4 | shared-edge temporal compression | SVD / PCA compression | preserves pairwise correlations exactly (orthogonal projection) | §10.3 |
+| Gate 4 | no accept tier; raw-trace motion check; `mean_M` floor | auto-accept; bandpass motion check; `mean_S` floor | tonic signal is subtle (HITL-only); motion is broadband; `mean_S≈0` | §11 |
 
 ---
 

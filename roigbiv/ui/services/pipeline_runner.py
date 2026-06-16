@@ -114,7 +114,6 @@ class PipelineRunner:
         self._error: Optional[str] = None
         self._results: list[FOVRunResult] = []
         self._registry_config: Optional[RegistryConfig] = None
-        self._slack_channel: Optional[str] = None
         self._current_stage: Optional[str] = None
         self._last_accessed: float = time.monotonic()
 
@@ -124,7 +123,6 @@ class PipelineRunner:
         workspace: WorkspacePaths,
         overrides: dict,
         registry_config: Optional[RegistryConfig] = None,
-        slack_channel: Optional[str] = None,
         selected_tifs: Optional[Sequence[Path]] = None,
     ) -> bool | str:
         """Kick off a run.
@@ -132,10 +130,6 @@ class PipelineRunner:
         Pass ``registry_config`` (from :attr:`AppState.registry_config`) so the
         pipeline never reads ``os.environ`` for registry paths, enabling safe
         concurrent sessions on different workspaces.
-
-        Pass ``slack_channel`` (a Slack channel ID) to post a run summary +
-        overlay PNGs when the batch finishes; the bot token is read from
-        ``ROIGBIV_SLACK_TOKEN`` in the environment that launched the UI.
 
         Returns:
           True    — run started successfully.
@@ -152,7 +146,6 @@ class PipelineRunner:
                     return False
                 self._reset_locked()
                 self._registry_config = registry_config
-                self._slack_channel = slack_channel
                 self._active = True
                 self._started_at = time.time()
                 self._n_fovs = (len(selected_tifs) if selected_tifs is not None
@@ -235,70 +228,6 @@ class PipelineRunner:
                 self._active = False
         finally:
             self._gate.release()
-        # Post-run Slack notification (network + disk only; GPU gate already
-        # released so it never blocks another session's pipeline).
-        self._maybe_post_slack(results, overrides)
-
-    def _maybe_post_slack(self, results: list[FOVRunResult], overrides: dict) -> None:
-        """Render overlays + post a summary to Slack if a channel was set.
-
-        ``run_with_workspace`` does not render overlays (the CLI does this in
-        ``run.py::_run_workspace``), so we render here to have an image to
-        upload, then map each :class:`FOVRunResult` to the
-        :class:`~roigbiv.pipeline._email.EmailFOVResult` the notifier consumes.
-        Failures are surfaced as a single log line — never raised.
-        """
-        import os
-        from pathlib import Path
-
-        channel = self._slack_channel
-        if not channel or not results:
-            return
-        if not os.environ.get("ROIGBIV_SLACK_TOKEN"):
-            self._log("Slack: ROIGBIV_SLACK_TOKEN not set in the UI's "
-                      "environment; skipping notification.")
-            return
-
-        from roigbiv import overlay as _overlay
-        from roigbiv.pipeline._email import EmailFOVResult
-        from roigbiv.pipeline._slack import SlackParams, send_slack
-
-        model_name = Path(overrides.get("cellpose_model", "")).name
-        for r in results:
-            if r.error is not None or r.fov is None or r.png_path is not None:
-                continue
-            fov_stem = r.tif.stem.replace("_mc", "")
-            try:
-                r.png_path = _overlay.render_overlay(
-                    fov=r.fov, output_dir=r.output_dir,
-                    model_name=model_name, fov_stem=fov_stem,
-                )
-            except BaseException as exc:  # noqa: BLE001
-                self._log(f"Slack: overlay render failed for {fov_stem}: {exc}")
-
-        summary = {
-            "model_name": model_name,
-            "fs": overrides.get("fs", "?"),
-            "tau": overrides.get("tau", "?"),
-            "flow_threshold": overrides.get("flow_threshold", "?"),
-            "stage_flags": {
-                2: overrides.get("enable_stage_2"),
-                3: overrides.get("enable_stage_3"),
-                4: overrides.get("enable_stage_4"),
-            },
-        }
-        slack_results = [
-            EmailFOVResult(
-                tif=r.tif, output_dir=r.output_dir, duration_s=r.duration_s,
-                error=r.error, png_path=r.png_path,
-                roi_counts=r.roi_counts or {"accept": 0, "flag": 0, "reject": 0},
-            )
-            for r in results
-        ]
-        params = SlackParams(channel=channel, token_env="ROIGBIV_SLACK_TOKEN")
-        ok = send_slack(slack_results, params, summary)
-        self._log("Slack: summary + overlays posted." if ok else
-                  "Slack FAILED — see server logs; overlays remain on disk.")
 
     def _append_and_tally(self, line: str) -> None:
         """Log callback that also counts completed FOVs and tracks the stage.

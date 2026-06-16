@@ -4,12 +4,28 @@ All notable changes to roigbiv are documented here.
 
 ## Unreleased
 
+### Removed
+
+- **Email and Slack notifications removed entirely.** Dropped the
+  `roigbiv/pipeline/_email.py` and `_slack.py` modules, the
+  `test_pipeline_email.py` / `test_pipeline_slack.py` suites,
+  `scripts/verify_email_smoke.py`, and the `docs/email-notifications.md`
+  / `docs/slack-notifications.md` guides. **Breaking CLI change:** the
+  `--email-to`, `--smtp-host`, `--smtp-port`, `--smtp-user`,
+  `--smtp-password-env`, `--no-email`, `--slack-channel`,
+  `--slack-token-env`, and `--no-slack` flags are gone, as are exit codes
+  `3` (SMTP failure) and `4` (Slack failure) — `roigbiv-pipeline` now
+  returns only `0` (success), `1` (all FOVs failed), or `2` (bad input).
+  The UI's "Notifications" card (Slack channel field) is removed. Overlay
+  PNGs and all other outputs are unaffected. `fmt_duration` moved from
+  `_email.py` to `roigbiv/pipeline/fmt.py`.
+
 ### Changed
 
 - **Overlay PNG draws every ROI by default.** `roigbiv/overlay.py`
   previously skipped `reject` ROIs silently; now `accept` (green),
   `flag` (orange), and `reject` (red) are all drawn, so gate-discard
-  issues surface in the email overlay without opening napari. The
+  issues surface in the overlay without opening napari. The
   annotation block always reports `N accept | N flag | N reject`.
   New `--overlay-outcomes` CLI flag (default `accept,flag,reject`)
   re-narrows the view; e.g. `--overlay-outcomes accept` for an

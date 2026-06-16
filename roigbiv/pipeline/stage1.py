@@ -22,8 +22,30 @@ from typing import Optional
 
 import numpy as np
 
-from roigbiv.pipeline.device import cuda_compute_capable
+from roigbiv.pipeline.device import cuda_unavailable_reason
 from roigbiv.pipeline.types import PipelineConfig
+
+
+def _cuda_fallback_message(reason: str) -> str:
+    """Accurate CPU-fallback diagnostic keyed by the device probe reason."""
+    if reason == "oom":
+        return (
+            "GPU present but out of VRAM (another process is holding it); "
+            "falling back to CPU for Cellpose. Free the GPU (e.g. unload the "
+            "local-Qwen model) or rerun — the pipeline's GPU preflight "
+            "(gpuguard) normally does this automatically."
+        )
+    if reason == "sm_mismatch":
+        return (
+            "CUDA device detected but the PyTorch build lacks kernels for this "
+            "GPU's compute capability (sm/CC mismatch); falling back to CPU for "
+            "Cellpose. Install a torch build that targets this GPU."
+        )
+    if reason == "no_cuda":
+        return "No usable CUDA device; running Cellpose on CPU."
+    return (
+        f"CUDA compute probe failed ({reason}); falling back to CPU for Cellpose."
+    )
 
 
 _BASE_DIR: Path = Path(__file__).resolve().parents[2]
@@ -193,11 +215,17 @@ def _estimate_diameter_px(
 
 
 def run_cellpose_detection(
-    mean_S: np.ndarray,
+    morph_channel: np.ndarray,
     vcorr_S: np.ndarray,
     cfg: PipelineConfig,
 ) -> tuple[list[np.ndarray], list[float], np.ndarray, np.ndarray]:
-    """Run Cellpose inference on a dual-channel (mean_S, vcorr_S) stack.
+    """Run Cellpose inference on a dual-channel (morphology, vcorr_S) stack.
+
+    ``morph_channel`` is the morphological channel. The live pipeline passes
+    ``fov.mean_M`` (the raw registered-movie mean), NOT ``mean_S``: under the
+    default SVD background ``mean_S ≈ 0`` (per-pixel brightness is absorbed into
+    L), so ``mean_M`` carries the contrast Cellpose's training expects. See
+    ``run_pipeline`` (roigbiv/pipeline/run.py).
 
     Returns
     -------
@@ -210,16 +238,13 @@ def run_cellpose_detection(
 
     if cfg.force_cpu:
         gpu = False
-    elif not cuda_compute_capable():
-        print(
-            "  WARNING: CUDA device detected but compute probe failed "
-            "(sm/CC mismatch — PyTorch build lacks kernels for this GPU); "
-            "falling back to CPU for Cellpose.",
-            flush=True,
-        )
-        gpu = False
     else:
-        gpu = True
+        _reason = cuda_unavailable_reason()
+        if _reason is None:
+            gpu = True
+        else:
+            print(f"  WARNING: {_cuda_fallback_message(_reason)}", flush=True)
+            gpu = False
     model_path = _resolve_model_path(cfg.cellpose_model)
 
     # Cellpose 3.x silently constructs a default model when given a missing
@@ -231,23 +256,33 @@ def run_cellpose_detection(
         model = CellposeModel(gpu=gpu, pretrained_model=model_path)
     print(f"  Cellpose model loaded: {model_path}", flush=True)
 
-    # Optionally denoise mean_S
+    # Optionally denoise the morphological channel
     t0 = time.time()
     if cfg.use_denoise:
         try:
-            mean_S_input = denoise_mean_S(mean_S, gpu=gpu)
+            morph_input = denoise_mean_S(morph_channel, gpu=gpu)
             print(f"  Cellpose3 denoise in {time.time()-t0:.2f}s", flush=True)
         except Exception as exc:
-            print(f"  WARNING: Cellpose3 denoise failed ({exc}); using raw mean_S",
+            print(f"  WARNING: Cellpose3 denoise failed ({exc}); using raw morphology channel",
                   flush=True)
-            mean_S_input = mean_S.astype(np.float32)
+            morph_input = morph_channel.astype(np.float32)
     else:
-        mean_S_input = mean_S.astype(np.float32)
+        morph_input = morph_channel.astype(np.float32)
 
-    # Stack channels as (H, W, 2) with mean at channel 0, Vcorr at channel 1.
-    # Cellpose's channels=[1, 2] means "cyto = channel 1, nucleus = channel 2" (1-indexed).
-    H, W = mean_S_input.shape
-    x = np.stack([mean_S_input, vcorr_S.astype(np.float32)], axis=-1)  # (H, W, 2)
+    # Build the Cellpose input. Two modes, selected by cfg.channels:
+    #   dual-channel (1, 2): morphology at ch0, Vcorr at ch1 — the GRIN default;
+    #     Cellpose reads Vcorr as a "nucleus" stain to recover dim-but-active cells.
+    #   single-channel (0, 0): morphology only. On dim/diffuse PRISM FOVs the Vcorr
+    #     nucleus channel actively SUPPRESSES segmentation (Phase-A isolation: cyto3
+    #     0→13 by dropping it), so PRISM/generic profiles run single-channel.
+    H, W = morph_input.shape
+    single_channel = tuple(cfg.channels)[1] == 0
+    if single_channel:
+        x = morph_input.astype(np.float32)                                # (H, W)
+        channel_axis = None
+    else:
+        x = np.stack([morph_input, vcorr_S.astype(np.float32)], axis=-1)  # (H, W, 2)
+        channel_axis = -1
 
     # Diameter auto-calibration: peak-detection + Otsu sizing on the mean
     # channel produces a robust per-FOV cell-scale estimate. Replaces
@@ -258,7 +293,7 @@ def run_cellpose_detection(
     effective_diameter = cfg.diameter
     if cfg.diameter_auto:
         t_cal = time.time()
-        d_est = _estimate_diameter_px(mean_S_input)
+        d_est = _estimate_diameter_px(morph_input)
         if d_est is not None and d_est > 4.0:
             effective_diameter = int(round(d_est))
             print(
@@ -281,7 +316,7 @@ def run_cellpose_detection(
         cellprob_threshold=cfg.cellprob_threshold,
         flow_threshold=cfg.flow_threshold,
         channels=list(cfg.channels),
-        channel_axis=-1,
+        channel_axis=channel_axis,
         normalize={"tile_norm_blocksize": cfg.tile_norm_blocksize},
     )
     print(f"  Cellpose inference in {time.time()-t0:.2f}s", flush=True)

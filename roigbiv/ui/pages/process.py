@@ -207,22 +207,16 @@ def _params_form(diameter_default: int = 12) -> html.Div:
         ),
         html.Hr(className="my-2"),
         _switch_row(
-            dbc.Switch(id="roigbiv-param-stage-2",
-                       label="Stage 2 — Temporal Detection (Suite2p)",
-                       value=True),
-            "roigbiv-param-stage-2",
+            dbc.Switch(id="roigbiv-param-cv-only",
+                       label="CV-only — computer-vision detection (Stage 1 only)",
+                       value=False),
+            "roigbiv-param-cv-only",
         ),
-        _switch_row(
-            dbc.Switch(id="roigbiv-param-stage-3",
-                       label="Stage 3 — Template Sweep",
-                       value=True),
-            "roigbiv-param-stage-3",
-        ),
-        _switch_row(
-            dbc.Switch(id="roigbiv-param-stage-4",
-                       label="Stage 4 — Tonic Search",
-                       value=True),
-            "roigbiv-param-stage-4",
+        html.Small(
+            "Foundation + Stage 1 (Cellpose) + Gate 1 + traces/QC; forces the "
+            "temporal stages 2-4 off. Unlike Scout this is analysis-grade and "
+            "resumable into the full pipeline later. The barebones CV path.",
+            className="text-muted d-block ms-4 mb-2",
         ),
         html.Hr(className="my-2"),
         _switch_row(
@@ -230,48 +224,118 @@ def _params_form(diameter_default: int = 12) -> html.Div:
             "roigbiv-param-resume",
         ),
     ])
-    notifications = _stage_card("Notifications", [
-        _field_row("Slack channel ID", "roigbiv-param-slack-channel",
-                   dbc.Input(id="roigbiv-param-slack-channel", type="text",
-                             placeholder="C0123ABCD (optional)")),
-        html.Small(
-            "Posts a run summary + overlay PNGs to this Slack channel when the "
-            "run finishes. Requires ROIGBIV_SLACK_TOKEN exported in the "
-            "environment that launched roigbiv-ui. See "
-            "docs/slack-notifications.md.",
-            id="roigbiv-param-slack-channel-help",
-            className="text-muted d-block mt-1",
-        ),
-    ])
-    return html.Div([foundation, stage1, stage_control, notifications])
+    # Advanced — the full sequential subtractive pipeline's temporal stages and
+    # the alternative (RPCA) background separation. Default-collapsed so the
+    # barebones CV path (Foundation + Stage 1) is the front-and-center surface;
+    # nothing here is removed, just tucked away.
+    advanced = dbc.Accordion(
+        start_collapsed=True,
+        flush=True,
+        className="mb-3",
+        children=[dbc.AccordionItem(
+            title="Advanced (legacy pipeline)",
+            children=[
+                _field_row("Background method", "roigbiv-param-bg-method",
+                           dbc.Select(
+                               id="roigbiv-param-bg-method",
+                               options=[
+                                   {"label": "Truncated SVD (default)", "value": "svd"},
+                                   {"label": "Robust PCA (L+S)", "value": "rpca"},
+                               ],
+                               value="svd",
+                           )),
+                html.Div(
+                    id="roigbiv-param-rpca-section",
+                    style={"display": "none"},
+                    children=[
+                        html.Small(
+                            "RPCA parameters (ignored when SVD is selected). Leave "
+                            "λ / binning blank to auto-tune; binning auto-shrinks to "
+                            "fit GPU memory on large FOVs.",
+                            className="text-muted d-block mb-2",
+                        ),
+                        _field_row("rpca max_rank", "roigbiv-param-rpca-max-rank",
+                                   dbc.Input(id="roigbiv-param-rpca-max-rank",
+                                             type="number", value=30, step=1, min=1)),
+                        _field_row("rpca max_iter", "roigbiv-param-rpca-max-iter",
+                                   dbc.Input(id="roigbiv-param-rpca-max-iter",
+                                             type="number", value=100, step=1, min=1)),
+                        _field_row("rpca tol", "roigbiv-param-rpca-tol",
+                                   dbc.Input(id="roigbiv-param-rpca-tol",
+                                             type="number", value=1e-3, step=1e-4,
+                                             min=1e-6)),
+                        _field_row("rpca λ (sparsity)", "roigbiv-param-rpca-lambda",
+                                   dbc.Input(id="roigbiv-param-rpca-lambda",
+                                             type="number", placeholder="Auto",
+                                             step=1e-3, min=0.0)),
+                        _field_row("rpca binning (frames)",
+                                   "roigbiv-param-rpca-bin-frames",
+                                   dbc.Input(id="roigbiv-param-rpca-bin-frames",
+                                             type="number", placeholder="Auto",
+                                             step=100, min=1)),
+                    ],
+                ),
+                html.Hr(className="my-2"),
+                html.Small(
+                    "Temporal detection stages of the sequential subtractive "
+                    "pipeline. Disabled (and ignored) under Scout, Foundation-only, "
+                    "or CV-only.",
+                    className="text-muted d-block mb-2",
+                ),
+                _switch_row(
+                    dbc.Switch(id="roigbiv-param-stage-2",
+                               label="Stage 2 — Temporal Detection (Suite2p)",
+                               value=True),
+                    "roigbiv-param-stage-2",
+                ),
+                _switch_row(
+                    dbc.Switch(id="roigbiv-param-stage-3",
+                               label="Stage 3 — Template Sweep",
+                               value=True),
+                    "roigbiv-param-stage-3",
+                ),
+                _switch_row(
+                    dbc.Switch(id="roigbiv-param-stage-4",
+                               label="Stage 4 — Tonic Search",
+                               value=True),
+                    "roigbiv-param-stage-4",
+                ),
+            ],
+        )],
+    )
+    return html.Div([foundation, stage1, stage_control, advanced])
 
 
-def _stage_control_reactivity(scout, foundation_only) -> tuple:
+def _stage_control_reactivity(scout, foundation_only, cv_only) -> tuple:
     """Form state mirroring ``_on_run``'s early-stop precedence.
 
-    Scout and Foundation-only both override the downstream stages; **scout takes
-    precedence over foundation-only** (it stops even earlier). Returns, in the
-    order the ``_sync_stage_controls`` callback emits them::
+    Precedence (each stops/forces more than the next): **scout > foundation-only
+    > cv-only**. Scout and foundation-only stop early; cv-only forces stages 2-4
+    off but keeps the full Foundation summaries + trace/QC (and stays resumable).
+    Returns, in the order the ``_sync_stage_controls`` callback emits them::
 
-        (fo_disabled,
+        (fo_disabled, cv_disabled,
          s2_disabled, s2_value, s3_disabled, s3_value, s4_disabled, s4_value,
          resume_disabled, resume_value)
 
-    Under an early-stop mode the stage 2/3/4 + resume switches go off+disabled;
-    otherwise they restore to their on-defaults (resume default is off). The
-    foundation-only switch is greyed (not unchecked) under scout — its ``value``
-    must stay an Input-only of the callback or Dash flags a circular dependency;
-    ``_on_run`` already forces it off under scout, so the run stays correct.
+    All three modes grey+uncheck the stage 2/3/4 switches. Only scout /
+    foundation-only disable resume — cv-only is resumable. The foundation-only
+    and cv-only switches are greyed (not unchecked) by higher-precedence modes;
+    their ``value`` stays Input-only or Dash flags a circular dependency, and
+    ``_on_run`` already enforces the precedence so the run stays correct.
     """
     scout_on = bool(scout)
     foundation_only_on = bool(foundation_only) and not scout_on
-    early_stop = scout_on or foundation_only_on
+    cv_only_on = bool(cv_only) and not scout_on and not foundation_only_on
+    stages_off = scout_on or foundation_only_on or cv_only_on
+    resume_locked = scout_on or foundation_only_on
     return (
-        scout_on,
-        early_stop, not early_stop,
-        early_stop, not early_stop,
-        early_stop, not early_stop,
-        early_stop, False,
+        scout_on,                       # fo greyed under scout
+        scout_on or foundation_only_on,  # cv greyed under scout / foundation-only
+        stages_off, not stages_off,
+        stages_off, not stages_off,
+        stages_off, not stages_off,
+        resume_locked, False,
     )
 
 
@@ -602,20 +666,28 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-param-k", "value"),
         State("roigbiv-param-model", "value"),
         State("roigbiv-param-mc-backend", "value"),
+        State("roigbiv-param-bg-method", "value"),
+        State("roigbiv-param-rpca-max-rank", "value"),
+        State("roigbiv-param-rpca-max-iter", "value"),
+        State("roigbiv-param-rpca-tol", "value"),
+        State("roigbiv-param-rpca-lambda", "value"),
+        State("roigbiv-param-rpca-bin-frames", "value"),
         State("roigbiv-param-flow-threshold", "value"),
         State("roigbiv-param-diameter", "value"),
         State("roigbiv-param-scout", "value"),
         State("roigbiv-param-foundation-only", "value"),
+        State("roigbiv-param-cv-only", "value"),
         State("roigbiv-param-stage-2", "value"),
         State("roigbiv-param-stage-3", "value"),
         State("roigbiv-param-stage-4", "value"),
         State("roigbiv-param-resume", "value"),
-        State("roigbiv-param-slack-channel", "value"),
         prevent_initial_call=True,
     )
-    def _on_run(_n: int, fs, tau, k, model, mc_backend, flow_threshold,
-                diameter, scout, foundation_only, stage_2, stage_3, stage_4,
-                resume, slack_channel):
+    def _on_run(_n: int, fs, tau, k, model, mc_backend,
+                bg_method, rpca_max_rank, rpca_max_iter, rpca_tol,
+                rpca_lambda, rpca_bin_frames, flow_threshold,
+                diameter, scout, foundation_only, cv_only, stage_2, stage_3,
+                stage_4, resume):
         state = get_app_state()
         if state.workspace is None:
             return True, dbc.Alert("Scan a workspace first.", color="warning")
@@ -628,30 +700,50 @@ def register_callbacks(app: dash.Dash) -> None:
         # precedence if both are toggled (it stops even earlier).
         foundation_only_on = bool(foundation_only) and not scout_on
         early_stop = scout_on or foundation_only_on
+        # CV-only forces stages 2-4 off (like early-stop modes) but keeps the
+        # full Foundation summaries + trace/QC and stays resumable. Lowest
+        # precedence: ignored if scout or foundation-only is on.
+        cv_only_on = bool(cv_only) and not early_stop
+        stages_off = early_stop or cv_only_on
+        # Background method + RPCA knobs. Only forward values the user set so
+        # PipelineConfig defaults hold otherwise (mirrors the CLI's
+        # _collect_background_overrides None-filter); svd is byte-identical to
+        # today, so this whole block is inert unless RPCA is chosen.
+        bg_overrides = {"background_method": bg_method or "svd"}
+        for key, value, cast in (
+            ("rpca_max_rank", rpca_max_rank, int),
+            ("rpca_max_iter", rpca_max_iter, int),
+            ("rpca_tol", rpca_tol, float),
+            ("rpca_lambda", rpca_lambda, float),
+            ("rpca_bin_frames", rpca_bin_frames, int),
+        ):
+            if value is not None and value != "":
+                bg_overrides[key] = cast(value)
         overrides = {
             "fs": float(fs or 7.5),
             "tau": float(tau or 1.0),
             "k_background": int(k or 30),
             "cellpose_model": model or "models/deployed/current_model",
             "motion_correction_backend": mc_backend or "phasecorr",
+            **bg_overrides,
             "flow_threshold": float(flow_threshold if flow_threshold is not None else 0.4),
             # Diameter chosen on the MC preview (+ diameter_auto forced off).
             **_diameter_overrides(state.calibrated_diameter(), diameter),
             "scout_mode": scout_on,
             "foundation_only": foundation_only_on,
-            # Scout / foundation-only stop early; the stage toggles are ignored
-            # when either is on, and a foundation-only dry run is not resumable.
-            "enable_stage_2": False if early_stop else (True if stage_2 is None else bool(stage_2)),
-            "enable_stage_3": False if early_stop else (True if stage_3 is None else bool(stage_3)),
-            "enable_stage_4": False if early_stop else (True if stage_4 is None else bool(stage_4)),
+            "cv_only": cv_only_on,
+            # Scout / foundation-only / cv-only all force stages 2-4 off; the
+            # stage toggles are ignored when any is on. Scout and foundation-only
+            # are not resumable; cv-only is (it keeps the manifest + summaries).
+            "enable_stage_2": False if stages_off else (True if stage_2 is None else bool(stage_2)),
+            "enable_stage_3": False if stages_off else (True if stage_3 is None else bool(stage_3)),
+            "enable_stage_4": False if stages_off else (True if stage_4 is None else bool(stage_4)),
             "resume": False if (resume is None or early_stop) else bool(resume),
         }
         runner = get_pipeline_runner()
-        slack_channel = (slack_channel or "").strip() or None
         selected_paths = _selected_run_paths(state.workspace, selected)
         result = runner.start(state.workspace, overrides,
                               registry_config=state.registry_config,
-                              slack_channel=slack_channel,
                               selected_tifs=selected_paths)
         if result == "busy":
             return False, dbc.Alert(
@@ -666,6 +758,14 @@ def register_callbacks(app: dash.Dash) -> None:
         # Seed the banner from the fresh snapshot (current_stage = Foundation);
         # the interval tick takes over from here.
         return False, _render_banner(runner.snapshot())
+
+    @app.callback(
+        Output("roigbiv-param-rpca-section", "style"),
+        Input("roigbiv-param-bg-method", "value"),
+    )
+    def _toggle_rpca_section(bg_method):
+        """Reveal the RPCA advanced params only when RPCA is selected."""
+        return {} if bg_method == "rpca" else {"display": "none"}
 
     @app.callback(
         Output("roigbiv-run-log", "children"),
@@ -800,6 +900,7 @@ def register_callbacks(app: dash.Dash) -> None:
 
     @app.callback(
         Output("roigbiv-param-foundation-only", "disabled"),
+        Output("roigbiv-param-cv-only", "disabled"),
         Output("roigbiv-param-stage-2", "disabled"),
         Output("roigbiv-param-stage-2", "value"),
         Output("roigbiv-param-stage-3", "disabled"),
@@ -810,14 +911,16 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-param-resume", "value"),
         Input("roigbiv-param-scout", "value"),
         Input("roigbiv-param-foundation-only", "value"),
+        Input("roigbiv-param-cv-only", "value"),
         prevent_initial_call=True,
     )
-    def _sync_stage_controls(scout, foundation_only):
+    def _sync_stage_controls(scout, foundation_only, cv_only):
         # Make the form visibly mirror what _on_run already enforces: scout /
-        # foundation-only override the downstream stages (scout precedence).
-        # foundation-only.value is Input-only here — never an Output of this
-        # callback — or Dash raises a circular dependency.
-        return _stage_control_reactivity(scout, foundation_only)
+        # foundation-only / cv-only override the downstream stages (precedence
+        # scout > foundation-only > cv-only). foundation-only.value and
+        # cv-only.value are Input-only here — never Outputs of this callback —
+        # or Dash raises a circular dependency.
+        return _stage_control_reactivity(scout, foundation_only, cv_only)
 
 
 # ── rendering helpers ──────────────────────────────────────────────────────

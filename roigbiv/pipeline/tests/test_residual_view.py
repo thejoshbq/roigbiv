@@ -149,3 +149,43 @@ def test_from_dense_with_layer_matches_oracle():
 
     view = ResidualView.from_dense(dense).with_source(flat_idx, W_design, traces)
     assert np.allclose(view.read_chunk(0, T), oracle, rtol=RTOL, atol=ATOL)
+
+
+def test_rpca_factors_roundtrip_contract():
+    """Factors from ``rpca._factor_from_robust_L`` round-trip through the view.
+
+    Proves the RPCA background path emits ``svd_factors.npz`` in a byte-compatible
+    format: the ResidualView reconstructs ``M − L`` identically whether built from
+    the in-memory factors (``from_factors``) or from a saved/reloaded npz
+    (``from_foundation``), matching a dense ``M − L`` oracle.
+    """
+    from roigbiv.pipeline import rpca
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        rng = np.random.RandomState(5)
+        movie = rng.randint(0, 500, size=(T, LY, LX)).astype(np.int16)
+        data_bin = td / "data.bin"
+        movie.tofile(str(data_bin))
+
+        # A genuinely low-rank L over the binned grid (bin_size = 1 ⇒ T_bin = T).
+        L_bin = (rng.randn(T, 3) @ rng.randn(3, N_PIX)).astype(np.float32)
+        U, S, V_bin = rpca._factor_from_robust_L(L_bin, n_svd=N_SVD, force_cpu=True)
+        bin_size = 1
+
+        US_k = (U[:, :K] * S[:K][None, :]).astype(np.float32)
+        L_full = V_bin[:, :K] @ US_k.T                      # (T, N_pix)
+        M = movie.reshape(T, N_PIX).astype(np.float32)
+        oracle = (M - L_full).reshape(T, LY, LX)
+
+        view = ResidualView.from_factors(
+            data_bin, U, S, V_bin, bin_size, (T, LY, LX), K,
+        )
+        assert np.allclose(view.read_chunk(0, T), oracle, rtol=RTOL, atol=ATOL)
+
+        svd_path = td / "svd_factors.npz"
+        np.savez(str(svd_path), U=U, S=S, V_bin=V_bin,
+                 bin_size=np.int32(bin_size), T=np.int32(T))
+        view2 = ResidualView.from_foundation(data_bin, svd_path, (T, LY, LX), K)
+        assert np.allclose(view2.read_chunk(0, T), oracle, rtol=RTOL, atol=ATOL)
+        assert np.allclose(view2.read_rows(0, LY), oracle, rtol=RTOL, atol=ATOL)

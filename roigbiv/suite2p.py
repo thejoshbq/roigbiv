@@ -16,10 +16,37 @@ Motion correction: controlled by ``do_registration``. Set False (default) for
 pre-corrected (*_mc.tif) stacks. The parameter is scaffolded so it can be
 toggled per-dataset without changing any other code.
 """
+import contextlib
 import os
 import shutil
 import time
+import warnings
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def _suppress_tifffile_uic_divide():
+    """Silence the benign ``invalid value encountered in divide`` RuntimeWarning.
+
+    Suite2p reads the input TIFF via tifffile; upstream PrairieView/Bruker stacks
+    carry a malformed MetaMorph/UIC RATIONAL tag (0 denominator) that yields a
+    ``0/0 = NaN`` during metadata parse (``tifffile.read_uic_tag``). The NaN lives
+    only in metadata and is never consumed — ``fs``/``tau`` come from
+    ``PipelineConfig`` and ``Ly``/``Lx``/``meanImg`` from Suite2p's own pixel pass
+    — so the warning is pure log noise.
+
+    Scoped tightly (tifffile-origin RuntimeWarning, this exact message) so genuine
+    Suite2p numerical warnings still surface. Mirrors the assembly-time
+    suppression in ``roigbiv.io`` (PrairieView OME-TIFF assembly).
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+            module="tifffile",
+        )
+        yield
 
 
 def _build_ops(input_dir, fs: float, tau: float = 1.0,
@@ -186,7 +213,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                          spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
         ops["tiff_list"] = [str(local_tif)]
-        run_s2p(ops=ops)
+        with _suppress_tifffile_uic_divide():
+            run_s2p(ops=ops)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:

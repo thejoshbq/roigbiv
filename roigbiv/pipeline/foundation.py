@@ -288,8 +288,11 @@ def _binned_svd_gpu(
         S = S_t.detach().cpu().numpy().astype(np.float32)       # (n_svd,)
         V = V_t.detach().cpu().numpy().astype(np.float32)       # (T_bin, n_svd)
     except (torch.cuda.OutOfMemoryError, RuntimeError):
-        # GPU OOM or unavailable — fall back to CPU. Re-seed since the failed
-        # GPU call already consumed RNG state.
+        # GPU OOM or unavailable — fall back to CPU. Release the GPU cache first
+        # (mirrors the rpca path) and re-seed since the failed GPU call already
+        # consumed RNG state.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         torch.manual_seed(0)
         A = torch.from_numpy(M_bin.T)
         U_t, S_t, V_t = torch.svd_lowrank(A, q=int(n_svd), niter=2)
@@ -363,19 +366,99 @@ def compute_background_separation(
     movie = _open_data_bin(data_bin_path, Ly, Lx)
     T = movie.shape[0]
 
-    # 1. Bin movie
-    t0 = time.time()
-    M_bin, bin_size = _compute_binned_movie(movie, cfg.svd_bin_frames)
-    T_bin = M_bin.shape[0]
-    print(f"  binned movie ({T}→{T_bin} frames, bin_size={bin_size}) "
-          f"in {time.time()-t0:.1f}s", flush=True)
+    method = getattr(cfg, "background_method", "svd")
+    if method == "rpca":
+        # Robust low-rank + sparse background. L stops absorbing localized
+        # bright/tonic somata, so they survive into the residual (mean_S is no
+        # longer ≈ 0). RPCA holds ~5 live copies of the binned matrix, so the
+        # temporal-bin target is sized against *free* GPU memory (large FOVs
+        # would otherwise OOM), then we retry coarser and finally on CPU.
+        import torch
 
-    # 2. SVD on binned
-    t0 = time.time()
-    n_svd = min(cfg.n_svd, T_bin - 1, N_pix - 1)  # svd rank upper bounds
-    U, S, V_bin = _binned_svd_gpu(M_bin, n_svd, force_cpu=cfg.force_cpu)
-    print(f"  SVD top-{n_svd} on binned movie in {time.time()-t0:.1f}s", flush=True)
-    del M_bin  # free ~5 GB
+        from roigbiv.pipeline import rpca
+
+        requested_frames = int(cfg.rpca_bin_frames)
+        free_bytes = rpca.free_gpu_bytes(cfg.force_cpu)
+        target = rpca.estimate_rpca_bin_frames(N_pix, requested_frames, free_bytes)
+        if free_bytes is not None and target < requested_frames:
+            print(f"  RPCA binning capped to {target} frames to fit GPU "
+                  f"(N_pix={N_pix}, free={free_bytes/1e9:.1f} GB; "
+                  f"requested {requested_frames})", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Attempt ladder: GPU at the sized target → GPU coarser → CPU. The
+        # innermost CPU fallback is disabled on the GPU attempts so an OOM
+        # propagates here and we re-bin coarser instead of silently dropping to
+        # a (much slower) CPU run.
+        if cfg.force_cpu:
+            plans = [(target, True)]
+        else:
+            plans = [(target, False),
+                     (max(rpca.MIN_RPCA_FRAMES, target // 2), False),
+                     (target, True)]
+
+        L_bin = bin_size = T_bin = n_svd = None
+        for attempt, (frames, on_cpu) in enumerate(plans):
+            is_last = attempt == len(plans) - 1
+            if on_cpu and not cfg.force_cpu:
+                print("  " + "!" * 64 + "\n"
+                      "  WARN: RPCA did not fit on the GPU after retries; running on\n"
+                      "  CPU. This can take many minutes on large (e.g. 1024×1024)\n"
+                      "  FOVs. Lower --rpca-bin-frames or --rpca-max-rank to stay on\n"
+                      "  the GPU.\n"
+                      "  " + "!" * 64, flush=True)
+            t0 = time.time()
+            M_bin, bin_size = _compute_binned_movie(movie, frames)
+            T_bin = M_bin.shape[0]
+            print(f"  binned movie ({T}→{T_bin} frames, bin_size={bin_size}) "
+                  f"for RPCA{' [CPU]' if on_cpu else ''} in "
+                  f"{time.time()-t0:.1f}s", flush=True)
+            try:
+                L_bin, _S_bin = rpca.robust_lowrank_sparse(
+                    M_bin,
+                    max_rank=int(cfg.rpca_max_rank),
+                    lam=cfg.rpca_lambda,
+                    mu=cfg.rpca_mu,
+                    tol=float(cfg.rpca_tol),
+                    max_iter=int(cfg.rpca_max_iter),
+                    force_cpu=on_cpu,
+                    allow_cpu_fallback=is_last,
+                    method=getattr(cfg, "rpca_method", "ialm"),
+                )
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                del M_bin
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if is_last:
+                    raise
+                print(f"  WARN: RPCA OOM at {T_bin} frames "
+                      f"({type(exc).__name__}); retrying coarser.", flush=True)
+                continue
+            # n_svd ≤ rpca_max_rank: L is rank ≤ max_rank by construction, so we
+            # only need that many factors to represent it exactly.
+            n_svd = min(cfg.n_svd, int(cfg.rpca_max_rank), T_bin - 1, N_pix - 1)
+            del M_bin, _S_bin  # sparse term is implicit in the lazy residual M − L
+            break
+
+        # Factor the robust L into the EXACT _binned_svd_gpu convention so the
+        # svd_factors.npz / ResidualView contract is byte-compatible.
+        U, S, V_bin = rpca._factor_from_robust_L(L_bin, n_svd, force_cpu=cfg.force_cpu)
+        del L_bin
+    else:
+        # 1. Bin movie
+        t0 = time.time()
+        M_bin, bin_size = _compute_binned_movie(movie, cfg.svd_bin_frames)
+        T_bin = M_bin.shape[0]
+        print(f"  binned movie ({T}→{T_bin} frames, bin_size={bin_size}) "
+              f"in {time.time()-t0:.1f}s", flush=True)
+
+        # 2. SVD on binned
+        t0 = time.time()
+        n_svd = min(cfg.n_svd, T_bin - 1, N_pix - 1)  # svd rank upper bounds
+        U, S, V_bin = _binned_svd_gpu(M_bin, n_svd, force_cpu=cfg.force_cpu)
+        print(f"  SVD top-{n_svd} on binned movie in {time.time()-t0:.1f}s", flush=True)
+        del M_bin  # free ~5 GB
 
     # 3. Persist SVD factors — the irreplaceable substrate for on-demand
     #    residual reconstruction (data.bin is the other half). Guard the write:
@@ -750,7 +833,9 @@ def run_foundation(
             motion_x, motion_y, T, Ly, Lx,
         )
 
-    print(fmt.stage_header("F", f"L+S background separation (k={cfg.k_background}, n_svd={cfg.n_svd})"),
+    _bg_method = getattr(cfg, "background_method", "svd")
+    print(fmt.stage_header("F", f"L+S background separation (method={_bg_method}, "
+                           f"k={cfg.k_background}, n_svd={cfg.n_svd})"),
           flush=True)
     residual_view, svd_factors_path, k_used, mean_L = compute_background_separation(
         data_bin_path, ops, cfg, output_dir,
@@ -773,9 +858,12 @@ def run_foundation(
     print(fmt.sub_phase("summary images", time.time() - t0), flush=True)
 
     # Raw movie mean (morphological channel for Cellpose).
-    # With top-k SVD-based L, mean_S ≈ 0 because the first few components
-    # absorb per-pixel brightness. mean_M preserves the raw morphological contrast
-    # that Cellpose's training regime expects (spec §4 "morphological contrast channel").
+    # Under background_method="svd", the top-k components absorb per-pixel
+    # brightness so mean_S ≈ 0; mean_M preserves the raw morphological contrast
+    # Cellpose's training regime expects (spec §4 "morphological contrast
+    # channel"). Under "rpca", mean_S is restored (bright somata are no longer
+    # absorbed into L), but Stage 1 still uses mean_M by design — its input is
+    # intentionally independent of the foundation method.
     mean_M = np.asarray(ops.get("meanImg"), dtype=np.float32)
     if mean_M is None or mean_M.shape != (Ly, Lx):
         # Fallback: reconstruct from data.bin (should rarely be needed)

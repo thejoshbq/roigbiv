@@ -57,3 +57,15 @@ def pipeline_complete(name: str, total_s: float | None = None, width: int = _W) 
         mins, secs = divmod(int(total_s), 60)
         body += f"  [{mins}m {secs:02d}s]" if mins else f"  [{secs}s]"
     return f"\n{rule}\n{body}\n{rule}"
+
+
+def fmt_duration(seconds: float) -> str:
+    """Pretty-print a duration in h/m/s (e.g. ``1h 2m 3s``, ``45s``)."""
+    s = int(round(seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"

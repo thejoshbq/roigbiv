@@ -189,7 +189,7 @@ Then: File → Open image → navigate to `data/annotated/` and pick any `*_mean
 | tifffile | TIFF I/O |
 | cellpose | Base segmentation models and training API |
 | torch (PyTorch) | Deep learning backend |
-| CUDA 11.8+ (optional) | GPU-accelerated training and inference |
+| CUDA 12.8+ / 13.0 (optional) | GPU-accelerated training and inference. RTX 5080 / Blackwell (sm_120) supported via `torch>=2.7` cu128+ wheels (this repo pins the cu130 index in `environment.yml`). |
 
 ---
 

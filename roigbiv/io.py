@@ -38,15 +38,16 @@ _PRAIRIE_FRAME_PATTERN = re.compile(r'_Cycle\d+_Ch\d+_(\d+)\.ome\.tif$')
 
 def _detect_prairie_sessions(root: Path) -> list:
     """
-    Return immediate subdirectories of *root* that look like PrairieView sessions.
+    Return directories that look like PrairieView sessions.
 
-    Detection heuristic: the directory contains ≥2 files whose names match
-    ``*_CycleNNNNN_ChN_NNNNNN.ome.tif``.
+    Detection heuristic: a directory contains ≥2 files whose names match
+    ``*_CycleNNNNN_ChN_NNNNNN.ome.tif``.  Both *root* itself and its immediate
+    subdirectories are considered, so pointing ``--input`` directly at a session
+    directory (frames loose in *root*) is detected as well as the nested layout.
     """
     sessions = []
-    for subdir in sorted(root.iterdir()):
-        if not subdir.is_dir():
-            continue
+    candidates = [root, *sorted(p for p in root.iterdir() if p.is_dir())]
+    for subdir in candidates:
         sample = list(subdir.glob("*.ome.tif"))[:5]
         if len(sample) >= 2 and all(_PRAIRIE_FRAME_PATTERN.search(f.name) for f in sample):
             sessions.append(subdir)
@@ -215,9 +216,20 @@ def discover_tifs(root) -> list:
     for pattern in ("*.tif", "*.tiff", "*.TIF", "*.TIFF"):
         tif_files.update(root.rglob(pattern))
 
-    # Exclude pipeline outputs, staging copies, stacks dir, and prairie frame dirs.
+    # Exclude pipeline outputs, staging copies, stacks dir, and the per-frame
+    # PrairieView files that were assembled above.
     # "inference"/"pipeline" guard the default output tree so an exported
     # {stem}_mc.tif is never re-discovered as a pre-corrected input.
+    # Frame exclusion is pattern-scoped (name matches the Cycle/Ch frame
+    # convention AND the file sits directly in a detected session dir) rather
+    # than by directory containment, so a session detected at *root* itself
+    # doesn't wrongly exclude every other TIF under root.
+    def _is_assembled_frame(p: Path) -> bool:
+        return (
+            p.parent in prairie_frame_dirs
+            and _PRAIRIE_FRAME_PATTERN.search(p.name) is not None
+        )
+
     tif_files = {
         p for p in tif_files
         if "output" not in p.parts
@@ -225,7 +237,7 @@ def discover_tifs(root) -> list:
         and "pipeline" not in p.parts
         and "_stage" not in p.parts
         and "_stacks" not in p.parts
-        and not any(p.is_relative_to(d) for d in prairie_frame_dirs)
+        and not _is_assembled_frame(p)
     }
 
     # Add assembled stacks

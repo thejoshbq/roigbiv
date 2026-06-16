@@ -8,7 +8,7 @@ Stages (see ``docs/roi-pipeline-specification.md``):
 
 Entry points (installed by ``pyproject.toml``):
     roigbiv-pipeline  — run the pipeline on one FOV or a directory
-                        (with optional email-on-done + overlay PNG)
+                        (writes an overlay PNG per FOV)
     roigbiv-ui        — launch the Dash + Plotly web UI
     roigbiv-registry  — cross-session FOV + cell registry CLI
     roigbiv-reingest  — ingest externally-edited ROI masks
