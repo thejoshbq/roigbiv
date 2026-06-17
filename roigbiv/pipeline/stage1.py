@@ -16,6 +16,11 @@ Parameter defaults (spec §18.2, Plan agent D7):
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -192,6 +197,118 @@ def _estimate_diameter_px(
     return float(np.median(diameters))
 
 
+def _effective_diameter(morph_input: np.ndarray, cfg: PipelineConfig) -> int:
+    """Resolve the diameter for inference: cfg.diameter, or a per-image estimate
+    when ``cfg.diameter_auto`` and the estimator succeeds. Backend-agnostic."""
+    effective_diameter = cfg.diameter
+    if cfg.diameter_auto:
+        t_cal = time.time()
+        d_est = _estimate_diameter_px(morph_input)
+        if d_est is not None and d_est > 4.0:
+            effective_diameter = int(round(d_est))
+            print(
+                f"  diameter_auto: image estimate {effective_diameter}px "
+                f"(overriding cfg.diameter={cfg.diameter}) "
+                f"[calibration {time.time()-t_cal:.2f}s]",
+                flush=True,
+            )
+        else:
+            print(
+                f"  WARNING: diameter_auto image estimate failed "
+                f"(d_est={d_est}); keeping cfg.diameter={cfg.diameter}.",
+                flush=True,
+            )
+    return effective_diameter
+
+
+def _split_labels(
+    label_image: np.ndarray, cellprob_map: np.ndarray
+) -> tuple[list[np.ndarray], list[float], np.ndarray, np.ndarray]:
+    """Split a label image into per-ROI boolean masks + per-ROI mean cellprob.
+    Backend-agnostic: identical for the cellpose3 and cpsam paths."""
+    masks_list: list[np.ndarray] = []
+    probs_list: list[float] = []
+    unique_ids = np.unique(label_image)
+    unique_ids = unique_ids[unique_ids != 0]
+    for lid in unique_ids:
+        bmask = (label_image == lid)
+        if not bmask.any():
+            continue
+        probs_list.append(float(cellprob_map[bmask].mean()))
+        masks_list.append(bmask)
+    return masks_list, probs_list, label_image, cellprob_map
+
+
+def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
+    """Locate the cp-sam (cellpose 4.x) env interpreter.
+
+    Order: cfg.cpsam_sidecar_python → $ROIGBIV_CPSAM_PYTHON → sibling `cp-sam`
+    conda env of the running interpreter. Raises if none exists.
+    """
+    candidates: list[str] = []
+    spec = getattr(cfg, "cpsam_sidecar_python", "") or ""
+    if spec:
+        candidates.append(spec)
+    env = os.environ.get("ROIGBIV_CPSAM_PYTHON")
+    if env:
+        candidates.append(env)
+    # sys.prefix == <conda>/envs/roigbiv → sibling env <conda>/envs/cp-sam
+    candidates.append(str(Path(sys.prefix).parent / "cp-sam" / "bin" / "python"))
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    raise FileNotFoundError(
+        "cpsam sidecar interpreter not found. Set cfg.cpsam_sidecar_python or "
+        f"$ROIGBIV_CPSAM_PYTHON. Tried: {', '.join(candidates)}"
+    )
+
+
+def _run_cpsam_sidecar(
+    x: np.ndarray, diameter: float, cfg: PipelineConfig, gpu: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run Cellpose-SAM out-of-process in the cp-sam env; return
+    ``(label_image uint16, cellprob_map float32)``. The denoised/in-process
+    cellpose path is unaffected."""
+    py = _resolve_cpsam_python(cfg)
+    runner = _BASE_DIR / "scripts" / "cpsam_sidecar.py"
+    if not runner.exists():
+        raise FileNotFoundError(f"cpsam sidecar runner missing: {runner}")
+
+    with tempfile.TemporaryDirectory(prefix="cpsam_") as td:
+        td_p = Path(td)
+        in_p = td_p / "input.npy"
+        lab_p = td_p / "labels.npy"
+        cp_p = td_p / "cellprob.npy"
+        man_p = td_p / "manifest.json"
+        np.save(str(in_p), x.astype(np.float32))
+        man_p.write_text(json.dumps({
+            "input": str(in_p),
+            "labels_out": str(lab_p),
+            "cellprob_out": str(cp_p),
+            "diameter": float(diameter),
+            "cellprob_threshold": float(cfg.cellprob_threshold),
+            "flow_threshold": float(cfg.flow_threshold),
+            "gpu": bool(gpu),
+            "channel_axis": -1 if x.ndim == 3 else None,
+        }))
+        print(f"  cpsam sidecar: {py} {runner}", flush=True)
+        proc = subprocess.run(
+            [py, str(runner), str(man_p)],
+            capture_output=True, text=True,
+        )
+        if proc.stdout.strip():
+            for line in proc.stdout.strip().splitlines():
+                print(f"  [cpsam] {line}", flush=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"cpsam sidecar failed (rc={proc.returncode}):\n"
+                f"{proc.stderr[-2000:]}"
+            )
+        label_image = np.load(str(lab_p)).astype(np.uint16)
+        cellprob_map = np.load(str(cp_p)).astype(np.float32)
+    return label_image, cellprob_map
+
+
 def run_cellpose_detection(
     mean_S: np.ndarray,
     vcorr_S: np.ndarray,
@@ -220,6 +337,24 @@ def run_cellpose_detection(
         gpu = False
     else:
         gpu = True
+
+    backend = getattr(cfg, "stage1_backend", "cellpose3")
+    if backend == "cpsam_sidecar":
+        # cpsam is channel-invariant + noise-robust: no denoise, same 2-channel
+        # stack ([morph, vcorr_S]); the channels=(1,2) role convention is inert.
+        morph = mean_S.astype(np.float32)
+        x = np.stack([morph, vcorr_S.astype(np.float32)], axis=-1)   # (H, W, 2)
+        eff = _effective_diameter(morph, cfg)
+        t0 = time.time()
+        label_image, cellprob_map = _run_cpsam_sidecar(x, eff, cfg, gpu)
+        print(f"  cpsam inference in {time.time()-t0:.2f}s", flush=True)
+        return _split_labels(label_image, cellprob_map)
+    if backend != "cellpose3":
+        raise ValueError(
+            f"unknown stage1_backend {backend!r} "
+            "(expected 'cellpose3' or 'cpsam_sidecar')"
+        )
+
     model_path = _resolve_model_path(cfg.cellpose_model)
 
     # Cellpose 3.x silently constructs a default model when given a missing
@@ -255,24 +390,7 @@ def run_cellpose_detection(
     # SizeModel is only attached to `Cellpose(...)` wrapper instances; our
     # custom-trained `CellposeModel` doesn't carry one, so we estimate from
     # the image directly.
-    effective_diameter = cfg.diameter
-    if cfg.diameter_auto:
-        t_cal = time.time()
-        d_est = _estimate_diameter_px(mean_S_input)
-        if d_est is not None and d_est > 4.0:
-            effective_diameter = int(round(d_est))
-            print(
-                f"  diameter_auto: image estimate {effective_diameter}px "
-                f"(overriding cfg.diameter={cfg.diameter}) "
-                f"[calibration {time.time()-t_cal:.2f}s]",
-                flush=True,
-            )
-        else:
-            print(
-                f"  WARNING: diameter_auto image estimate failed "
-                f"(d_est={d_est}); keeping cfg.diameter={cfg.diameter}.",
-                flush=True,
-            )
+    effective_diameter = _effective_diameter(mean_S_input, cfg)
 
     t0 = time.time()
     masks, flows, styles = model.eval(
@@ -301,17 +419,4 @@ def run_cellpose_detection(
         cellprob_map = (label_image > 0).astype(np.float32)
 
     # Split labels into per-ROI boolean masks; extract per-ROI prob from centroid
-    masks_list = []
-    probs_list = []
-    unique_ids = np.unique(label_image)
-    unique_ids = unique_ids[unique_ids != 0]
-    for lid in unique_ids:
-        bmask = (label_image == lid)
-        if not bmask.any():
-            continue
-        # centroid probability: mean of cellprob over the mask
-        prob = float(cellprob_map[bmask].mean())
-        masks_list.append(bmask)
-        probs_list.append(prob)
-
-    return masks_list, probs_list, label_image, cellprob_map
+    return _split_labels(label_image, cellprob_map)

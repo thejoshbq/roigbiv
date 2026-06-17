@@ -272,6 +272,22 @@ class PipelineConfig:
     tile_norm_blocksize: int = 128
     use_denoise: bool = True                # Cellpose3 denoise_cyto3
 
+    # ── Stage 1 backend (Phase M; OFF default — cellpose3 path unchanged) ──
+    # "cellpose3"     : in-process cellpose 3.x (deployed CP3 checkpoint / cyto3
+    #                   etc.) — the current, default behavior.
+    # "cpsam_sidecar" : Cellpose-SAM (cellpose 4.x) run OUT-OF-PROCESS in the
+    #                   `cp-sam` conda env. 4.x needs numpy 2.x and cannot share
+    #                   this interpreter; the deployed CP3 checkpoint cannot load
+    #                   under 4.x (CP3 != CP4). Stage-1 inputs/outputs are
+    #                   identical either way, so gates / subtraction / provenance
+    #                   / the residual engine are untouched. cpsam is channel-
+    #                   invariant and noise-robust → the sidecar drops denoise
+    #                   and ignores the channels=(1,2) role convention.
+    stage1_backend: str = "cellpose3"
+    # Path to the cp-sam env python. "" → auto-resolve: $ROIGBIV_CPSAM_PYTHON,
+    # else the sibling `cp-sam` conda env of the running interpreter.
+    cpsam_sidecar_python: str = ""
+
     # ── Gate 1 (Morphology) ───────────────────────────────────────────────
     min_area: int = 80
     max_area: int = 600
