@@ -90,11 +90,18 @@ check is operationalized per-FOV. The recall gains that *are* visible land in th
 intended single-firer/tonic benefit of `max_S` is largely invisible to this GT and is a
 Phase-5 concern (requires tonic GT).
 
+## Gate decision (resolved)
+
+**APPROVED 2026-06-17 — default flipped to `stage1_ch2_source = "vcorr_max_fused"`**
+(`types.py:303`). This is the first default change of the engagement; it cleanly meets
+the recall-first bar (+0.017 recall, 0/13 FOV regressions, +2.4% FP). `vcorr_S` and
+`max_S` remain config-selectable for reproducibility/rollback.
+
 ## Recommendation
 
 1. **Flip the default to `stage1_ch2_source = "vcorr_max_fused"`** — only on your
    explicit approval (clean pass: +0.017 recall, 0/13 regressions, +2.4% FP). Otherwise
-   keep it OFF and config-selectable.
+   keep it OFF and config-selectable. — **DONE (approved, see above).**
 2. **Do not adopt `max_S` alone** — it regresses 2/13 FOVs (fails no-regression).
 3. Re-evaluate the `max_S`/`fused` benefit against tonic GT in Phase 5, where the
    single-firer target the enrichment was designed for becomes measurable.

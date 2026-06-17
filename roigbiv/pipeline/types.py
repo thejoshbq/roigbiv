@@ -293,14 +293,16 @@ class PipelineConfig:
     # what fills Cellpose's *second* input channel. CP3's deployed checkpoint is
     # architecturally 2-channel (conv1 in_channels=2), so enrichment happens by
     # swapping ch2 content, not by adding a 3rd channel.
-    #   "vcorr_S"          : pixel-correlation map — the current/default behavior.
+    #   "vcorr_S"          : pixel-correlation map — legacy behavior.
     #   "max_S"            : residual peak-intensity (single-firer / sparse cue).
     #   "vcorr_max_fused"  : per-image min-max-normalized max(vcorr_S, max_S)
-    #                        (union of "correlated" OR "has a bright peak").
+    #                        (union of "correlated" OR "has a bright peak") — DEFAULT.
     # Gate 1 always uses vcorr_S regardless — this changes the Stage-1 detector
     # input ONLY (one variable). Falls back to vcorr_S with a warning when max_S
     # is unavailable (e.g. scout-mode foundation).
-    stage1_ch2_source: str = "vcorr_S"
+    # Default flipped vcorr_S -> vcorr_max_fused after Phase-4 A/B (recall +0.017,
+    # 0/13 FOV regressions, FP +2.4%); see docs/phase4_channel_ab_report.md.
+    stage1_ch2_source: str = "vcorr_max_fused"
 
     # ── Gate 1 (Morphology) ───────────────────────────────────────────────
     min_area: int = 80
