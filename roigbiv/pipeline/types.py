@@ -288,6 +288,20 @@ class PipelineConfig:
     # else the sibling `cp-sam` conda env of the running interpreter.
     cpsam_sidecar_python: str = ""
 
+    # ── Stage 1 channel-2 content (Phase 4; OFF default — vcorr_S unchanged) ──
+    # The morphological channel-1 is always mean_M (raw movie mean). This selects
+    # what fills Cellpose's *second* input channel. CP3's deployed checkpoint is
+    # architecturally 2-channel (conv1 in_channels=2), so enrichment happens by
+    # swapping ch2 content, not by adding a 3rd channel.
+    #   "vcorr_S"          : pixel-correlation map — the current/default behavior.
+    #   "max_S"            : residual peak-intensity (single-firer / sparse cue).
+    #   "vcorr_max_fused"  : per-image min-max-normalized max(vcorr_S, max_S)
+    #                        (union of "correlated" OR "has a bright peak").
+    # Gate 1 always uses vcorr_S regardless — this changes the Stage-1 detector
+    # input ONLY (one variable). Falls back to vcorr_S with a warning when max_S
+    # is unavailable (e.g. scout-mode foundation).
+    stage1_ch2_source: str = "vcorr_S"
+
     # ── Gate 1 (Morphology) ───────────────────────────────────────────────
     min_area: int = 80
     max_area: int = 600

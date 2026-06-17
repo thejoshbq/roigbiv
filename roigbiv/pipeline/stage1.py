@@ -239,6 +239,45 @@ def _split_labels(
     return masks_list, probs_list, label_image, cellprob_map
 
 
+def _resolve_stage1_ch2(
+    vcorr_S: np.ndarray, max_S: Optional[np.ndarray], cfg: PipelineConfig
+) -> tuple[np.ndarray, str]:
+    """Resolve Cellpose's channel-2 content per ``cfg.stage1_ch2_source``.
+
+    Channel-1 (morphology = mean_M) is fixed by the caller; this picks ch2 only
+    (one variable). Default ``"vcorr_S"`` reproduces the historical behavior
+    byte-for-byte. Falls back to vcorr_S (with a warning) when ``max_S`` is
+    requested but unavailable (e.g. scout-mode foundation produces no max_S).
+    Backend-agnostic: used by both the cellpose3 and cpsam paths.
+    """
+    src = getattr(cfg, "stage1_ch2_source", "vcorr_S")
+    v = vcorr_S.astype(np.float32)
+    if src == "vcorr_S":
+        return v, "vcorr_S"
+    if max_S is None:
+        print(
+            f"  WARNING: stage1_ch2_source={src!r} but max_S unavailable; "
+            "falling back to vcorr_S",
+            flush=True,
+        )
+        return v, "vcorr_S(fallback)"
+    m = max_S.astype(np.float32)
+    if src == "max_S":
+        return m, "max_S"
+    if src == "vcorr_max_fused":
+        def _nz(a: np.ndarray) -> np.ndarray:
+            lo, hi = float(a.min()), float(a.max())
+            return (a - lo) / (hi - lo) if hi > lo else np.zeros_like(a)
+        # Normalize each to [0,1] BEFORE combining so neither raw scale dominates;
+        # elementwise max = union of "looks correlated" OR "has a bright peak".
+        fused = np.maximum(_nz(v), _nz(m)).astype(np.float32)
+        return fused, "vcorr_max_fused"
+    raise ValueError(
+        f"unknown stage1_ch2_source {src!r} "
+        "(expected 'vcorr_S', 'max_S', or 'vcorr_max_fused')"
+    )
+
+
 def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
     """Locate the cp-sam (cellpose 4.x) env interpreter.
 
@@ -313,8 +352,14 @@ def run_cellpose_detection(
     mean_S: np.ndarray,
     vcorr_S: np.ndarray,
     cfg: PipelineConfig,
+    *,
+    max_S: Optional[np.ndarray] = None,
 ) -> tuple[list[np.ndarray], list[float], np.ndarray, np.ndarray]:
-    """Run Cellpose inference on a dual-channel (mean_S, vcorr_S) stack.
+    """Run Cellpose inference on a dual-channel (morph, ch2) stack.
+
+    ``max_S`` is optional and only consulted when ``cfg.stage1_ch2_source``
+    selects it (Phase 4 channel-2 A/B); the default ``"vcorr_S"`` ignores it and
+    reproduces the historical 2-channel (morph, vcorr_S) behavior exactly.
 
     Returns
     -------
@@ -338,12 +383,17 @@ def run_cellpose_detection(
     else:
         gpu = True
 
+    # Channel-2 content selection (Phase 4 A/B; default vcorr_S = unchanged).
+    ch2, ch2_label = _resolve_stage1_ch2(vcorr_S, max_S, cfg)
+    if ch2_label != "vcorr_S":
+        print(f"  Stage-1 channel-2 source: {ch2_label}", flush=True)
+
     backend = getattr(cfg, "stage1_backend", "cellpose3")
     if backend == "cpsam_sidecar":
-        # cpsam is channel-invariant + noise-robust: no denoise, same 2-channel
-        # stack ([morph, vcorr_S]); the channels=(1,2) role convention is inert.
+        # cpsam is channel-invariant + noise-robust: no denoise, 2-channel
+        # stack ([morph, ch2]); the channels=(1,2) role convention is inert.
         morph = mean_S.astype(np.float32)
-        x = np.stack([morph, vcorr_S.astype(np.float32)], axis=-1)   # (H, W, 2)
+        x = np.stack([morph, ch2], axis=-1)   # (H, W, 2)
         eff = _effective_diameter(morph, cfg)
         t0 = time.time()
         label_image, cellprob_map = _run_cpsam_sidecar(x, eff, cfg, gpu)
@@ -379,10 +429,11 @@ def run_cellpose_detection(
     else:
         mean_S_input = mean_S.astype(np.float32)
 
-    # Stack channels as (H, W, 2) with mean at channel 0, Vcorr at channel 1.
+    # Stack channels as (H, W, 2) with morph at channel 0, ch2 at channel 1.
     # Cellpose's channels=[1, 2] means "cyto = channel 1, nucleus = channel 2" (1-indexed).
+    # ch2 defaults to vcorr_S (Phase 4 may substitute max_S / fused).
     H, W = mean_S_input.shape
-    x = np.stack([mean_S_input, vcorr_S.astype(np.float32)], axis=-1)  # (H, W, 2)
+    x = np.stack([mean_S_input, ch2], axis=-1)  # (H, W, 2)
 
     # Diameter auto-calibration: peak-detection + Otsu sizing on the mean
     # channel produces a robust per-FOV cell-scale estimate. Replaces

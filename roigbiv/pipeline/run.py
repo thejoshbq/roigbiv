@@ -500,7 +500,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         # so mean_M preserves the morphological contrast Cellpose's training expects.
         with _gpu_section(gpu_lock):
             candidates, probs, label_image, cellprob_map = run_cellpose_detection(
-                fov.mean_M, fov.vcorr_S, cfg,
+                fov.mean_M, fov.vcorr_S, cfg, max_S=fov.max_S,
             )
         stage_timings["stage1_detect_s"] = time.time() - t_start
         n_detected = len(candidates)
