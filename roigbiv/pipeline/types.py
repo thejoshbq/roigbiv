@@ -337,6 +337,17 @@ class PipelineConfig:
     sparse_min_skew: float = 0.3
     tonic_bp_std_factor: float = 2.0        # bp_std > this × noise_floor
 
+    # ── Tonic accept tier (Phase 5b, OFF by default — no_default_flip) ─────
+    # When enabled, anatomically-detected (source_stage ∈ {1,2}) ROIs that
+    # classify as tonic AND whose neuropil_baseline_elevation (5a feature) is
+    # ≥ tonic_accept_min_elevation are promoted gate_outcome→"accept" so they
+    # skip human review. Stage-4 tonics (source_stage==4) are NEVER touched —
+    # their requires_review path (gate4) is unchanged. Threshold is provisional
+    # until set from the held-out elevation sweep; flag stays OFF pending an
+    # A/B + explicit approval.
+    tonic_accept_tier: bool = False
+    tonic_accept_min_elevation: float = 0.5
+
     # ── Subtraction engine ────────────────────────────────────────────────
     subtract_chunk_frames: int = 2000
     subtract_ridge_lambda_scale: float = 1e-6

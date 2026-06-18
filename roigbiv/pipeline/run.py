@@ -332,6 +332,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     )
     from roigbiv.pipeline.qc_features import compute_all_features
     from roigbiv.pipeline.classify import classify_all_rois
+    from roigbiv.pipeline.gate_tonic_elevation import apply_tonic_accept_tier
     from roigbiv.pipeline.dff import compute_all_dff
     from roigbiv.pipeline.deconvolution import deconvolve_traces
     from roigbiv.pipeline.hitl import build_review_queue, export_hitl_package
@@ -1005,6 +1006,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
 
     t_start = time.time()
     classify_all_rois(fov.rois, cfg)
+    # Phase 5b: optional tonic accept tier (OFF by default). Post-classification
+    # so it can read activity_type; promotes anatomical tonics only. No-op unless
+    # cfg.tonic_accept_tier is True.
+    apply_tonic_accept_tier(fov.rois, cfg)
     stage_timings["classify_s"] = time.time() - t_start
 
     t_start = time.time()
