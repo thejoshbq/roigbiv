@@ -195,5 +195,9 @@ def extract_all_traces(
     for i, roi in enumerate(rois):
         roi.trace = F_raw[i].astype(np.float32, copy=True)
         roi.trace_corrected = F_corrected[i].astype(np.float32, copy=True)
+        # Keep the raw neuropil trace on the ROI so QC can compute a
+        # neuropil-relative baseline (Phase 5a). Stored as an ndarray feature;
+        # _jsonable_features drops it from JSON like trace_bandpass.
+        roi.features["F_neuropil"] = F_neu[i].astype(np.float32, copy=True)
 
     return F_raw, F_neu, F_corrected

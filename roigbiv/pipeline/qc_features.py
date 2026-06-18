@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy import signal, stats
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_erosion, percentile_filter
 
 from roigbiv.pipeline.types import FOVData, ROI, PipelineConfig
 
@@ -268,6 +268,63 @@ def compute_temporal_features(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Neuropil-relative baseline elevation (Phase 5a)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _stable_baseline(trace: np.ndarray, window_frames: int, percentile: int) -> float:
+    """A stable long-window F0 collapsed to a scalar.
+
+    Median of a sliding low-percentile filter over a WIDE window. The wide
+    window (tonic_baseline_window_s) preserves the DC offset that signals tonic
+    activity — a short rolling dF/F0 baseline would erase exactly that offset.
+    The median over the per-frame baseline keeps slow drift (e.g. bleaching)
+    from biasing the estimate. Falls back to a whole-trace percentile when the
+    trace is shorter than one window.
+    """
+    trace = np.asarray(trace, dtype=np.float32)
+    if trace.size == 0:
+        return 0.0
+    if trace.size <= window_frames:
+        return float(np.percentile(trace, percentile))
+    base = percentile_filter(trace, percentile=percentile,
+                             size=window_frames, mode="nearest")
+    return float(np.median(base))
+
+
+def compute_neuropil_baseline_elevation(roi: ROI, cfg: PipelineConfig) -> None:
+    """Phase 5a — neuropil-relative baseline-elevation feature.
+
+    Quantifies how far the ROI's own stable baseline F0 sits ABOVE its annular
+    neuropil's stable baseline F0. Tonic (high-DC) somata sit persistently above
+    local background; phasic cells do not. Computed on the RAW ROI and neuropil
+    fluorescence (roi.trace, roi.features['F_neuropil']) — NOT residual or
+    dF/F — with the wide tonic baseline window so the DC offset is preserved.
+
+    Logged only: this populates features and changes NO decision logic (the
+    5a/5b split keeps feature addition separate from the accept-tier change).
+    Writes:
+      roi_baseline_f0            stable F0 of the raw ROI trace
+      neuropil_baseline_f0       stable F0 of the raw neuropil trace
+      neuropil_baseline_elevation  (F0_roi − F0_neu) / max(|F0_neu|, eps)
+    """
+    feats = roi.features
+    tr = roi.trace
+    fn = feats.get("F_neuropil")
+    if tr is None or fn is None:
+        feats["neuropil_baseline_elevation"] = 0.0
+        return
+
+    window_frames = max(2, int(round(cfg.tonic_baseline_window_s * cfg.fs)))
+    f0_roi = _stable_baseline(tr, window_frames, cfg.baseline_percentile)
+    f0_neu = _stable_baseline(fn, window_frames, cfg.baseline_percentile)
+    feats["roi_baseline_f0"] = f0_roi
+    feats["neuropil_baseline_f0"] = f0_neu
+    feats["neuropil_baseline_elevation"] = float(
+        (f0_roi - f0_neu) / max(abs(f0_neu), 1e-6)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Provenance features
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -324,4 +381,5 @@ def compute_all_features(
         compute_spatial_features(roi, fov.mean_S, fov.dog_map,
                                  all_masks_union, (H, W))
         compute_temporal_features(roi, cfg.fs, cfg.tau, template)
+        compute_neuropil_baseline_elevation(roi, cfg)
         compute_provenance_features(roi, rois)
