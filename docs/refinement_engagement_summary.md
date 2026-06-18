@@ -108,22 +108,26 @@ Read the code first. Two surprises:
 - **Important:** this only **records a number** — it changes no decisions yet. It's
   the raw material for Phase 5b.
 
-### Phase 5b — Let confident tonic cells skip review → ⏳ In progress
+### Phase 5b — Let confident tonic cells skip review → ⏹️ Built (OFF), but inert on this data
 - **Idea:** if an anatomically-detected cell looks convincingly tonic (high baseline
   elevation), let it be **auto-accepted** so a human doesn't have to review it.
   (Cells found by the dedicated tonic-search stage are left exactly as-is.)
-- **Discovery surprise (two problems):**
-  1. **The standard scorer can't see this change.** It scores which cell *locations*
-     exist — but this change only re-routes cells *out of the review queue*, it
-     doesn't add or remove any. So the usual A/B would show "no change."
-  2. **There's no tonic answer key** to check whether auto-accepted cells are
-     really cells.
-- **What we did:** built a **custom, review-aware scorer** that asks "of the cells
-  this rule auto-accepts, how many are real (match the location answer key) vs.
-  potentially junk escaping review?" — and reports how much human review it saves.
-- **Status:** the 13-movie measurement run is going now. Next: pick a safe
-  threshold, write the report, and **stop for your approval** before turning
-  anything on.
+- **First surprise:** the standard scorer **can't even see this change** — it scores
+  which cell *locations* exist, but this only re-routes cells *out of the review
+  queue*. And there's **no tonic answer key**. So we built a **custom, review-aware
+  scorer**.
+- **Decisive result:** across all 13 movies (433 cells), there are **zero tonic
+  cells of any kind.** The classifier labels **none** tonic, and the dedicated
+  tonic-search stage found **nothing**. The rule has nothing to act on.
+- **Why:** the classifier's "tonic" test looks for a slow *oscillation* pattern that
+  none of these cells have. The new 5a "elevation" measure *does* fire (62% of cells
+  sit clearly above their surroundings) — but that's **not the same thing as tonic**
+  (bright flickering cells are elevated too). The two measure different phenomena,
+  and with no tonic answer key we can't tell which definition is "right."
+- **Decision (5b-A):** keep the tier **OFF** as a safe, ready no-op. The real
+  blocker is **data** (these movies have ~no tonic cells, and we have no tonic
+  ground truth) — not code. Don't redefine "tonic" blindly. **Engagement concluded
+  here.**
 
 ---
 
@@ -138,8 +142,29 @@ Read the code first. Two surprises:
 | 4 | Detector 2nd-channel content | ✅ **Fused (new default)** | +recall, 0 movies regress, +2.4% FP |
 | denoise | Denoise off (re-test) | ❌ Keep ON | Gain vanished, 4 movies got worse |
 | 5a | Baseline-elevation measure | ✅ Added (measure only) | Foundation for tonic decisions |
-| 5b | Auto-accept tonic cells | ⏳ Running | Needs custom scorer + your approval |
+| 5b | Auto-accept tonic cells | ⏹️ Built (OFF), inert | No tonic cells in data; no tonic GT |
 
-**Net so far:** one real improvement adopted (Phase 4 fused channel), several
-plausible-but-wrong ideas correctly rejected before they could do harm, and the
-tonic work set up carefully on honest footing. Nothing load-bearing was disturbed.
+## Engagement conclusion (2026-06-18)
+
+**Concluded at Phase 5b (option 5b-A).**
+
+- **One adopted improvement:** Phase 4's **fused** second channel — +0.017 recall,
+  0/13 movies regressed, +2.4% false alarms. The only change that cleanly passed
+  the recall-first bar; default flipped with approval.
+- **Four ideas correctly rejected before they could do harm:** PMD denoising
+  (false-alarm explosion), the SAM model swap (lost on every movie), denoise-off
+  (gain was a fluke), and tonic auto-accept (nothing to act on).
+- **One diagnostic banked:** the 5a baseline-elevation measure is logged on every
+  ROI for future use.
+- **The honest wall:** the tonic-recall goal can't be advanced or even *measured*
+  on the current data — these movies contain ~no tonic cells by the working
+  definition, and there's no tonic ground truth to define them differently. The
+  next real step is a **data/labeling** task (human-label tonic cells → tonic GT),
+  not more code.
+- **Nothing load-bearing was touched** — the subtractive spine, gates, provenance,
+  HITL, registry, and virtual-residual engine are all unchanged. New behavior that
+  wasn't adopted remains OFF-by-default and config-selectable for future re-tests.
+
+**Where the work lives:** the cumulative line (Phase-4 fused default + 5a feature +
+5b OFF tier + all reports) is on branch **`feat/0-phase5-tonic`**. Per the
+engagement's `git_discipline`, nothing was merged to `main` — merging is your call.
