@@ -30,7 +30,7 @@ When in doubt about *behavior*, the spec wins over code comments or this file.
 | Intent | Source of truth |
 | --- | --- |
 | Pipeline behavior, gate logic, ROI schema | `docs/roi-pipeline-specification.md` |
-| Algorithm walkthrough (per-stage math) | `docs/pipeline_algorithm_breakdown.md` |
+| Algorithm methods (per-stage math, current impl) | `docs/publication/algorithms_v2.md` (authoritative; supersedes `docs/publication/algorithms.md` (v1) and the legacy `docs/pipeline_algorithm_breakdown.md`) |
 | Tunable parameters (all defaults) | `configs/pipeline.yaml` |
 | Dash UI roadmap + architecture | `docs/visualizer-plan.md` |
 | Astrocyte / dual-channel extension | `docs/ASTROCYTE_PLAN.md` |
