@@ -26,6 +26,14 @@ import numpy as np
 import tifffile
 
 from roigbiv.pipeline import fmt
+from roigbiv.pipeline.profiles import (
+    AUTO,
+    STAGE1_CLI_DEFAULTS,
+    get_profile,
+    is_profile,
+    list_profiles,
+    merged_overrides,
+)
 from roigbiv.pipeline.types import FOVData, PipelineConfig
 
 
@@ -1139,6 +1147,56 @@ def _resolve_model(spec: str) -> str:
     return spec
 
 
+def _resolve_profile_name(name: str, input_path: Path) -> str:
+    """Resolve ``--profile`` to a concrete profile name.
+
+    ``auto`` currently maps to ``grin`` (no FOV-optics sniffing yet); concrete
+    names pass through. Resolution happens here — where explicit-vs-default
+    flags are still distinguishable — not inside ``get_profile`` (which rejects
+    ``auto``). Raises on an unknown name so a typo fails fast.
+    """
+    if name == AUTO:
+        return "grin"   # TODO: sniff optics from input_path to pick prism/grin
+    if not is_profile(name):
+        raise ValueError(
+            f"unknown profile {name!r}; choose one of {list_profiles()}."
+        )
+    return name
+
+
+def _build_explicit_stage1(args: argparse.Namespace, profile_bundle: dict) -> dict:
+    """Stage-1 args the user set explicitly, with historical-CLI-default backfill.
+
+    For each Stage-1 field an explicit flag (value is not ``None``) always wins.
+    A field left at ``None`` (omitted) is backfilled from ``STAGE1_CLI_DEFAULTS``
+    (or ``_DEFAULT_MODEL`` for the model) ONLY IF the resolved profile does not
+    already set it — so the profile can own the field, and the GRIN path stays
+    byte-identical to the pre-profile CLI defaults. The returned dict is applied
+    *after* the profile bundle by ``merged_overrides`` (precedence
+    ``defaults < profile < explicit``).
+    """
+    out: dict = {}
+    # (argparse attr, PipelineConfig field) — model maps to cellpose_model.
+    fields = (
+        ("diameter", "diameter"),
+        ("diameter_auto", "diameter_auto"),
+        ("cellprob_threshold", "cellprob_threshold"),
+        ("flow_threshold", "flow_threshold"),
+        ("channels", "channels"),
+        ("model", "cellpose_model"),
+    )
+    for arg_name, cfg_key in fields:
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            out[cfg_key] = val                      # explicit flag wins
+        elif cfg_key not in profile_bundle:         # omitted & profile is silent
+            out[cfg_key] = (
+                _DEFAULT_MODEL if arg_name == "model"
+                else STAGE1_CLI_DEFAULTS[arg_name]
+            )
+    return out
+
+
 def _stage_flags(cfg: PipelineConfig) -> dict[int, bool]:
     return {2: cfg.enable_stage_2, 3: cfg.enable_stage_3, 4: cfg.enable_stage_4}
 
@@ -1148,9 +1206,9 @@ def _build_pipeline_summary(cfg: PipelineConfig, args: argparse.Namespace) -> di
         "model_name": Path(cfg.cellpose_model).name,
         "fs": cfg.fs,
         "tau": cfg.tau,
-        "diameter": args.diameter,
-        "cellprob_threshold": args.cellprob_threshold,
-        "flow_threshold": args.flow_threshold,
+        "diameter": cfg.diameter,
+        "cellprob_threshold": cfg.cellprob_threshold,
+        "flow_threshold": cfg.flow_threshold,
         "stage_flags": _stage_flags(cfg),
     }
 
@@ -1205,29 +1263,42 @@ def main(argv: "list[str] | None" = None) -> int:
                         help=("Temporal binning factor that produced --fs "
                               "(default 1 = un-averaged). Recorded in "
                               "traces_meta.json for pynapse handoff."))
-    parser.add_argument("--model", type=str, default=_DEFAULT_MODEL,
+    parser.add_argument("--model", type=str, default=None,
                         help=("Cellpose model path, built-in name, or "
                               "'latest' (newest mtime in "
                               "models/checkpoints/models/). "
                               f"Default: {_DEFAULT_MODEL}"))
     parser.add_argument("--tau", type=float, default=1.0,
                         help="Indicator decay constant (default: 1.0, GCaMP6s).")
-    parser.add_argument("--diameter", type=int, default=12,
-                        help="Cellpose diameter (default 12).")
+    parser.add_argument("--profile", type=str, default=AUTO,
+                        choices=list_profiles(),
+                        help=("Acquisition/lens profile bundling Stage-1 + "
+                              "Gate-1 defaults (see pipeline/profiles.py). "
+                              "'grin' = the 512² baseline (no-op); 'prism' = "
+                              "single-channel cyto3 for diffuse PRISM FOVs; "
+                              "'generic' = conservative unknown-optics fallback. "
+                              "Explicit flags override the profile. Default: "
+                              f"{AUTO} (currently resolves to grin)."))
+    # NOTE: these Stage-1 flags default to None so the profile resolver can
+    # distinguish "omitted" (backfilled from STAGE1_CLI_DEFAULTS / the profile)
+    # from "explicitly set" (wins over the profile). See _build_explicit_stage1.
+    # Help text states the historical GRIN default that backfill restores.
+    parser.add_argument("--diameter", type=int, default=None,
+                        help="Cellpose diameter (GRIN default 12).")
     parser.add_argument("--diameter-auto", dest="diameter_auto",
-                        action="store_true", default=False,
+                        action="store_true", default=None,
                         help=("Override --diameter with an image-based "
                               "estimate (DoG peaks + Otsu sizing on mean_M) "
                               "computed at the start of Stage 1. Use when "
                               "frame size or cell scale is unknown."))
     parser.add_argument("--cellprob-threshold", dest="cellprob_threshold",
-                        type=float, default=-2.0,
-                        help="Cellpose cell-probability threshold (default -2.0).")
+                        type=float, default=None,
+                        help="Cellpose cell-probability threshold (GRIN default -2.0).")
     parser.add_argument("--flow-threshold", dest="flow_threshold",
-                        type=float, default=0.6,
-                        help="Cellpose flow threshold (default 0.6).")
-    parser.add_argument("--channels", type=_parse_channels, default=(1, 2),
-                        help="Cellpose channels as 'cyto,nucleus' (default 1,2).")
+                        type=float, default=None,
+                        help="Cellpose flow threshold (GRIN default 0.6).")
+    parser.add_argument("--channels", type=_parse_channels, default=None,
+                        help="Cellpose channels as 'cyto,nucleus' (GRIN default 1,2).")
     parser.add_argument("--min-area", dest="min_area", type=int, default=None,
                         help=("Gate 1 minimum ROI area in px² (default 80, "
                               "tuned for 512×512 GRIN). Raise for prism / "
@@ -1514,7 +1585,10 @@ def main(argv: "list[str] | None" = None) -> int:
               file=sys.stderr)
         return 2
 
-    args.model = _resolve_model(args.model)
+    # Only resolve an explicit --model; None (omitted) is filled later by the
+    # profile resolver / _build_explicit_stage1 backfill.
+    if args.model is not None:
+        args.model = _resolve_model(args.model)
 
     # Stage-enable overrides only forwarded when explicitly set on the CLI
     # (BooleanOptionalAction default=None ⇒ "untouched"); otherwise fall
@@ -1620,32 +1694,31 @@ def _run_single(
         }.items()
         if v is not None
     }
-    cfg = PipelineConfig(
-        fs=args.fs,
-        frame_averaging=args.frame_averaging,
-        tau=args.tau,
-        k_background=args.k,
-        cellpose_model=args.model,
-        diameter=args.diameter,
-        diameter_auto=args.diameter_auto,
-        cellprob_threshold=args.cellprob_threshold,
-        flow_threshold=args.flow_threshold,
-        channels=args.channels,
-        output_dir=args.output_dir,
-        no_viewer=no_viewer,
-        resume=args.resume,
-        force_cpu=args.force_cpu,
-        scout_mode=args.scout_mode,
-        scout_vcorr_stride=args.scout_vcorr_stride,
-        scout_vcorr_neighbors=args.scout_vcorr_neighbors,
-        foundation_only=args.foundation_only,
-        **stage_overrides,
-        **solver_overrides,
-        **mc_overrides,
-        **stage1_overrides,
-        **gate2_overrides,
-        **stage3_overrides,
-    )
+    # Resolve the lens profile, then merge: defaults < profile < explicit flags.
+    # _build_explicit_stage1 owns the channels/diameter/cellprob/flow/model
+    # backfill; stage1_overrides (min/max/tile) and the other *_overrides are
+    # already None-filtered explicit dicts and likewise win over the profile.
+    profile_name = _resolve_profile_name(args.profile, tif_path)
+    explicit_stage1 = _build_explicit_stage1(args, get_profile(profile_name))
+    base = {
+        "fs": args.fs,
+        "frame_averaging": args.frame_averaging,
+        "tau": args.tau,
+        "k_background": args.k,
+        "output_dir": args.output_dir,
+        "no_viewer": no_viewer,
+        "resume": args.resume,
+        "force_cpu": args.force_cpu,
+        "scout_mode": args.scout_mode,
+        "scout_vcorr_stride": args.scout_vcorr_stride,
+        "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
+        "foundation_only": args.foundation_only,
+    }
+    cfg = PipelineConfig(**merged_overrides(
+        profile_name, base,
+        [explicit_stage1, stage_overrides, solver_overrides, mc_overrides,
+         stage1_overrides, gate2_overrides, stage3_overrides],
+    ))
 
     fov_stem = tif_path.stem.replace("_mc", "")
     print(fmt.fov_banner(tif_path.name, 1, 1), flush=True)
@@ -1832,28 +1905,26 @@ def _run_workspace(
         }.items()
         if v is not None
     }
-    overrides = {
+    # Resolve the lens profile and merge (defaults < profile < explicit flags).
+    # The merged dict (incl. the resolved "profile" label + backfilled Stage-1
+    # fields) becomes the per-FOV cfg overrides consumed by run_with_workspace.
+    profile_name = _resolve_profile_name(args.profile, input_path)
+    explicit_stage1 = _build_explicit_stage1(args, get_profile(profile_name))
+    base = {
         "fs": args.fs,
         "frame_averaging": args.frame_averaging,
         "tau": args.tau,
         "k_background": args.k,
-        "cellpose_model": args.model,
-        "diameter": args.diameter,
-        "diameter_auto": args.diameter_auto,
-        "cellprob_threshold": args.cellprob_threshold,
-        "flow_threshold": args.flow_threshold,
-        "channels": args.channels,
         "no_viewer": True,    # workspace runs are headless
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         "foundation_only": args.foundation_only,
-        **stage_overrides,
-        **ws_solver_overrides,
-        **ws_mc_overrides,
-        **ws_stage1_overrides,
-        **ws_gate2_overrides,
-        **ws_stage3_overrides,
     }
+    overrides = merged_overrides(
+        profile_name, base,
+        [explicit_stage1, stage_overrides, ws_solver_overrides, ws_mc_overrides,
+         ws_stage1_overrides, ws_gate2_overrides, ws_stage3_overrides],
+    )
 
     ws_results = run_with_workspace(
         workspace, overrides,
@@ -1862,7 +1933,7 @@ def _run_workspace(
         n_workers=args.n_workers,
     )
 
-    model_name = Path(args.model).name
+    model_name = Path(overrides["cellpose_model"]).name
     for wr in ws_results:
         if wr.error is not None or wr.fov is None:
             continue
@@ -1907,14 +1978,8 @@ def _run_workspace(
 
     # Synthesize a representative cfg for the body summary (workspace
     # configs are per-FOV; the run-level params we want to echo are the
-    # CLI-set overrides, which are uniform across FOVs).
-    cfg_for_summary = PipelineConfig(
-        fs=args.fs, frame_averaging=args.frame_averaging, tau=args.tau,
-        k_background=args.k, cellpose_model=args.model,
-        diameter=args.diameter, cellprob_threshold=args.cellprob_threshold,
-        flow_threshold=args.flow_threshold, channels=args.channels,
-        **stage_overrides,
-    )
+    # profile-merged overrides, which are uniform across FOVs).
+    cfg_for_summary = PipelineConfig(**overrides)
     summary = _build_pipeline_summary(cfg_for_summary, args)
     email_results = [
         EmailFOVResult(
