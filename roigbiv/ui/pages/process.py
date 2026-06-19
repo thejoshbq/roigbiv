@@ -22,7 +22,9 @@ from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.io import validate_tif
 from roigbiv.pipeline.loaders import _maybe_read_tif
+from roigbiv.pipeline.profiles import AUTO, get_profile, list_profiles
 from roigbiv.pipeline.stage1 import list_available_models
+from roigbiv.pipeline.types import PipelineConfig
 from roigbiv.pipeline.workspace import WorkspacePaths, resolve_workspace
 from roigbiv.ui.components.figure import build_roi_figure
 from roigbiv.ui.components.forms import HELP_TEXT, help_icon, labeled_with_help
@@ -33,6 +35,55 @@ from roigbiv.ui.services.pipeline_runner import RunSnapshot, get_pipeline_runner
 
 
 # ── layout ─────────────────────────────────────────────────────────────────
+
+
+# ── acquisition/lens profile autofill ───────────────────────────────────────
+# The Profile dropdown autofills every Stage-1 field below from the profile
+# bundle (pipeline/profiles.py), falling back to the grin/dataclass baseline for
+# keys the profile does not set. The form fields stay the source of truth at run
+# time — the dropdown is a convenience that seeds them; the user may then tweak
+# any field. (config field name, dash component id), in display order.
+_PROFILE_AUTOFILL: list[tuple[str, str]] = [
+    ("cellpose_model", "roigbiv-param-model"),
+    ("channels", "roigbiv-param-channels"),
+    ("flow_threshold", "roigbiv-param-flow-threshold"),
+    ("cellprob_threshold", "roigbiv-param-cellprob-threshold"),
+    ("diameter", "roigbiv-param-diameter"),
+    ("use_denoise", "roigbiv-param-use-denoise"),
+    ("min_area", "roigbiv-param-min-area"),
+    ("max_area", "roigbiv-param-max-area"),
+    ("min_solidity", "roigbiv-param-min-solidity"),
+    ("max_eccentricity", "roigbiv-param-max-eccentricity"),
+    ("tile_norm_blocksize", "roigbiv-param-tile-norm-blocksize"),
+    ("mc_strip_height", "roigbiv-param-mc-strip-height"),
+]
+
+# UI-selectable profiles — concrete only. ``auto`` is excluded: it means "sniff
+# the optics" (unimplemented; resolves to grin), which is meaningless when the
+# user is explicitly choosing in a dropdown.
+_UI_PROFILES: list[str] = [p for p in list_profiles() if p != AUTO]
+
+
+def _profile_field_values(profile_name: str) -> dict:
+    """Resolved Stage-1 field values for *profile_name*: the profile bundle laid
+    over the grin/dataclass baseline. Keyed by PipelineConfig field name."""
+    base = PipelineConfig()
+    bundle = get_profile(profile_name)
+    return {key: bundle.get(key, getattr(base, key)) for key, _ in _PROFILE_AUTOFILL}
+
+
+def _channels_to_str(ch) -> str:
+    """Tuple channels → the 'cyto,nucleus' string the dbc.Select carries."""
+    return f"{int(ch[0])},{int(ch[1])}"
+
+
+def _parse_channels_value(spec) -> tuple:
+    """'cyto,nucleus' string → (int, int); falls back to the GRIN default."""
+    try:
+        a, b = (int(p.strip()) for p in str(spec).split(","))
+        return (a, b)
+    except (ValueError, AttributeError):
+        return (1, 2)
 
 
 def layout() -> html.Div:
@@ -144,8 +195,23 @@ def _params_form(diameter_default: int = 12) -> html.Div:
             id="roigbiv-param-mc-backend-help",
             className="text-muted d-block mt-1",
         ),
+        _field_row("mc_strip_height (px)", "roigbiv-param-mc-strip-height",
+                   dbc.Input(id="roigbiv-param-mc-strip-height", type="number",
+                             value=32, step=8, min=8, max=256)),
     ])
     stage1 = _stage_card("Stage 1 · Cellpose detection", [
+        _field_row("Acquisition profile", "roigbiv-param-profile",
+                   dbc.Select(
+                       id="roigbiv-param-profile",
+                       options=[{"label": p, "value": p} for p in _UI_PROFILES],
+                       value="grin",
+                   )),
+        html.Small(
+            "Selecting a profile autofills the Stage-1 + Gate-1 fields below for "
+            "that lens (grin = 512² GRIN baseline; prism = 1024² Prism). Tweak "
+            "any field afterward — the fields are what actually run.",
+            className="text-muted d-block mb-2",
+        ),
         _field_row("Model", "roigbiv-param-model",
                    dbc.Select(
                        id="roigbiv-param-model",
@@ -153,9 +219,23 @@ def _params_form(diameter_default: int = 12) -> html.Div:
                        value=(_model_opts[0]["value"] if _model_opts
                               else "models/deployed/current_model"),
                    )),
+        _field_row("channels (cyto,nucleus)", "roigbiv-param-channels",
+                   dbc.Select(
+                       id="roigbiv-param-channels",
+                       options=[
+                           {"label": "Single-channel — mean_M only (0,0)",
+                            "value": "0,0"},
+                           {"label": "Cyto + vcorr nucleus (1,2)",
+                            "value": "1,2"},
+                       ],
+                       value="1,2",
+                   )),
         _field_row("flow_threshold", "roigbiv-param-flow-threshold",
                    dbc.Input(id="roigbiv-param-flow-threshold", type="number",
                              value=0.4, step=0.05, min=0.0, max=3.0)),
+        _field_row("cellprob_threshold", "roigbiv-param-cellprob-threshold",
+                   dbc.Input(id="roigbiv-param-cellprob-threshold", type="number",
+                             value=-2.0, step=0.5, min=-6.0, max=6.0)),
         _field_row("diameter (px)", "roigbiv-param-diameter",
                    dbc.Input(id="roigbiv-param-diameter", type="number",
                              value=diameter_default, step=1, min=3, max=200,
@@ -170,8 +250,30 @@ def _params_form(diameter_default: int = 12) -> html.Div:
             "Soma diameter in pixels. Drag the cyan circle on the "
             "motion-correction preview to match a representative cell, or click "
             "Suggest. Applies to every FOV in the run.",
-            className="text-muted d-block mt-1",
+            className="text-muted d-block mt-1 mb-2",
         ),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-use-denoise",
+                       label="Cellpose denoise (denoise_cyto3)", value=True),
+            "roigbiv-param-use-denoise",
+        ),
+        _field_row("tile_norm_blocksize", "roigbiv-param-tile-norm-blocksize",
+                   dbc.Input(id="roigbiv-param-tile-norm-blocksize", type="number",
+                             value=128, step=8, min=0, max=512)),
+        html.Hr(className="my-2"),
+        html.Small("Gate 1 · morphology bounds", className="text-muted d-block mb-2"),
+        _field_row("min_area (px²)", "roigbiv-param-min-area",
+                   dbc.Input(id="roigbiv-param-min-area", type="number",
+                             value=80, step=10, min=0)),
+        _field_row("max_area (px²)", "roigbiv-param-max-area",
+                   dbc.Input(id="roigbiv-param-max-area", type="number",
+                             value=600, step=50, min=1)),
+        _field_row("min_solidity", "roigbiv-param-min-solidity",
+                   dbc.Input(id="roigbiv-param-min-solidity", type="number",
+                             value=0.55, step=0.05, min=0.0, max=1.0)),
+        _field_row("max_eccentricity", "roigbiv-param-max-eccentricity",
+                   dbc.Input(id="roigbiv-param-max-eccentricity", type="number",
+                             value=0.90, step=0.05, min=0.0, max=1.0)),
     ])
     stage_control = _stage_card("Stage control", [
         html.Small(
@@ -611,11 +713,23 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-param-stage-4", "value"),
         State("roigbiv-param-resume", "value"),
         State("roigbiv-param-slack-channel", "value"),
+        State("roigbiv-param-profile", "value"),
+        State("roigbiv-param-channels", "value"),
+        State("roigbiv-param-cellprob-threshold", "value"),
+        State("roigbiv-param-use-denoise", "value"),
+        State("roigbiv-param-min-area", "value"),
+        State("roigbiv-param-max-area", "value"),
+        State("roigbiv-param-min-solidity", "value"),
+        State("roigbiv-param-max-eccentricity", "value"),
+        State("roigbiv-param-tile-norm-blocksize", "value"),
+        State("roigbiv-param-mc-strip-height", "value"),
         prevent_initial_call=True,
     )
     def _on_run(_n: int, fs, tau, k, model, mc_backend, flow_threshold,
                 diameter, scout, foundation_only, stage_2, stage_3, stage_4,
-                resume, slack_channel):
+                resume, slack_channel, profile, channels, cellprob_threshold,
+                use_denoise, min_area, max_area, min_solidity, max_eccentricity,
+                tile_norm_blocksize, mc_strip_height):
         state = get_app_state()
         if state.workspace is None:
             return True, dbc.Alert("Scan a workspace first.", color="warning")
@@ -632,9 +746,21 @@ def register_callbacks(app: dash.Dash) -> None:
             "fs": float(fs or 7.5),
             "tau": float(tau or 1.0),
             "k_background": int(k or 30),
+            # Acquisition/lens profile — a provenance label recorded in the
+            # cfg_snapshot; the per-field values below are what actually run.
+            "profile": profile or "grin",
             "cellpose_model": model or "models/deployed/current_model",
             "motion_correction_backend": mc_backend or "phasecorr",
+            "mc_strip_height": int(mc_strip_height) if mc_strip_height is not None else 32,
+            "channels": _parse_channels_value(channels),
             "flow_threshold": float(flow_threshold if flow_threshold is not None else 0.4),
+            "cellprob_threshold": float(cellprob_threshold if cellprob_threshold is not None else -2.0),
+            "use_denoise": bool(use_denoise),
+            "tile_norm_blocksize": int(tile_norm_blocksize) if tile_norm_blocksize is not None else 128,
+            "min_area": int(min_area) if min_area is not None else 80,
+            "max_area": int(max_area) if max_area is not None else 600,
+            "min_solidity": float(min_solidity) if min_solidity is not None else 0.55,
+            "max_eccentricity": float(max_eccentricity) if max_eccentricity is not None else 0.90,
             # Diameter chosen on the MC preview (+ diameter_auto forced off).
             **_diameter_overrides(state.calibrated_diameter(), diameter),
             "scout_mode": scout_on,
@@ -797,6 +923,41 @@ def register_callbacks(app: dash.Dash) -> None:
         if est is None or est <= 4.0:
             return no_update, "No estimate — adjust the circle manually."
         return int(round(est)), f"suggested = {est:.0f} px"
+
+    @app.callback(
+        Output("roigbiv-param-model", "value", allow_duplicate=True),
+        Output("roigbiv-param-channels", "value", allow_duplicate=True),
+        Output("roigbiv-param-flow-threshold", "value", allow_duplicate=True),
+        Output("roigbiv-param-cellprob-threshold", "value", allow_duplicate=True),
+        Output("roigbiv-param-diameter", "value", allow_duplicate=True),
+        Output("roigbiv-param-use-denoise", "value", allow_duplicate=True),
+        Output("roigbiv-param-min-area", "value", allow_duplicate=True),
+        Output("roigbiv-param-max-area", "value", allow_duplicate=True),
+        Output("roigbiv-param-min-solidity", "value", allow_duplicate=True),
+        Output("roigbiv-param-max-eccentricity", "value", allow_duplicate=True),
+        Output("roigbiv-param-tile-norm-blocksize", "value", allow_duplicate=True),
+        Output("roigbiv-param-mc-strip-height", "value", allow_duplicate=True),
+        Input("roigbiv-param-profile", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_profile_change(profile_name):
+        # Autofill every Stage-1/Gate-1 field from the chosen profile bundle.
+        # The fields remain user-editable and are the source of truth at run time.
+        v = _profile_field_values(profile_name or "grin")
+        return (
+            v["cellpose_model"],
+            _channels_to_str(v["channels"]),
+            v["flow_threshold"],
+            v["cellprob_threshold"],
+            v["diameter"],
+            v["use_denoise"],
+            v["min_area"],
+            v["max_area"],
+            v["min_solidity"],
+            v["max_eccentricity"],
+            v["tile_norm_blocksize"],
+            v["mc_strip_height"],
+        )
 
     @app.callback(
         Output("roigbiv-param-foundation-only", "disabled"),

@@ -90,7 +90,49 @@ HELP_TEXT: dict[str, str] = {
         "row-wise non-rigid fast path (can haze/band low-SNR FOVs); legacy is "
         "the original SIMA HMM2D (CPU-only, slow, needs the sima-legacy env). "
         "Skipped for pre-corrected _mc stacks.",
+    "roigbiv-param-mc-strip-height":
+        "Height in rows of the horizontal strips the row-wise motion correction "
+        "registers independently. Larger = steadier but coarser non-rigid "
+        "correction (default 32; the prism profile uses 48 for its 1024² FOVs).",
     # Pipeline · Stage 1 Cellpose
+    "roigbiv-param-profile":
+        "Acquisition/lens profile. Selecting one autofills the Stage-1 and "
+        "Gate-1 fields for that optic: grin = the 512² GRIN baseline (pipeline "
+        "defaults); prism = dim, diffuse 1024² Prism FOVs (single-channel cyto3, "
+        "no denoise, ~56 px somata, relaxed area/shape gates); generic = a "
+        "conservative single-channel fallback. The fields stay editable — they, "
+        "not the dropdown, are what actually run.",
+    "roigbiv-param-channels":
+        "Cellpose input channels (cyto, nucleus). Single-channel (0,0) segments "
+        "the mean_M image alone — the dominant Prism fix. Cyto+vcorr (1,2) feeds "
+        "the correlation map as a nucleus channel (the GRIN default), which "
+        "suppresses detection on Prism's diffuse vcorr.",
+    "roigbiv-param-cellprob-threshold":
+        "Cellpose cell-probability threshold (−6…6). Lower admits dimmer, "
+        "lower-confidence masks; higher is stricter. GRIN default −2.0; the "
+        "prism profile uses 0.0.",
+    "roigbiv-param-use-denoise":
+        "Run Cellpose3 denoise_cyto3 before segmentation. Helps bright GRIN "
+        "FOVs but suppresses dim Prism signal — the prism profile turns it off.",
+    "roigbiv-param-tile-norm-blocksize":
+        "Block size (px) for Cellpose tile normalization; 0 disables it. Larger "
+        "blocks normalize over a wider area (default 128; prism uses 256 for its "
+        "1024² FOVs).",
+    "roigbiv-param-min-area":
+        "Gate 1 minimum ROI area in px². Masks smaller than this are rejected. "
+        "GRIN default 80 (512²); the prism profile raises it to 1500 for ~56 px "
+        "somata.",
+    "roigbiv-param-max-area":
+        "Gate 1 maximum ROI area in px². Masks larger than this are rejected as "
+        "merged blobs. GRIN default 600 (512²); the prism profile raises it to "
+        "5000.",
+    "roigbiv-param-min-solidity":
+        "Gate 1 minimum solidity (filled-area fraction, 0–1). Rejects ragged / "
+        "non-convex masks. GRIN default 0.55; prism relaxes to 0.40 for cyto3's "
+        "ugly-but-valid masks.",
+    "roigbiv-param-max-eccentricity":
+        "Gate 1 maximum eccentricity (0–1). Rejects elongated fiber/axon shapes. "
+        "GRIN default 0.90; prism relaxes to 0.95.",
     "roigbiv-param-model":
         "Cellpose model checkpoint used for Stage 1 spatial detection. "
         "Defaults to the deployed CP3 model; fine-tuned checkpoints appear "

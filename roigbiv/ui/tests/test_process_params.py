@@ -20,9 +20,19 @@ PARAM_IDS = [
     "roigbiv-param-tau",
     "roigbiv-param-k",
     "roigbiv-param-mc-backend",
+    "roigbiv-param-mc-strip-height",
+    "roigbiv-param-profile",
     "roigbiv-param-model",
+    "roigbiv-param-channels",
     "roigbiv-param-flow-threshold",
+    "roigbiv-param-cellprob-threshold",
     "roigbiv-param-diameter",
+    "roigbiv-param-use-denoise",
+    "roigbiv-param-tile-norm-blocksize",
+    "roigbiv-param-min-area",
+    "roigbiv-param-max-area",
+    "roigbiv-param-min-solidity",
+    "roigbiv-param-max-eccentricity",
     "roigbiv-param-scout",
     "roigbiv-param-foundation-only",
     "roigbiv-param-stage-2",
@@ -171,6 +181,50 @@ def test_stage1_group_contains_cellpose_params():
     # diameter is the Cellpose soma-scale knob, set on the MC preview circle.
     assert "roigbiv-param-diameter" in sids
     assert "roigbiv-mc-suggest-btn" in sids
+
+
+def test_profile_select_offers_concrete_profiles_only():
+    # The Profile dropdown lists concrete profiles (no 'auto') and defaults to
+    # grin — the no-op 512² baseline, so a fresh form == the prior behavior.
+    sel = _find_by_id(_params_form(), "roigbiv-param-profile")
+    values = _option_values(sel)
+    assert set(values) == {"grin", "prism", "generic"}
+    assert "auto" not in values
+    assert sel.value == "grin"
+
+
+def test_profile_field_values_prism_applies_the_levers():
+    # The autofill resolver pulls every PRISM lever from the profile bundle,
+    # falling back to the grin/dataclass baseline for unset keys.
+    from roigbiv.ui.pages.process import _profile_field_values
+
+    v = _profile_field_values("prism")
+    assert v["channels"] == (0, 0)
+    assert v["cellpose_model"] == "cyto3"
+    assert v["use_denoise"] is False
+    assert v["diameter"] == 56
+    assert v["min_area"] == 1500 and v["max_area"] == 5000
+    assert v["cellprob_threshold"] == 0.0
+    assert v["mc_strip_height"] == 48
+
+
+def test_profile_field_values_grin_is_dataclass_baseline():
+    from roigbiv.pipeline.types import PipelineConfig
+    from roigbiv.ui.pages.process import _PROFILE_AUTOFILL, _profile_field_values
+
+    base = PipelineConfig()
+    v = _profile_field_values("grin")
+    for key, _id in _PROFILE_AUTOFILL:
+        assert v[key] == getattr(base, key), f"grin {key} must match the dataclass default"
+
+
+def test_channels_str_round_trip():
+    from roigbiv.ui.pages.process import _channels_to_str, _parse_channels_value
+
+    assert _channels_to_str((0, 0)) == "0,0"
+    assert _parse_channels_value("0,0") == (0, 0)
+    assert _parse_channels_value("1,2") == (1, 2)
+    assert _parse_channels_value(None) == (1, 2)        # bad input → GRIN default
 
 
 def test_mc_fov_select_is_dbc_select(monkeypatch):
