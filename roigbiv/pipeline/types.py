@@ -259,6 +259,12 @@ class PipelineConfig:
     mc_s2p_pre_smooth: float = 0.0          # pre-high-pass Gaussian smoothing
     mc_s2p_spatial_taper: float = 40.0      # edge pixels tapered out of registration
 
+    # ── Acquisition / lens profile (see pipeline/profiles.py) ─────────────
+    # Records which profile bundle the CLI/UI resolver applied
+    # (grin/prism/generic). "grin" = dataclass defaults (no-op). Serialized
+    # into summary_for_log so the manifest records the resolved profile.
+    profile: str = "grin"
+
     # ── Stage 1 (Cellpose) ────────────────────────────────────────────────
     cellpose_model: str = _DEFAULT_CELLPOSE_MODEL
     diameter: int = 12
