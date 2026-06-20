@@ -64,12 +64,20 @@ PROFILES: dict[str, dict] = {
         "cellpose_model": "cyto3",     # generalist beats the GRIN-overfit deployed model
         "use_denoise": False,          # denoise_cyto3 suppresses dim PRISM signal
         "diameter": 56,                # measure_prism_scale.py median
-        # ── Group 2: Gate-1 area bounds (grounded by measure_prism_scale.py) ──
-        "min_area": 1500,
-        "max_area": 5000,
-        # ── Group 2/3: PENDING A/B — relax for cyto3's ugly-but-valid masks ──
+        # ── Group 2: Gate-1 area bounds (widened by the Stage-1 recall OFAT) ──
+        # Bounds widened from the measure_prism_scale.py 1500/5000 after a
+        # drift-guarded one-factor-at-a-time matrix on VI15_D2_FOV2 (pre-005):
+        # min_area 1500→900 recovers small dim somata; max_area 5000→9000
+        # recovers large single-soma masks the 5000 ceiling clipped. Net 11→17
+        # accepts, 0 rejects, on that FOV. CAVEAT: max_area=9000 also admits
+        # genuine 2-soma merges — KEEP the peak-count check (skimage
+        # peak_local_max, ~28 px sep) downstream so ≥2-peak masks flag rather
+        # than accept (the label-11 merge case). See scripts/stage1_matrix/.
+        "min_area": 900,
+        "max_area": 9000,
+        # ── Group 3: relax for cyto3's ugly-but-valid masks (recall OFAT) ──
         "min_solidity": 0.40,
-        "max_eccentricity": 0.95,
+        "max_eccentricity": 0.97,    # 0.95→0.97 recovers the 1 elongated reject
         "tile_norm_blocksize": 256,
         "flow_threshold": 0.4,
         "cellprob_threshold": 0.0,

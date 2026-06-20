@@ -120,19 +120,19 @@ HELP_TEXT: dict[str, str] = {
         "1024² FOVs).",
     "roigbiv-param-min-area":
         "Gate 1 minimum ROI area in px². Masks smaller than this are rejected. "
-        "GRIN default 80 (512²); the prism profile raises it to 1500 for ~56 px "
+        "GRIN default 80 (512²); the prism profile raises it to 900 for ~56 px "
         "somata.",
     "roigbiv-param-max-area":
         "Gate 1 maximum ROI area in px². Masks larger than this are rejected as "
         "merged blobs. GRIN default 600 (512²); the prism profile raises it to "
-        "5000.",
+        "9000 (large somata; the peak-count check still flags genuine merges).",
     "roigbiv-param-min-solidity":
         "Gate 1 minimum solidity (filled-area fraction, 0–1). Rejects ragged / "
         "non-convex masks. GRIN default 0.55; prism relaxes to 0.40 for cyto3's "
         "ugly-but-valid masks.",
     "roigbiv-param-max-eccentricity":
         "Gate 1 maximum eccentricity (0–1). Rejects elongated fiber/axon shapes. "
-        "GRIN default 0.90; prism relaxes to 0.95.",
+        "GRIN default 0.90; prism relaxes to 0.97.",
     "roigbiv-param-model":
         "Cellpose model checkpoint used for Stage 1 spatial detection. "
         "Defaults to the deployed CP3 model; fine-tuned checkpoints appear "

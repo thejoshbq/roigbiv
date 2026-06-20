@@ -74,7 +74,7 @@ def test_merged_overrides_precedence_and_label():
     base = {"fs": 7.5, "tau": 1.0}
     out = merged_overrides(
         "prism", base,
-        [{"min_area": 999},                 # explicit user flag beats profile's 1500
+        [{"min_area": 999},                 # explicit user flag beats profile's 900
          {"diameter": 30}],                 # explicit beats profile's 56
     )
     assert out["fs"] == 7.5                  # base preserved
@@ -155,7 +155,7 @@ def test_prism_cfg_applies_single_channel_generalist():
     assert cfg.use_denoise is False
     assert cfg.diameter == 56
     assert cfg.flow_threshold == 0.4
-    assert cfg.min_area == 1500 and cfg.max_area == 5000
+    assert cfg.min_area == 900 and cfg.max_area == 9000
 
 
 def test_explicit_flag_overrides_prism_profile_in_cfg():

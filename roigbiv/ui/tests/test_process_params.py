@@ -203,7 +203,7 @@ def test_profile_field_values_prism_applies_the_levers():
     assert v["cellpose_model"] == "cyto3"
     assert v["use_denoise"] is False
     assert v["diameter"] == 56
-    assert v["min_area"] == 1500 and v["max_area"] == 5000
+    assert v["min_area"] == 900 and v["max_area"] == 9000
     assert v["cellprob_threshold"] == 0.0
     assert v["mc_strip_height"] == 48
 
