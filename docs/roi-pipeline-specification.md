@@ -513,6 +513,15 @@ Each ROI is evaluated against these features:
 | Nuclear shadow score | DoG response at ROI centroid | ≥ 0 (any positive) | Strong negative (inverted pattern) |
 | Soma-surround contrast | (mean ROI brightness − mean annulus brightness) / mean annulus brightness | > 0.1 | ≤ 0.1 |
 | Cellpose probability | From Cellpose output | > −2.0 (already filtered by inference) | Below threshold |
+| Merge peaks | Local-maxima count (`peak_local_max`, ~1-soma-radius separation) inside masks larger than `gate1_merge_peak_min_area` | 1 peak (single soma) | ≥2 peaks → **flag, never accept** (2-soma merge admitted by a high `max_area`) |
+
+**Merge check rationale:** a permissive `max_area` (e.g. the PRISM profile's
+9000 px) is needed to recover legitimately large somata, but it also lets two
+adjacent somata fused into one Cellpose mask pass the area ceiling. The
+peak-count check distinguishes a single large soma (1 intensity peak) from a
+merge (≥2). A merge is demoted accept→flag (surfaced for HITL); it is not
+auto-rejected and not auto-split here. The check is inert wherever masks never
+exceed `gate1_merge_peak_min_area` (e.g. the GRIN profile, `max_area=600`).
 
 **Gate outcome categories:**
 - **Accept:** Passes all criteria → subtracted in source subtraction,

@@ -12,18 +12,44 @@ Validates Stage 1 ROIs before source subtraction:
     absolute margins for "marginal" flagging (Plan agent B7)
 
 Decision rules (spec §6):
-  REJECT if area ∉ [80, 350] OR solidity < 0.55 OR eccentricity > 0.90
+  REJECT if area ∉ [min_area, max_area] OR solidity < min_solidity
+          OR eccentricity > max_eccentricity
           OR (nuclear_shadow_score strongly negative AND contrast ≤ 0.1)
-  FLAG   if exactly one criterion fails within its per-criterion margin
+  FLAG   if exactly one criterion fails within its per-criterion margin,
+          OR a large mask holds ≥2 intensity peaks (2-soma merge: demote
+          accept→flag rather than accept it as one soma)
   ACCEPT otherwise
 """
 from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import binary_dilation
+from skimage.feature import peak_local_max
 from skimage.measure import regionprops
 
 from roigbiv.pipeline.types import ROI, PipelineConfig
+
+
+def count_mask_peaks(
+    mask: np.ndarray,
+    intensity: np.ndarray,
+    min_separation: int,
+) -> int:
+    """Number of local-maxima inside `mask` on the `intensity` image.
+
+    A single soma yields one peak; ≥2 peaks means the mask spans multiple
+    somata fused into one blob — a merge admitted by a high ``max_area``
+    ceiling. Replicates the diagnostic validated in the Stage-1 recall OFAT
+    (scripts/stage1_matrix): peaks restricted to the mask, no border exclusion.
+    """
+    img = np.where(mask, intensity, 0.0)
+    peaks = peak_local_max(
+        img,
+        min_distance=int(min_separation),
+        labels=mask.astype(int),
+        exclude_border=False,
+    )
+    return int(len(peaks))
 
 
 def compute_annulus(
@@ -181,6 +207,22 @@ def evaluate_gate1(
         if dog_reject:
             gate_reasons.append(f"dog_contrast_conjunction:score={nuclear_shadow_score:.3f}")
 
+        # ── Merge check (spec §6) ─────────────────────────────────────────
+        # A large mask with ≥2 intensity peaks is a 2-soma merge that a high
+        # max_area would otherwise accept as one soma. Demote accept→flag so it
+        # surfaces for HITL review (splitting is out of scope here). Existing
+        # flag/reject outcomes are preserved; the reason is recorded either way.
+        n_peaks = 0
+        if area > cfg.gate1_merge_peak_min_area:
+            n_peaks = count_mask_peaks(
+                mask, mean_S, cfg.gate1_merge_peak_min_separation,
+            )
+            if n_peaks >= 2:
+                gate_reasons.append(f"merge_peaks:{n_peaks}")
+                if outcome == "accept":
+                    outcome = "flag"
+                    confidence = "moderate"
+
         roi = ROI(
             mask=mask,
             label_id=next_label,
@@ -198,6 +240,7 @@ def evaluate_gate1(
                 "vcorr_mean": float(vcorr_S[mask].mean()),
                 "mean_S_mean": float(mean_S[mask].mean()),
                 "dog_thresh_strong_neg": dog_thresh_strong_neg,
+                "mask_peak_count": n_peaks,
             },
         )
         rois.append(roi)

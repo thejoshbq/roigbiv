@@ -316,6 +316,13 @@ class PipelineConfig:
     min_solidity: float = 0.55
     max_eccentricity: float = 0.90
     min_contrast: float = 0.10
+    # Merge detection: a large mask with >=2 intensity peaks is a 2-soma merge
+    # admitted by a high max_area ceiling. Such masks are demoted accept->flag
+    # (never silently accepted; splitting is a downstream/HITL concern). Inert
+    # wherever masks never exceed gate1_merge_peak_min_area (e.g. GRIN profile,
+    # max_area=600). Grounded by the Stage-1 recall OFAT (scripts/stage1_matrix).
+    gate1_merge_peak_min_area: int = 4000       # only peak-check masks larger than this (px²)
+    gate1_merge_peak_min_separation: int = 28   # peak_local_max min_distance (~1 soma radius @ d=56)
     # Per-criterion absolute margins for marginal flagging
     flag_area_margin: int = 20
     flag_solidity_margin: float = 0.05
