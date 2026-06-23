@@ -142,6 +142,9 @@ def _left_column(workspace: Optional[WorkspacePaths],
         dbc.Button("Run pipeline", id="roigbiv-run-btn",
                    color="primary", className="mt-3 w-100", n_clicks=0,
                    disabled=workspace is None or run_active),
+        dbc.Button("Stop run", id="roigbiv-stop-btn",
+                   color="danger", outline=True, className="mt-2 w-100",
+                   n_clicks=0, disabled=not run_active),
     ])
 
 
@@ -339,6 +342,11 @@ def _params_form(diameter_default: int = 12) -> html.Div:
             dbc.Switch(id="roigbiv-param-resume", label="Resume", value=False),
             "roigbiv-param-resume",
         ),
+        _switch_row(
+            dbc.Switch(id="roigbiv-param-override",
+                       label="Override previous registry entry", value=False),
+            "roigbiv-param-override",
+        ),
     ])
     notifications = _stage_card("Notifications", [
         _field_row("Slack channel ID", "roigbiv-param-slack-channel",
@@ -353,7 +361,36 @@ def _params_form(diameter_default: int = 12) -> html.Div:
             className="text-muted d-block mt-1",
         ),
     ])
-    return html.Div([foundation, stage1, stage_control, notifications])
+    form = html.Div([foundation, stage1, stage_control, notifications])
+    _persist_param_controls(form)
+    return form
+
+
+def _persist_param_controls(tree) -> None:
+    """Mark every ``roigbiv-param-*`` control for browser persistence in-place.
+
+    Walks the built form tree and turns on native Dash persistence
+    (``localStorage``, constant key — these tunables are workspace-independent)
+    for each parameter control, so values survive page navigation / reload
+    instead of resetting to the hardcoded ``value=`` defaults. Centralized here
+    so new params are covered automatically; the ``_prop_names`` guard skips the
+    ``roigbiv-param-*-help`` ``html.Small`` spans that share the id prefix but
+    don't support persistence.
+    """
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (list, tuple)):
+            stack.extend(node)
+            continue
+        cid = getattr(node, "id", None)
+        if (isinstance(cid, str) and cid.startswith("roigbiv-param-")
+                and "persistence" in getattr(node, "_prop_names", ())):
+            node.persistence = True
+            node.persistence_type = "local"
+        children = getattr(node, "children", None)
+        if children is not None:
+            stack.append(children)
 
 
 def _stage_control_reactivity(scout, foundation_only) -> tuple:
@@ -624,10 +661,14 @@ def _mc_preview_section() -> html.Div:
     state = get_app_state()
     options, value = _mc_options_and_value(state.workspace)
     diam = state.calibrated_diameter() or 12
+    # Persist the previewed FOV per workspace; False = no persistence when no
+    # workspace is resolved yet (a constant key would leak across workspaces).
+    mc_key = str(state.workspace.input_root) if state.workspace else False
     return html.Div([
         html.H5("Motion-correction preview", className="mb-2 mt-3"),
         dbc.Select(id="roigbiv-mc-fov-select", options=options, value=value,
-                   className="mb-2"),
+                   className="mb-2",
+                   persistence=mc_key, persistence_type="local"),
         dcc.Graph(id="roigbiv-mc-preview",
                   figure=_mc_preview_figure(value, diameter_px=diam),
                   config={"displaylogo": False, "scrollZoom": True,
@@ -636,10 +677,57 @@ def _mc_preview_section() -> html.Div:
     ])
 
 
+def _launched_config_summary(snap: Optional["RunSnapshot"]):
+    """Read-only echo of the overrides that actually launched the run.
+
+    Rendered from the runner snapshot at page-load time, so it survives
+    navigation / reload and — unlike the live, persisted parameter form — never
+    misrepresents an in-progress run if the user edits the form afterward.
+    Returns ``None`` before any run has started.
+    """
+    if snap is None or snap.started_at is None or not snap.overrides:
+        return None
+    ov = snap.overrides
+
+    def _item(label: str, value) -> html.Div:
+        return html.Div(
+            [html.Span(f"{label}: ", className="text-muted"),
+             html.Span(str(value), className="fw-semibold")],
+            className="small me-3 d-inline-block",
+        )
+
+    if ov.get("scout_mode"):
+        stages = "scout"
+    elif ov.get("foundation_only"):
+        stages = "foundation-only"
+    else:
+        on = [f"S{n}" for n in (2, 3, 4) if ov.get(f"enable_stage_{n}", True)]
+        if ov.get("resume"):
+            on.append("resume")
+        stages = ", ".join(on) if on else "—"
+    model = str(ov.get("cellpose_model", "")).rsplit("/", 1)[-1]
+    diam = ov.get("diameter")
+    return dbc.Card(dbc.CardBody([
+        html.H6("Launched config", className="mb-2"),
+        html.Div([
+            _item("FOVs", snap.n_fovs),
+            _item("fs", ov.get("fs")),
+            _item("tau", ov.get("tau")),
+            _item("model", model or "—"),
+            _item("MC", ov.get("motion_correction_backend")),
+            _item("diameter", diam if diam is not None else "auto"),
+            _item("channels", ov.get("channels")),
+            _item("stages", stages),
+        ]),
+    ]), className="roigbiv-card-accent mb-3")
+
+
 def _right_column(snap: Optional["RunSnapshot"] = None) -> html.Div:
     progress, label = _progress_for(snap)
+    config_card = _launched_config_summary(snap)
     return html.Div([
         html.H4("Run status", className="mb-3"),
+        *([config_card] if config_card is not None else []),
         html.Div(id="roigbiv-run-timer", className="mb-2",
                  children=(_format_timer(snap.started_at, snap.completed_at)
                            if snap else "")),
@@ -733,13 +821,14 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-param-max-eccentricity", "value"),
         State("roigbiv-param-tile-norm-blocksize", "value"),
         State("roigbiv-param-mc-strip-height", "value"),
+        State("roigbiv-param-override", "value"),
         prevent_initial_call=True,
     )
     def _on_run(_n: int, fs, tau, k, model, mc_backend, flow_threshold,
                 diameter, scout, foundation_only, stage_2, stage_3, stage_4,
                 resume, slack_channel, profile, channels, cellprob_threshold,
                 use_denoise, min_area, max_area, min_solidity, max_eccentricity,
-                tile_norm_blocksize, mc_strip_height):
+                tile_norm_blocksize, mc_strip_height, override):
         state = get_app_state()
         if state.workspace is None:
             return True, dbc.Alert("Scan a workspace first.", color="warning")
@@ -798,6 +887,10 @@ def register_callbacks(app: dash.Dash) -> None:
                 # Diameter chosen on the MC preview (+ diameter_auto forced off).
                 **_diameter_overrides(state.calibrated_diameter(), diameter),
             }
+        # Opt-in: replace (not accumulate) the prior registry entry for each
+        # re-run FOV. Set once here so it covers both the AUTO and concrete
+        # branches. Popped before PipelineConfig is built (see workspace.py).
+        overrides["override"] = bool(override)
         runner = get_pipeline_runner()
         slack_channel = (slack_channel or "").strip() or None
         result = runner.start(state.workspace, overrides,
@@ -828,6 +921,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-run-banner", "children", allow_duplicate=True),
         Output("roigbiv-run-btn", "disabled", allow_duplicate=True),
         Output("roigbiv-run-confirm", "children"),
+        Output("roigbiv-stop-btn", "disabled", allow_duplicate=True),
         Input("roigbiv-process-tick", "n_intervals"),
         prevent_initial_call="initial_duplicate",
     )
@@ -845,7 +939,25 @@ def register_callbacks(app: dash.Dash) -> None:
             _render_banner(snap),
             state.workspace is None or snap.active,
             _render_confirm(snap.results_summary),
+            # Stop is actionable only while a run is in flight (and not already
+            # stopping).
+            (not snap.active) or snap.stopping,
         )
+
+    @app.callback(
+        Output("roigbiv-run-banner", "children", allow_duplicate=True),
+        Output("roigbiv-stop-btn", "disabled", allow_duplicate=True),
+        Input("roigbiv-stop-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _on_stop(_n: int):
+        # Cooperative stop: flag the in-flight run to halt at the next stage
+        # boundary. Disable the button once a stop is requested; the tick
+        # refreshes the banner from "Stopping…" to "Run stopped." when it ends.
+        runner = get_pipeline_runner()
+        requested = runner.abort()
+        snap = runner.snapshot()
+        return _render_banner(snap), (not requested)
 
     @app.callback(
         Output("roigbiv-run-banner", "children", allow_duplicate=True),
@@ -947,11 +1059,17 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-tif-select-sink", "data"),
         Input("roigbiv-tif-select", "value"),
-        prevent_initial_call=True,
+        prevent_initial_call=False,
     )
     def _sync_selected_tifs(value):
         # Mirror the checklist selection into server-side AppState so the run
         # path (_on_run, server-side) reads it without a new callback State.
+        # Fires on the *restored* value too (persistence re-mounts the checklist
+        # on nav/reload), keeping AppState in step with what's displayed. Guard
+        # the workspace-less initial render: the sink lives in the always-present
+        # layout, so this can fire before any scan.
+        if get_app_state().workspace is None:
+            return no_update
         get_app_state().set_selected_tifs(value or [])
         return len(value or [])
 
@@ -1093,12 +1211,25 @@ def _render_banner(snap: Optional["RunSnapshot"]):
     """Live run-status banner: current stage while active, outcome when done."""
     if snap is None or snap.started_at is None:
         return None
+    # Error wins over stopped: a crash on the post-stop path (e.g. backfill)
+    # still sets the abort event, so guard stopped on the absence of an error
+    # or the failure would be masked as a clean "Run stopped."
     if snap.error:
         return dbc.Alert("Run failed — see log below.",
                          color="danger", className="py-2 mb-2")
+    if snap.stopped:
+        return dbc.Alert("Run stopped.",
+                         color="secondary", className="py-2 mb-2")
     if not snap.active:
         return dbc.Alert("Run complete.",
                          color="success", className="py-2 mb-2")
+    if snap.stopping:
+        stage = snap.current_stage or "current stage"
+        return dbc.Alert(
+            [html.Span("Stopping · ", className="fw-bold"),
+             html.Span(f"finishing {stage}, then halting…")],
+            color="warning", className="py-2 mb-2",
+        )
     stage = snap.current_stage or "Pipeline run started"
     return dbc.Alert(
         [html.Span("Running · ", className="fw-bold"), html.Span(stage)],
@@ -1113,6 +1244,9 @@ def _workspace_summary(workspace: WorkspacePaths) -> html.Div:
     # AppState.set_workspace resets the stored selection to all) — no separate
     # seeding output is needed on the scan callback.
     options, values = _tif_options_and_values(workspace)
+    # Persist the selection keyed to workspace identity so it survives reload
+    # but never bleeds a stale selection onto a different workspace.
+    ws_key = str(workspace.input_root)
     return dbc.Card(dbc.CardBody([
         html.H6("Workspace resolved", className="mb-2"),
         html.Small("Select which detected TIF stacks to run.",
@@ -1122,12 +1256,14 @@ def _workspace_summary(workspace: WorkspacePaths) -> html.Div:
             options=[{"label": "Select all", "value": "all"}],
             value=["all"] if values else [],
             className="fw-bold mb-1",
+            persistence=ws_key, persistence_type="local",
         ),
         dbc.Checklist(
             id="roigbiv-tif-select",
             options=options,
             value=list(values),
             className="ms-3 mb-0",
+            persistence=ws_key, persistence_type="local",
         ),
     ]), className="roigbiv-card-accent mt-2")
 

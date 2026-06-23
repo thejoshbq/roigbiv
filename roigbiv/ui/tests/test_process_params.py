@@ -358,12 +358,15 @@ def test_workspace_summary_renders_checklist(monkeypatch):
 
     monkeypatch.setattr(proc, "validate_tif", lambda _t: (None, (10, 32, 32)))
     tifs = (Path("/ws/a_mc.tif"), Path("/ws/b_mc.tif"))
-    summary = proc._workspace_summary(SimpleNamespace(tifs=tifs))
+    summary = proc._workspace_summary(
+        SimpleNamespace(tifs=tifs, input_root=Path("/ws")))
 
     child = _find_by_id(summary, "roigbiv-tif-select")
     assert type(child).__name__ == "Checklist"
     assert [o["value"] for o in child.options] == [str(t) for t in tifs]
     assert child.value == [str(t) for t in tifs]          # all selected
+    # Selection persists per workspace so it survives a reload.
+    assert child.persistence == "/ws" and child.persistence_type == "local"
 
     master = _find_by_id(summary, "roigbiv-tif-select-all")
     assert type(master).__name__ == "Checklist"
@@ -422,6 +425,70 @@ def test_app_state_selection_round_trip():
     assert st.selected_tifs == {str(ws.tifs[0])}
     st.set_selected_tifs([])
     assert st.selected_tifs == set()
+
+
+# ── Override switch + form persistence ───────────────────────────────────────
+
+def test_override_switch_present_with_help_text():
+    form = _params_form()
+    sw = _find_by_id(form, "roigbiv-param-override")
+    assert sw.value is False                       # opt-in: off by default
+    assert "roigbiv-param-override" in HELP_TEXT
+
+
+def test_param_controls_persist_to_localstorage():
+    # Every roigbiv-param-* control is marked for localStorage persistence so
+    # edits survive a page reload (the *-help spans are correctly skipped).
+    form = _params_form()
+    persisted = [c for c in _walk(form)
+                 if isinstance(getattr(c, "id", None), str)
+                 and c.id.startswith("roigbiv-param-")
+                 and getattr(c, "persistence", None) is True]
+    assert len(persisted) >= 20
+    for c in persisted:
+        assert c.persistence_type == "local"
+    fs = _find_by_id(form, "roigbiv-param-fs")
+    assert fs.persistence is True and fs.persistence_type == "local"
+
+
+# ── Launched-config echo ─────────────────────────────────────────────────────
+
+def test_launched_config_summary_renders_overrides():
+    import time
+
+    from roigbiv.ui.pages.process import _launched_config_summary
+    from roigbiv.ui.services.pipeline_runner import RunSnapshot
+
+    snap = RunSnapshot(
+        active=False, started_at=time.time(), completed_at=time.time(),
+        n_fovs=3, n_done=3, n_failed=0, logs=[], error=None,
+        overrides={
+            "fs": 7.5, "tau": 1.0,
+            "cellpose_model": "models/deployed/current_model",
+            "motion_correction_backend": "phasecorr", "channels": [0, 0],
+            "diameter": 12,
+            "enable_stage_2": True, "enable_stage_3": False, "enable_stage_4": True,
+        },
+    )
+    card = _launched_config_summary(snap)
+    assert card is not None
+    text = " ".join(
+        c.children if isinstance(getattr(c, "children", None), str) else ""
+        for c in _walk(card))
+    # Model is shown basename-only; the disabled stage is omitted from the list.
+    assert "current_model" in text
+    assert "phasecorr" in text
+    assert "S2" in text and "S4" in text and "S3" not in text
+
+
+def test_launched_config_summary_none_before_run():
+    from roigbiv.ui.pages.process import _launched_config_summary
+    from roigbiv.ui.services.pipeline_runner import RunSnapshot
+
+    pre = RunSnapshot(active=False, started_at=None, completed_at=None,
+                      n_fovs=0, n_done=0, n_failed=0, logs=[], error=None)
+    assert _launched_config_summary(pre) is None
+    assert _launched_config_summary(None) is None
 
 
 if __name__ == "__main__":

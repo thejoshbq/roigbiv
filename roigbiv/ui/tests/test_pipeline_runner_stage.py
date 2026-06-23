@@ -79,5 +79,72 @@ def test_pipeline_ok_counts_done():
     assert runner.snapshot().n_done == 1
 
 
+# ── Stop (cooperative abort) ─────────────────────────────────────────────────
+
+def test_abort_noop_when_no_run_active():
+    runner = _runner()
+    assert runner.abort() is False
+    snap = runner.snapshot()
+    assert snap.stopping is False
+    assert snap.stopped is False
+
+
+def test_abort_sets_stopping_then_stopped():
+    runner = _runner()
+    runner._active = True              # simulate an in-flight run
+    assert runner.abort() is True
+    assert runner._abort_event.is_set()
+    # While still active: stopping is True, stopped is False.
+    snap = runner.snapshot()
+    assert snap.stopping is True
+    assert snap.stopped is False
+    # When the run ends with the event set: stopped flips True, stopping clears.
+    runner._active = False
+    snap = runner.snapshot()
+    assert snap.stopping is False
+    assert snap.stopped is True
+
+
+def test_stopped_is_independent_of_awaiting():
+    # A stopped run is distinct from a run paused for optics confirmation.
+    runner = _runner()
+    runner._active = True
+    runner.abort()
+    runner._active = False
+    snap = runner.snapshot()
+    assert snap.stopped is True
+    assert snap.n_awaiting == 0
+
+
+# ── Launched-config echo (overrides capture) ─────────────────────────────────
+
+def test_banner_error_wins_over_stopped():
+    # A crash on the post-stop path still leaves the abort event set; the banner
+    # must surface the failure, not mask it as a clean "Run stopped."
+    import time
+
+    from roigbiv.ui.pages.process import _render_banner
+    from roigbiv.ui.services.pipeline_runner import RunSnapshot
+
+    snap = RunSnapshot(
+        active=False, started_at=time.time(), completed_at=time.time(),
+        n_fovs=1, n_done=0, n_failed=1, logs=[],
+        error="RuntimeError: backfill blew up", stopped=True, stopping=False)
+    alert = _render_banner(snap)
+    assert "failed" in str(alert.children).lower()
+    assert alert.color == "danger"
+
+
+def test_overrides_exposed_in_snapshot_and_cleared_on_reset():
+    runner = _runner()
+    runner._overrides = {"fs": 7.5, "tau": 1.0}
+    assert runner.snapshot().overrides == {"fs": 7.5, "tau": 1.0}
+    # Snapshot returns a copy — callers can't mutate runner state.
+    runner.snapshot().overrides["fs"] = 30.0
+    assert runner._overrides["fs"] == 7.5
+    runner._reset_locked()
+    assert runner.snapshot().overrides is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

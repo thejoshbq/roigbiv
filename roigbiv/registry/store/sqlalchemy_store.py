@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session as SASession
 from sqlalchemy.orm import sessionmaker
@@ -254,6 +254,75 @@ class SQLAlchemyStore:
                 .order_by(m.Session.created_at.desc())
             ).first()
             return _session_to_record(row) if row else None
+
+    def supersede_session(self, output_dir: str) -> dict:
+        """Delete prior run rows for ``output_dir`` so a re-run replaces them.
+
+        Deletes, in FK-safe order: the ``cell_observation`` rows of every
+        session tied to ``output_dir``, then those ``session`` rows. For each
+        FOV thereby left with no remaining sessions (an orphan — its only run
+        was just superseded), deletes its ``cell`` rows and the ``fov`` row.
+        A FOV that still has sessions from other output dirs is left intact.
+
+        SQLite honours ``ON DELETE CASCADE`` only with ``PRAGMA
+        foreign_keys=ON`` per connection, so we cascade explicitly (matching
+        :mod:`roigbiv.registry.dedupe`).
+
+        Assumes the superseded session is the cell origin for ``output_dir``
+        (the intended same-output_dir re-run case). When a FOV survives because
+        it carries sessions from *other* output dirs, its ``Cell`` rows are
+        kept; a ``Cell.first_seen_session_id`` that pointed at the dropped
+        session becomes a dangling soft-reference (the column is nullable with
+        no FK, read only as a string tie-break in matching, so it degrades
+        gracefully rather than erroring).
+
+        Returns deletion counts: ``{"sessions", "observations", "fovs",
+        "cells"}``.
+        """
+        counts = {"sessions": 0, "observations": 0, "fovs": 0, "cells": 0}
+        with self._Session() as s:
+            sess_rows = s.scalars(
+                select(m.Session).where(m.Session.output_dir == output_dir)
+            ).all()
+            if not sess_rows:
+                return counts
+            session_ids = [r.session_id for r in sess_rows]
+            fov_ids = {r.fov_id for r in sess_rows}
+
+            obs_ids = s.scalars(
+                select(m.CellObservation.observation_id).where(
+                    m.CellObservation.session_id.in_(session_ids)
+                )
+            ).all()
+            counts["observations"] = len(obs_ids)
+            if obs_ids:
+                s.execute(
+                    delete(m.CellObservation).where(
+                        m.CellObservation.session_id.in_(session_ids)
+                    )
+                )
+            s.execute(
+                delete(m.Session).where(m.Session.session_id.in_(session_ids))
+            )
+            counts["sessions"] = len(session_ids)
+
+            # Drop any FOV the supersede just orphaned (zero sessions left).
+            for fov_id in fov_ids:
+                remaining = s.scalar(
+                    select(m.Session).where(m.Session.fov_id == fov_id)
+                )
+                if remaining is not None:
+                    continue
+                cell_ids = s.scalars(
+                    select(m.Cell.global_cell_id).where(m.Cell.fov_id == fov_id)
+                ).all()
+                if cell_ids:
+                    s.execute(delete(m.Cell).where(m.Cell.fov_id == fov_id))
+                    counts["cells"] += len(cell_ids)
+                s.execute(delete(m.FOV).where(m.FOV.fov_id == fov_id))
+                counts["fovs"] += 1
+            s.commit()
+        return counts
 
     # ── Cell ──────────────────────────────────────────────────────────────
     def insert_cell(self, cell: CellRecord) -> None:

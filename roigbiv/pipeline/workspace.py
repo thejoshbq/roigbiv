@@ -200,6 +200,7 @@ def run_with_workspace(
     n_workers: int = 1,
     registry_config: Optional["RegistryConfig"] = None,
     selected_tifs: Optional[Sequence[Path]] = None,
+    abort_event: Optional["threading.Event"] = None,
 ) -> list[FOVRunResult]:
     """Run the pipeline + registry over every TIF in ``workspace``.
 
@@ -236,6 +237,9 @@ def run_with_workspace(
     cfg_overrides = dict(cfg_overrides or {})
     if resume:
         cfg_overrides.setdefault("resume", True)
+    # ``override`` is a registry directive, not a PipelineConfig field — pop it
+    # here so it never reaches ``_build_config``/``PipelineConfig``.
+    override = bool(cfg_overrides.pop("override", False))
 
     # Honor a UI-selected subset without mutating the frozen workspace. Resolve
     # both sides so a non-resolved selection still matches workspace.tifs.
@@ -261,16 +265,26 @@ def run_with_workspace(
         results = _run_parallel(workspace, tifs_to_run, cfg_overrides, log,
                                 skip_registry=skip_registry,
                                 n_workers=n_workers,
-                                registry_cfg=cfg)
+                                registry_cfg=cfg,
+                                override=override,
+                                abort_event=abort_event)
     else:
         results = []
         for idx, tif in enumerate(tifs_to_run, start=1):
+            # Cooperative stop between FOVs: honor a stop requested while a
+            # prior FOV was running (an in-FOV stop is handled by run_pipeline).
+            if abort_event is not None and abort_event.is_set():
+                log(f"Stop requested — halting before FOV {idx}/"
+                    f"{len(tifs_to_run)} ({len(tifs_to_run) - idx + 1} not run).")
+                break
             if idx > 1:
                 log(fmt.fov_separator())
             log(fmt.fov_banner(tif.name, idx, len(tifs_to_run)))
             results.append(_process_one(tif, workspace, cfg_overrides, log,
                                         skip_registry=skip_registry,
-                                        registry_cfg=cfg))
+                                        registry_cfg=cfg,
+                                        override=override,
+                                        abort_event=abort_event))
 
     if not skip_backfill:
         _safety_backfill(workspace, log, cfg)
@@ -287,11 +301,25 @@ def _run_parallel(
     skip_registry: bool,
     n_workers: int,
     registry_cfg: "RegistryConfig",
+    override: bool = False,
+    abort_event: Optional["threading.Event"] = None,
 ) -> list[FOVRunResult]:
     """Fan pipeline calls out to ``pipeline/batch.run_batch``; do the light
     post-pipeline work (registry + traces bundle) sequentially in the parent.
+
+    The in-process ``abort_event`` cannot reach the separate batch worker
+    processes, so it only short-circuits *before* the pool launches; a full
+    mid-batch stop (future cancel + pool terminate) is a CLI-only follow-up.
     """
     from roigbiv.pipeline.batch import run_batch
+
+    # Honor a stop requested before the pool launches — the threading.Event
+    # does not propagate into the worker processes once they're running.
+    if abort_event is not None and abort_event.is_set():
+        log("Stop requested — halting before the parallel batch launches.")
+        return [FOVRunResult(tif=t, output_dir=workspace.output_root /
+                             t.stem.replace("_mc", ""), error="aborted")
+                for t in tifs]
 
     jobs: list[tuple[Path, PipelineConfig]] = []
     out_dirs: list[Path] = []
@@ -378,7 +406,8 @@ def _run_parallel(
                 log("  registry: skipped (foundation-only dry run)")
         else:
             try:
-                registry = _register_session(stem, fov, log, registry_cfg)
+                registry = _register_session(stem, fov, log, registry_cfg,
+                                             override=override)
             except Exception as exc:  # noqa: BLE001
                 log(f"  WARNING: registry call failed — "
                     f"{type(exc).__name__}: {exc}")
@@ -421,8 +450,14 @@ def _process_one(
     *,
     skip_registry: bool,
     registry_cfg: "RegistryConfig",
+    override: bool = False,
+    abort_event: Optional["threading.Event"] = None,
 ) -> FOVRunResult:
-    from roigbiv.pipeline.run import OpticsConfirmationRequired, run_pipeline
+    from roigbiv.pipeline.run import (
+        OpticsConfirmationRequired,
+        PipelineAborted,
+        run_pipeline,
+    )
 
     stem = tif.stem.replace("_mc", "")
     out_dir = workspace.output_root / stem
@@ -440,7 +475,7 @@ def _process_one(
     cfg = _build_config(out_dir, cfg_overrides)
     t0 = time.perf_counter()
     try:
-        fov = run_pipeline(tif, cfg)
+        fov = run_pipeline(tif, cfg, abort_event=abort_event)
     except OpticsConfirmationRequired as need:
         # Foundation is on disk; this FOV awaits an optics decision. Skip
         # registry/traces — there are no ROIs yet. The UI surfaces this and
@@ -452,6 +487,17 @@ def _process_one(
             output_dir=out_dir,
             duration_s=time.perf_counter() - t0,
             awaiting_confirmation=need.payload,
+        )
+    except PipelineAborted:
+        # Cooperative stop at a stage boundary. The last completed stage's
+        # outputs + manifest entry are on disk (a --resume run continues from
+        # there); skip the registry write — these are partial detections.
+        log("  aborted (stop requested) — registry write skipped.")
+        return FOVRunResult(
+            tif=tif,
+            output_dir=out_dir,
+            duration_s=time.perf_counter() - t0,
+            error="aborted",
         )
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -479,7 +525,8 @@ def _process_one(
             from roigbiv.pipeline.optics import resolved_config_payload
             registry = _register_session(
                 stem, fov, log, registry_cfg,
-                resolved_config=resolved_config_payload(cfg))
+                resolved_config=resolved_config_payload(cfg),
+                override=override)
         except Exception as exc:  # noqa: BLE001
             log(f"  WARNING: registry call failed — "
                 f"{type(exc).__name__}: {exc}")
@@ -533,6 +580,7 @@ def _build_config(output_dir: Path, overrides: dict) -> PipelineConfig:
     base = {"output_dir": output_dir, "no_viewer": True}
     base.update(overrides)
     base["output_dir"] = output_dir   # always force per-FOV path
+    base.pop("override", None)        # registry directive, not a config field
     return PipelineConfig(**base)
 
 
@@ -612,7 +660,7 @@ def _apply_registry_memory(
 
 def _register_session(
     stem: str, fov: FOVData, log: LogCallback, cfg: "RegistryConfig",
-    *, resolved_config: Optional[dict] = None,
+    *, resolved_config: Optional[dict] = None, override: bool = False,
 ) -> Optional[dict]:
     """Mirror of ``roigbiv.pipeline.run._register_fov_after_pipeline``.
 
@@ -659,6 +707,7 @@ def _register_session(
         accept_threshold=cfg.fov_accept_threshold,
         review_threshold=cfg.fov_review_threshold,
         resolved_config=resolved_config,
+        override=override,
     )
     decision = report.get("decision", "unknown")
     posterior = report.get("fov_posterior") or report.get("fov_sim")

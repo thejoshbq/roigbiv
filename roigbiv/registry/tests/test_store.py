@@ -109,3 +109,81 @@ def test_session_observation_cell_roundtrip():
     assert store.get_fov(fov_id).latest_session_date == date(2023, 1, 1)
     store.update_fov_latest_session(fov_id, date(2022, 1, 1))
     assert store.get_fov(fov_id).latest_session_date == date(2023, 1, 1)
+
+
+# ── supersede_session (override re-run support) ──────────────────────────────
+
+def _seed_fov_with_session(store, *, output_dir, fingerprint=None):
+    """Insert one FOV + one session (at ``output_dir``) + two cells/obs."""
+    fov_id = str(uuid.uuid4())
+    fp = fingerprint or str(uuid.uuid4()).replace("-", "")[:64].ljust(64, "0")
+    store.insert_fov(FOVRecord(
+        fov_id=fov_id, fingerprint_hash=fp,
+        animal_id="X", region="PrL",
+        mean_m_uri="file:///x", centroid_table_uri="file:///x",
+        created_at=datetime.now(timezone.utc),
+    ))
+    session_id = str(uuid.uuid4())
+    store.insert_session(SessionRecord(
+        session_id=session_id, fov_id=fov_id,
+        session_date=date(2022, 12, 9), output_dir=output_dir,
+        n_matched=0, n_new=2, n_missing=0,
+        created_at=datetime.now(timezone.utc),
+    ))
+    cells = [str(uuid.uuid4()), str(uuid.uuid4())]
+    for i, gid in enumerate(cells, start=1):
+        store.insert_cell(CellRecord(
+            global_cell_id=gid, fov_id=fov_id,
+            first_seen_session_id=session_id,
+            morphology_summary={"first_local_label_id": i},
+        ))
+    store.insert_observations([
+        ObservationRecord(observation_id=str(uuid.uuid4()),
+                          global_cell_id=gid, session_id=session_id,
+                          local_label_id=i)
+        for i, gid in enumerate(cells, start=1)
+    ])
+    return fov_id, session_id
+
+
+def test_supersede_session_deletes_session_observations_and_orphan_fov():
+    store = _new_store()
+    fov_id, _ = _seed_fov_with_session(store, output_dir="/tmp/out")
+
+    counts = store.supersede_session("/tmp/out")
+    assert counts == {"sessions": 1, "observations": 2, "fovs": 1, "cells": 2}
+
+    # Orphaned FOV (no remaining sessions) and its cells are gone.
+    assert store.get_fov(fov_id) is None
+    assert store.list_cells(fov_id) == []
+    assert store.list_sessions(fov_id) == []
+    assert store.get_session_by_output_dir("/tmp/out") is None
+
+
+def test_supersede_session_preserves_fov_with_other_sessions():
+    store = _new_store()
+    fov_id, keep_session = _seed_fov_with_session(store, output_dir="/tmp/keep")
+    # A second session on the SAME FOV but a different output_dir.
+    other = str(uuid.uuid4())
+    store.insert_session(SessionRecord(
+        session_id=other, fov_id=fov_id,
+        session_date=date(2023, 1, 2), output_dir="/tmp/drop",
+        n_matched=0, n_new=0, n_missing=0,
+        created_at=datetime.now(timezone.utc),
+    ))
+
+    counts = store.supersede_session("/tmp/drop")
+    assert counts["sessions"] == 1
+    assert counts["fovs"] == 0          # FOV still has /tmp/keep — not orphaned
+    assert counts["cells"] == 0
+
+    assert store.get_fov(fov_id) is not None
+    assert len(store.list_cells(fov_id)) == 2
+    remaining = {s.output_dir for s in store.list_sessions(fov_id)}
+    assert remaining == {"/tmp/keep"}
+
+
+def test_supersede_session_noop_when_output_dir_absent():
+    store = _new_store()
+    counts = store.supersede_session("/tmp/never-registered")
+    assert counts == {"sessions": 0, "observations": 0, "fovs": 0, "cells": 0}

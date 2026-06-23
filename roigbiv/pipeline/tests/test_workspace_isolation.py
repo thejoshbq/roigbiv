@@ -121,7 +121,8 @@ def test_run_with_workspace_selected_subset(tmp_path, monkeypatch):
 
     seen: list[Path] = []
 
-    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg):
+    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg,
+              **kwargs):
         seen.append(tif)
         return wsmod.FOVRunResult(tif=tif, output_dir=ws.output_root / tif.stem)
 
@@ -149,7 +150,8 @@ def test_run_with_workspace_selected_none_runs_all(tmp_path, monkeypatch):
 
     seen: list[Path] = []
 
-    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg):
+    def _stub(tif, ws, cfg_overrides, log, *, skip_registry, registry_cfg,
+              **kwargs):
         seen.append(tif)
         return wsmod.FOVRunResult(tif=tif, output_dir=ws.output_root / tif.stem)
 

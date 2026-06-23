@@ -169,6 +169,13 @@ HELP_TEXT: dict[str, str] = {
         "Skip stages already completed when the config and input are "
         "unchanged, reusing prior outputs. Ignored under scout / "
         "foundation-only.",
+    "roigbiv-param-override":
+        "Replace this FOV's prior registry entry instead of accumulating "
+        "rows. Drops the previous run's session (and the FOV + cells if that "
+        "leaves it with no other sessions) before re-registering. Destructive: "
+        "the delete and the re-register are separate steps, so interrupting an "
+        "override re-run can leave the prior entry gone — just re-run to "
+        "rebuild it. Off by default — normal re-runs are non-destructive.",
     # Pipeline · Notifications
     "roigbiv-param-slack-channel":
         "Posts a run summary and overlay PNGs to this Slack channel when the "

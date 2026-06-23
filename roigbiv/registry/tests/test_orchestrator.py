@@ -202,3 +202,62 @@ def test_repeat_call_on_same_output_dir_is_idempotent(tmp_path: Path):
     assert r2["session_id"] == r1["session_id"]
     assert len(store.list_sessions(fov_id)) == 1
     assert len(store.list_fovs()) == 1
+
+
+def test_override_bypasses_idempotency_and_replaces(tmp_path: Path):
+    """override=True re-registers a same-masks re-run instead of no-op'ing.
+
+    Without override the second call short-circuits to ``already_registered``
+    (see the test above). With override the prior session is superseded (and
+    its now-orphaned FOV dropped), so the run re-mints — leaving exactly one
+    FOV + one session for that output_dir rather than accumulating.
+    """
+    store, blob = _build_backends(tmp_path)
+    query = _session("q", [(16, 16), (32, 32), (48, 48)])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1"
+    r1 = register_or_match(fov_stem=stem, query=query, output_dir=out_dir,
+                           store=store, blob_store=blob)
+    assert r1["decision"] == "new_fov"
+
+    r2 = register_or_match(
+        fov_stem=stem,
+        query=_session("q", [(16, 16), (32, 32), (48, 48)]),
+        output_dir=out_dir, store=store, blob_store=blob,
+        override=True)
+    # Not the idempotent short-circuit — a fresh registration replaced it.
+    assert r2["decision"] != "already_registered"
+    assert len(store.list_fovs()) == 1
+    assert len(store.list_sessions(r2["fov_id"])) == 1
+
+
+def test_override_changed_masks_drops_orphaned_prior_fov(tmp_path: Path):
+    """A changed-mask re-run with override leaves exactly one FOV/session.
+
+    Uses a different ``animal_id`` on the second run so candidate retrieval is
+    empty (no ROICaT) — the point under test is supersede + orphan cleanup,
+    not cross-session matching.
+    """
+    store, blob = _build_backends(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    r1 = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1",
+        query=_session("q1", [(10, 10), (20, 40), (40, 20)]),
+        output_dir=out_dir, store=store, blob_store=blob)
+    assert r1["decision"] == "new_fov"
+    old_fov_id = r1["fov_id"]
+
+    r2 = register_or_match(
+        fov_stem="T2_221210_PrL-NAc-G6-5M_HI-D1_FOV1",   # different animal
+        query=_session("q2", [(30, 30), (45, 45), (15, 50)]),
+        output_dir=out_dir, store=store, blob_store=blob,
+        override=True)
+    assert r2["decision"] == "new_fov"
+    # Old FOV was orphaned by the supersede (its only session was at out_dir)
+    # and dropped; only the fresh one remains.
+    assert store.get_fov(old_fov_id) is None
+    assert len(store.list_fovs()) == 1
+    assert store.list_fovs()[0].fov_id == r2["fov_id"]
+    assert len(store.list_sessions(r2["fov_id"])) == 1

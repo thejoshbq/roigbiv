@@ -96,6 +96,9 @@ class RunSnapshot:
     results_summary: list[dict] = field(default_factory=list)
     current_stage: Optional[str] = None
     n_awaiting: int = 0          # FOVs paused for optics confirmation
+    overrides: Optional[dict] = None   # config the run actually launched with
+    stopping: bool = False       # stop requested, finishing current stage
+    stopped: bool = False        # run ended after a cooperative stop
 
 
 class PipelineRunner:
@@ -117,6 +120,9 @@ class PipelineRunner:
         self._registry_config: Optional[RegistryConfig] = None
         self._slack_channel: Optional[str] = None
         self._current_stage: Optional[str] = None
+        self._overrides: Optional[dict] = None
+        self._abort_event = threading.Event()
+        self._stopping: bool = False
         self._last_accessed: float = time.monotonic()
 
     # ── control ───────────────────────────────────────────────────────────
@@ -161,6 +167,9 @@ class PipelineRunner:
                 # Foundation runs first and emits no stage_header; show it until
                 # the first Stage marker streams in.
                 self._current_stage = _FOUNDATION_STAGE
+                # Capture the config that actually launched this run, for the
+                # read-only "Launched config" echo on the Process page.
+                self._overrides = dict(overrides)
         except Exception:
             self._gate.release()
             raise
@@ -189,7 +198,29 @@ class PipelineRunner:
                 current_stage=self._current_stage,
                 n_awaiting=sum(1 for r in self._results
                                if r.awaiting_confirmation is not None),
+                overrides=(dict(self._overrides)
+                           if self._overrides is not None else None),
+                stopping=self._stopping and self._active,
+                stopped=(not self._active) and self._abort_event.is_set(),
             )
+
+    def abort(self) -> bool:
+        """Request a cooperative stop of the in-flight run.
+
+        Sets the shared :class:`threading.Event` the pipeline polls at each
+        stage boundary. The current stage finishes (its outputs + manifest
+        entry land on disk) and then the run halts; a later ``--resume`` run
+        continues from there. Returns True if a stop was requested, False if
+        no run is active.
+        """
+        with self._lock:
+            if not self._active:
+                return False
+            self._stopping = True
+            self._logs.append(
+                "Stop requested — finishing current stage, then halting…")
+            self._abort_event.set()
+            return True
 
     def results(self) -> list[FOVRunResult]:
         with self._lock:
@@ -206,6 +237,9 @@ class PipelineRunner:
         self._error = None
         self._results = []
         self._current_stage = None
+        self._overrides = None
+        self._abort_event.clear()
+        self._stopping = False
 
     def _log(self, line: str) -> None:
         with self._lock:
@@ -220,6 +254,7 @@ class PipelineRunner:
                     log_cb=self._append_and_tally,
                     registry_config=self._registry_config,
                     selected_tifs=selected_tifs,
+                    abort_event=self._abort_event,
                 )
             except BaseException as exc:  # noqa: BLE001
                 tb = traceback.format_exc()

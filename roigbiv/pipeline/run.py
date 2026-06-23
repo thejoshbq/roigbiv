@@ -61,6 +61,27 @@ class OpticsConfirmationRequired(Exception):
         )
 
 
+class PipelineAborted(BaseException):
+    """Raised at a stage boundary when a cooperative stop was requested.
+
+    Derives from ``BaseException`` (not ``Exception``) so the per-stage
+    ``except Exception`` handlers inside :func:`run_pipeline` don't swallow
+    it — it propagates to the workspace runner, which records the FOV as
+    ``aborted`` and skips the registry write.
+    """
+
+
+def _check_abort(abort_event) -> None:
+    """Raise :class:`PipelineAborted` if a stop was requested.
+
+    No-op when ``abort_event`` is ``None`` (CLI, single-FOV, and batch-worker
+    paths — the batch path stops via worker-process termination, not this
+    in-process flag).
+    """
+    if abort_event is not None and abort_event.is_set():
+        raise PipelineAborted()
+
+
 _GATE2_MIN_SCALE = 3 / 4   # gate2_min_area / gate1_min_area at GRIN defaults (60/80)
 _GATE2_MAX_SCALE = 2 / 3   # gate2_max_area / gate1_max_area at GRIN defaults (400/600)
 
@@ -334,7 +355,8 @@ def _write_stage4_outputs(
     }, indent=2))
 
 
-def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
+def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
+                 abort_event=None) -> FOVData:
     """Run the full four-stage pipeline on a single FOV.
 
     Writes all outputs to cfg.output_dir and (unless cfg.no_viewer) opens a
@@ -344,6 +366,12 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     batch runner), GPU-heavy phases are serialized across concurrent FOV
     workers so the RTX-4060 8 GiB VRAM isn't double-booked. CPU phases
     (Foundation summary images, Stage 4 bandpass, traces, QC) overlap freely.
+
+    If `abort_event` (a `threading.Event`) is provided and set, the run stops
+    cooperatively at the next stage boundary by raising :class:`PipelineAborted`.
+    The last fully-completed stage's outputs + manifest entry are intact, so a
+    subsequent ``--resume`` run continues from there. ``None`` (CLI / batch
+    workers) disables the check.
 
     Returns a fully populated FOVData (through Stage 4).
     """
@@ -493,6 +521,10 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
         ), flush=True)
 
+    # Cooperative stop: foundation is on disk; halt before the optics gate /
+    # Stage 1 so a --resume run continues from here.
+    _check_abort(abort_event)
+
     # ── Optics auto-scale (post-foundation, pre-Stage-1) ──────────────────
     # Derive the numeric gates (areas/diameter/separations/pool radii) from the
     # FOV's own measured soma scale, overriding the profile's hardcoded numbers
@@ -549,6 +581,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # ── Stage 1 Cellpose detection ────────────────────────────────────────
     if rp.should_run("stage1"):
         print(fmt.stage_header(1, "Cellpose detection"), flush=True)
+        _check_abort(abort_event)
         t_start = time.time()
         try:
             import torch
@@ -656,6 +689,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # ── Source subtraction (on accept + flag only) ────────────────────────
     if rp.should_run("stage1_subtract"):
         print(fmt.stage_header("1→S", "Source subtraction"), flush=True)
+        _check_abort(abort_event)
         t_start = time.time()
         rois_to_subtract = [r for r in fov.rois
                             if r.source_stage == 1
@@ -713,6 +747,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     # ── Stage 2 Suite2p Temporal Detection ────────────────────────────────
     if rp.should_run("stage2") and cfg.enable_stage_2:
         print(fmt.stage_header(2, "Suite2p temporal detection"), flush=True)
+        _check_abort(abort_event)
         t_start = time.time()
         with _gpu_section(gpu_lock):
             stage2_candidates = run_stage2(fov, cfg, starting_label_id=next_label)
@@ -780,6 +815,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     )
     if s2_should_subtract:
         print(fmt.stage_header("2→S", "Source subtraction"), flush=True)
+        _check_abort(abort_event)
         t_start = time.time()
         s2_subtract = [r for r in fov.rois
                        if r.source_stage == 2
@@ -843,6 +879,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if cfg.use_pmd_denoise and rp.should_run("stage3"):
         print(fmt.stage_header("PMD", "Spatiotemporal denoise of residual (Stage 3/4 input)"),
               flush=True)
+        _check_abort(abort_event)
         t_pmd = time.time()
         with _gpu_section(gpu_lock):
             fov.residual_view = pmd_denoise_view(fov.residual_view, output_dir, cfg)
@@ -855,6 +892,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
         # Stage 3 reads the live residual view (deepest subtraction applied:
         # S₂ if Stage 2 subtracted, else S₁, else S — the view tracks this).
         print(fmt.stage_header(3, "Template sweep on residual view"), flush=True)
+        _check_abort(abort_event)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
         with _gpu_section(gpu_lock):
@@ -935,6 +973,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if s3_should_subtract:
         print(fmt.stage_header("3→S", "Source subtraction on residual view"),
               flush=True)
+        _check_abort(abort_event)
         t_start = time.time()
         s3_subtract = [r for r in fov.rois
                        if r.source_stage == 3
@@ -989,6 +1028,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     if rp.should_run("stage4") and cfg.enable_stage_4:
         print(fmt.stage_header(4, "Tonic neuron search on residual view"),
               flush=True)
+        _check_abort(abort_event)
         next_label = max((r.label_id for r in fov.rois), default=0) + 1
         t_start = time.time()
         stage4_candidates = run_stage4(fov.residual_view, fov, cfg,
@@ -1058,6 +1098,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
     fov.rois.sort(key=lambda r: int(r.label_id))
 
     print(fmt.stage_header("Post", "Trace extraction + QC"), flush=True)
+    _check_abort(abort_event)
     t_start = time.time()
     F_raw, F_neu, F_corrected = extract_all_traces(fov, fov.rois, cfg)
     stage_timings["traces_s"] = time.time() - t_start

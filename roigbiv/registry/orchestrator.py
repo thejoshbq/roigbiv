@@ -98,6 +98,7 @@ def register_or_match(
     accept_threshold: float = AUTO_ACCEPT_THRESHOLD,
     review_threshold: float = REVIEW_THRESHOLD,
     resolved_config: Optional[dict] = None,
+    override: bool = False,
 ) -> dict:
     """Register a newly-processed session against the cross-session registry.
 
@@ -116,6 +117,12 @@ def register_or_match(
         filename date is wrong).
     calibration, adapter_config : tunables (both have sensible defaults).
     accept_threshold, review_threshold : decision banding.
+    override : bool
+        When True, supersede any prior run for ``output_dir`` (drop its
+        session + observations, and the FOV + cells if that orphans it)
+        before registering, and bypass the idempotency guard so the run
+        always re-registers fresh. Lets a re-run replace rather than
+        accumulate rows in the workspace DB. Default False (opt-in).
     """
     store.ensure_schema()
 
@@ -133,17 +140,37 @@ def register_or_match(
 
     fp = compute_fingerprint(query.merged_masks, query.mean_m)
 
+    if override:
+        # Replace any prior run for this output_dir rather than accumulating
+        # rows. Drops the prior session (+ observations) and, when that leaves
+        # its FOV with no sessions, the FOV (+ cells). Falls through to a fresh
+        # registration below (idempotency guard is skipped under override).
+        # NOTE: the supersede and the re-registration below are separate
+        # transactions — an interruption between them can leave the prior entry
+        # dropped with nothing yet in its place. Acceptable because override is
+        # opt-in and a destructive re-run is recoverable by simply re-running.
+        deleted = store.supersede_session(str(output_dir))
+        if any(deleted.values()):
+            log.info(
+                "override: superseded prior run at %s "
+                "(sessions=%d observations=%d fovs=%d cells=%d)",
+                output_dir, deleted["sessions"], deleted["observations"],
+                deleted["fovs"], deleted["cells"],
+            )
+
     # 0. Idempotency guard — if a session row already points at this exact
     #    output_dir and the FOV it's tied to still carries the same
     #    fingerprint hash we're about to register, this is a duplicate call
     #    (backfill re-registering what the per-TIF pass already wrote, or a
     #    user running `roigbiv-registry match` twice on the same directory).
     #    Short-circuit: no DB writes, return the cached report.
-    existing_report = _load_idempotent_report(
-        store=store, output_dir=output_dir, fingerprint_hash=fp.fingerprint_hash
-    )
-    if existing_report is not None:
-        return existing_report
+    if not override:
+        existing_report = _load_idempotent_report(
+            store=store, output_dir=output_dir,
+            fingerprint_hash=fp.fingerprint_hash,
+        )
+        if existing_report is not None:
+            return existing_report
 
     # 1. Hash pre-filter — exact re-run shortcut.
     hit = store.get_fov_by_hash(fp.fingerprint_hash)
