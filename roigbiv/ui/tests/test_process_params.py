@@ -183,14 +183,15 @@ def test_stage1_group_contains_cellpose_params():
     assert "roigbiv-mc-suggest-btn" in sids
 
 
-def test_profile_select_offers_concrete_profiles_only():
-    # The Profile dropdown lists concrete profiles (no 'auto') and defaults to
-    # grin — the no-op 512² baseline, so a fresh form == the prior behavior.
+def test_profile_select_offers_auto_and_concrete_profiles():
+    # The Profile dropdown offers 'auto' (recommended, first + default) plus the
+    # concrete profiles. 'auto' classifies the optics per-FOV and derives gates;
+    # concrete profiles pin the optics + expose the manual fields.
     sel = _find_by_id(_params_form(), "roigbiv-param-profile")
     values = _option_values(sel)
-    assert set(values) == {"grin", "prism", "generic"}
-    assert "auto" not in values
-    assert sel.value == "grin"
+    assert set(values) == {"auto", "grin", "prism", "generic"}
+    assert values[0] == "auto"            # recommended option listed first
+    assert sel.value == "auto"            # streamlined "upload → adapts" default
 
 
 def test_profile_field_values_prism_applies_the_levers():

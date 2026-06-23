@@ -95,6 +95,7 @@ class RunSnapshot:
     error: Optional[str]
     results_summary: list[dict] = field(default_factory=list)
     current_stage: Optional[str] = None
+    n_awaiting: int = 0          # FOVs paused for optics confirmation
 
 
 class PipelineRunner:
@@ -186,6 +187,8 @@ class PipelineRunner:
                 error=self._error,
                 results_summary=[self._summarize(r) for r in self._results],
                 current_stage=self._current_stage,
+                n_awaiting=sum(1 for r in self._results
+                               if r.awaiting_confirmation is not None),
             )
 
     def results(self) -> list[FOVRunResult]:
@@ -229,7 +232,11 @@ class PipelineRunner:
 
             with self._lock:
                 self._results = results
-                self._n_done = sum(1 for r in results if r.error is None)
+                # Awaiting-confirmation FOVs have no error but are not "done":
+                # foundation ran, detection is paused pending an optics decision.
+                self._n_done = sum(
+                    1 for r in results
+                    if r.error is None and r.awaiting_confirmation is None)
                 self._n_failed = sum(1 for r in results if r.error is not None)
                 self._completed_at = time.time()
                 self._active = False
@@ -325,6 +332,7 @@ class PipelineRunner:
             "output_dir": str(r.output_dir),
             "duration_s": r.duration_s,
             "error": r.error,
+            "awaiting_confirmation": r.awaiting_confirmation,
             "roi_counts": dict(r.roi_counts),
             "registry_decision": (
                 (r.registry or {}).get("decision") if r.registry else None

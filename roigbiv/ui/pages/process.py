@@ -18,7 +18,8 @@ from typing import Optional
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import Input, Output, State, dcc, html, no_update
+from dash import ALL, Input, Output, State, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
 from roigbiv.io import validate_tif
 from roigbiv.pipeline.loaders import _maybe_read_tif
@@ -58,10 +59,14 @@ _PROFILE_AUTOFILL: list[tuple[str, str]] = [
     ("mc_strip_height", "roigbiv-param-mc-strip-height"),
 ]
 
-# UI-selectable profiles — concrete only. ``auto`` is excluded: it means "sniff
-# the optics" (unimplemented; resolves to grin), which is meaningless when the
-# user is explicitly choosing in a dropdown.
-_UI_PROFILES: list[str] = [p for p in list_profiles() if p != AUTO]
+# UI-selectable profiles. ``auto`` (first, recommended) classifies the optics
+# from the FOV and derives the gates per-FOV — the user uploads and the pipeline
+# adapts, pausing for confirmation only when uncertain. The concrete profiles
+# remain for users who want to pin the optics + tune fields by hand.
+_UI_PROFILES: list[str] = [AUTO, *[p for p in list_profiles() if p != AUTO]]
+
+# Concrete (non-auto) profiles, offered in the per-FOV optics confirmation card.
+_CONCRETE_PROFILES: list[str] = [p for p in list_profiles() if p != AUTO]
 
 
 def _profile_field_values(profile_name: str) -> dict:
@@ -204,11 +209,14 @@ def _params_form(diameter_default: int = 12) -> html.Div:
                    dbc.Select(
                        id="roigbiv-param-profile",
                        options=[{"label": p, "value": p} for p in _UI_PROFILES],
-                       value="grin",
+                       value=AUTO,
                    )),
         html.Small(
-            "Selecting a profile autofills the Stage-1 + Gate-1 fields below for "
-            "that lens (grin = 512² GRIN baseline; prism = 1024² Prism). Tweak "
+            "auto (recommended) classifies the optics per-FOV and derives the "
+            "gates from the measured soma scale — the manual fields below are "
+            "ignored, and the run pauses for confirmation only when uncertain. "
+            "Selecting a concrete profile autofills the Stage-1 + Gate-1 fields "
+            "below for that lens (grin = 512² GRIN baseline; prism = 1024² Prism). Tweak "
             "any field afterward — the fields are what actually run.",
             className="text-muted d-block mb-2",
         ),
@@ -642,6 +650,8 @@ def _right_column(snap: Optional["RunSnapshot"] = None) -> html.Div:
                  children=log_stream(snap.logs if snap else [])),
         _mc_preview_section(),
         html.Hr(),
+        html.Div(id="roigbiv-run-confirm",
+                 children=_render_confirm(snap.results_summary if snap else [])),
         html.H5("Per-FOV results", className="mb-2"),
         html.Div(id="roigbiv-run-results",
                  children=_render_results(snap.results_summary if snap else [])),
@@ -742,27 +752,14 @@ def register_callbacks(app: dash.Dash) -> None:
         # precedence if both are toggled (it stops even earlier).
         foundation_only_on = bool(foundation_only) and not scout_on
         early_stop = scout_on or foundation_only_on
-        overrides = {
+        selected_paths = _selected_run_paths(state.workspace, selected)
+        # Foundation + control fields, independent of how the optics resolve.
+        base = {
             "fs": float(fs or 7.5),
             "tau": float(tau or 1.0),
             "k_background": int(k or 30),
-            # Acquisition/lens profile — a provenance label recorded in the
-            # cfg_snapshot; the per-field values below are what actually run.
-            "profile": profile or "grin",
-            "cellpose_model": model or "models/deployed/current_model",
             "motion_correction_backend": mc_backend or "phasecorr",
             "mc_strip_height": int(mc_strip_height) if mc_strip_height is not None else 32,
-            "channels": _parse_channels_value(channels),
-            "flow_threshold": float(flow_threshold if flow_threshold is not None else 0.4),
-            "cellprob_threshold": float(cellprob_threshold if cellprob_threshold is not None else -2.0),
-            "use_denoise": bool(use_denoise),
-            "tile_norm_blocksize": int(tile_norm_blocksize) if tile_norm_blocksize is not None else 128,
-            "min_area": int(min_area) if min_area is not None else 80,
-            "max_area": int(max_area) if max_area is not None else 600,
-            "min_solidity": float(min_solidity) if min_solidity is not None else 0.55,
-            "max_eccentricity": float(max_eccentricity) if max_eccentricity is not None else 0.90,
-            # Diameter chosen on the MC preview (+ diameter_auto forced off).
-            **_diameter_overrides(state.calibrated_diameter(), diameter),
             "scout_mode": scout_on,
             "foundation_only": foundation_only_on,
             # Scout / foundation-only stop early; the stage toggles are ignored
@@ -772,9 +769,37 @@ def register_callbacks(app: dash.Dash) -> None:
             "enable_stage_4": False if early_stop else (True if stage_4 is None else bool(stage_4)),
             "resume": False if (resume is None or early_stop) else bool(resume),
         }
+        if (profile or AUTO) == AUTO:
+            # Auto: classify the optics + derive gates per-FOV; ignore the manual
+            # Stage-1 fields (they're disabled for auto). Pauses for confirmation
+            # when uncertain — surfaced in the per-FOV confirmation card.
+            from roigbiv.pipeline.run import build_auto_workspace_overrides
+            run_tifs = selected_paths if selected_paths else list(state.workspace.tifs)
+            overrides = build_auto_workspace_overrides(run_tifs, base)
+        else:
+            overrides = {
+                **base,
+                # Concrete profile: a provenance label; the per-field values
+                # below are what actually run. auto_scale OFF so the user's
+                # explicit form values are never overridden, and no pause.
+                "profile": profile,
+                "auto_scale": False,
+                "assume_optics": True,
+                "cellpose_model": model or "models/deployed/current_model",
+                "channels": _parse_channels_value(channels),
+                "flow_threshold": float(flow_threshold if flow_threshold is not None else 0.4),
+                "cellprob_threshold": float(cellprob_threshold if cellprob_threshold is not None else -2.0),
+                "use_denoise": bool(use_denoise),
+                "tile_norm_blocksize": int(tile_norm_blocksize) if tile_norm_blocksize is not None else 128,
+                "min_area": int(min_area) if min_area is not None else 80,
+                "max_area": int(max_area) if max_area is not None else 600,
+                "min_solidity": float(min_solidity) if min_solidity is not None else 0.55,
+                "max_eccentricity": float(max_eccentricity) if max_eccentricity is not None else 0.90,
+                # Diameter chosen on the MC preview (+ diameter_auto forced off).
+                **_diameter_overrides(state.calibrated_diameter(), diameter),
+            }
         runner = get_pipeline_runner()
         slack_channel = (slack_channel or "").strip() or None
-        selected_paths = _selected_run_paths(state.workspace, selected)
         result = runner.start(state.workspace, overrides,
                               registry_config=state.registry_config,
                               slack_channel=slack_channel,
@@ -802,6 +827,7 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-run-timer", "children"),
         Output("roigbiv-run-banner", "children", allow_duplicate=True),
         Output("roigbiv-run-btn", "disabled", allow_duplicate=True),
+        Output("roigbiv-run-confirm", "children"),
         Input("roigbiv-process-tick", "n_intervals"),
         prevent_initial_call="initial_duplicate",
     )
@@ -818,7 +844,74 @@ def register_callbacks(app: dash.Dash) -> None:
             _format_timer(snap.started_at, snap.completed_at),
             _render_banner(snap),
             state.workspace is None or snap.active,
+            _render_confirm(snap.results_summary),
         )
+
+    @app.callback(
+        Output("roigbiv-run-banner", "children", allow_duplicate=True),
+        Output("roigbiv-process-tick", "disabled", allow_duplicate=True),
+        Input({"type": "optics-confirm-btn", "stem": ALL}, "n_clicks"),
+        State({"type": "optics-confirm-profile", "stem": ALL}, "value"),
+        State({"type": "optics-confirm-profile", "stem": ALL}, "id"),
+        prevent_initial_call=True,
+    )
+    def _on_confirm_optics(clicks, profiles, ids):
+        # Fire only on a real click (rendering the cards seeds n_clicks=0).
+        if not any(c for c in (clicks or []) if c):
+            raise PreventUpdate
+        trig = dash.ctx.triggered_id
+        if not trig or trig.get("type") != "optics-confirm-btn":
+            raise PreventUpdate
+        stem = trig.get("stem")
+        sel = next((v for pid, v in zip(ids, profiles)
+                    if pid.get("stem") == stem), None) or "generic"
+
+        state = get_app_state()
+        ws = state.workspace
+        if ws is None:
+            raise PreventUpdate
+        tif = next((t for t in ws.tifs
+                    if t.stem.replace("_mc", "") == stem), None)
+        if tif is None:
+            raise PreventUpdate
+
+        # Resume from Stage 1 on the existing foundation with the confirmed
+        # optics. Foundation-relevant fields come from the original run's
+        # manifest snapshot so the (relaxed) resume stays consistent.
+        from roigbiv.pipeline.optics import _AUTO_SCALE_PROFILES
+        from roigbiv.pipeline.profiles import merged_overrides
+        from roigbiv.pipeline.resume import read_manifest
+        snap_cfg = (read_manifest(ws.output_root / stem) or {}).get(
+            "cfg_snapshot", {}) or {}
+        base = {
+            "fs": snap_cfg.get("fs", 7.5),
+            "tau": snap_cfg.get("tau", 1.0),
+            "k_background": snap_cfg.get("k_background", 30),
+            "motion_correction_backend":
+                snap_cfg.get("motion_correction_backend", "phasecorr"),
+            "resume": True,
+            "assume_optics": True,          # the user just confirmed — don't re-pause
+            "auto_scale": sel in _AUTO_SCALE_PROFILES,
+            "explicit_fields": (),
+            "auto_adapt": {},
+            "enable_stage_2": snap_cfg.get("enable_stage_2", True),
+            "enable_stage_3": snap_cfg.get("enable_stage_3", True),
+            "enable_stage_4": snap_cfg.get("enable_stage_4", True),
+            "no_viewer": True,
+        }
+        overrides = merged_overrides(sel, base, [])
+        runner = get_pipeline_runner()
+        res = runner.start(ws, overrides,
+                           registry_config=state.registry_config,
+                           selected_tifs=[tif])
+        if res == "busy":
+            return dbc.Alert(
+                "Pipeline busy for another session — try again shortly.",
+                color="warning"), no_update
+        if not res:
+            return dbc.Alert("A run is already active — wait for it to finish.",
+                             color="warning"), no_update
+        return _render_banner(runner.snapshot()), False   # re-enable the tick
 
     @app.callback(
         Output("roigbiv-mc-fov-select", "options", allow_duplicate=True),
@@ -943,7 +1036,11 @@ def register_callbacks(app: dash.Dash) -> None:
     def _on_profile_change(profile_name):
         # Autofill every Stage-1/Gate-1 field from the chosen profile bundle.
         # The fields remain user-editable and are the source of truth at run time.
-        v = _profile_field_values(profile_name or "grin")
+        # ``auto`` resolves per-FOV at run time and ignores these manual fields,
+        # so leave them untouched (no_update) when auto is selected.
+        if (profile_name or "auto") == AUTO:
+            return tuple(no_update for _ in range(12))
+        v = _profile_field_values(profile_name)
         return (
             v["cellpose_model"],
             _channels_to_str(v["channels"]),
@@ -1089,3 +1186,50 @@ def _render_results(summaries: list[dict]) -> html.Div:
         size="sm", striped=True, borderless=False,
         className="mb-0",
     )
+
+
+def _render_confirm(summaries: list[dict]) -> html.Div:
+    """Per-FOV optics-confirmation cards for FOVs that paused after foundation."""
+    awaiting = [s for s in (summaries or []) if s.get("awaiting_confirmation")]
+    if not awaiting:
+        return html.Div()
+    cards = []
+    for s in awaiting:
+        stem = s.get("stem")
+        p = s.get("awaiting_confirmation") or {}
+        cand = p.get("candidate_profile", "generic")
+        d = p.get("soma_diameter_med")
+        reasons = p.get("reasons", []) or []
+        cards.append(dbc.Card(dbc.CardBody([
+            html.Div([
+                html.Strong(stem),
+                html.Span(f"  candidate: {cand} ({p.get('confidence', '?')})",
+                          className="text-muted"),
+            ]),
+            html.Div(
+                f"measured soma d≈{d if d is not None else '?'}px  "
+                f"n={p.get('n_somata', 0)}",
+                className="small text-muted mb-1"),
+            (html.Ul([html.Li(r, className="small text-muted") for r in reasons],
+                     className="mb-2") if reasons else None),
+            dbc.InputGroup([
+                dbc.InputGroupText("Optics"),
+                dbc.Select(
+                    id={"type": "optics-confirm-profile", "stem": stem},
+                    options=[{"label": pp, "value": pp} for pp in _CONCRETE_PROFILES],
+                    value=cand if cand in _CONCRETE_PROFILES else "generic",
+                ),
+                dbc.Button("Confirm & resume",
+                           id={"type": "optics-confirm-btn", "stem": stem},
+                           color="primary", n_clicks=0),
+            ]),
+        ]), color="warning", outline=True, className="mb-2"))
+    return html.Div([
+        html.H5("Optics confirmation needed", className="mb-2"),
+        html.Div(html.Em(
+            "Auto-adaptation was uncertain for these FOVs. Confirm the optics "
+            "to resume from Stage 1 — foundation is already done, so it's fast.",
+            className="text-muted small"), className="mb-2"),
+        *cards,
+        html.Hr(),
+    ])
