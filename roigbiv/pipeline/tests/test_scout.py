@@ -29,6 +29,42 @@ def _synthetic_movie(seed=0, T=60, Ly=12, Lx=10):
     return (rng.normal(0, 50, (T, Ly, Lx)) + 1000).astype(np.int16)
 
 
+def _reference_vcorr(movie, neighbors=8):
+    """Direct, slow Pearson reference for small synthetic movies."""
+    if neighbors == 4:
+        offsets = [(-1, 0), (0, -1), (0, 1), (1, 0)]
+    elif neighbors == 8:
+        offsets = [(-1, -1), (-1, 0), (-1, 1),
+                   (0, -1),           (0, 1),
+                   (1, -1),  (1, 0),  (1, 1)]
+    else:
+        raise ValueError("neighbors must be 4 or 8")
+
+    movie = movie.astype(np.float64)
+    _, Ly, Lx = movie.shape
+    out = np.zeros((Ly, Lx), dtype=np.float64)
+    count = np.zeros((Ly, Lx), dtype=np.int32)
+    eps = 1e-12
+    for y in range(Ly):
+        for x in range(Lx):
+            trace = movie[:, y, x]
+            trace_centered = trace - trace.mean()
+            trace_norm = np.sqrt(np.sum(trace_centered ** 2))
+            for dy, dx in offsets:
+                yy = y + dy
+                xx = x + dx
+                if yy < 0 or yy >= Ly or xx < 0 or xx >= Lx:
+                    continue
+                neighbor = movie[:, yy, xx]
+                neighbor_centered = neighbor - neighbor.mean()
+                neighbor_norm = np.sqrt(np.sum(neighbor_centered ** 2))
+                den = trace_norm * neighbor_norm
+                if den > eps:
+                    out[y, x] += np.sum(trace_centered * neighbor_centered) / (den + eps)
+                count[y, x] += 1
+    return (out / np.maximum(count, 1)).astype(np.float32)
+
+
 def test_vcorr_on_movie_matches_residual_accumulator(tmp_path):
     """Scout's movie pass equals the production summary pass on identical data."""
     movie = _synthetic_movie()
@@ -43,6 +79,19 @@ def test_vcorr_on_movie_matches_residual_accumulator(tmp_path):
     assert np.allclose(scout["mean"], ref["mean"], atol=1e-3)
     assert np.allclose(scout["max"], ref["max"], atol=1e-3)
     assert np.allclose(scout["vcorr"], ref["vcorr"], atol=1e-4)
+
+
+@pytest.mark.parametrize("neighbors", [4, 8])
+def test_accumulate_summaries_vcorr_matches_direct_reference(neighbors):
+    """Vcorr must match direct Pearson, including boundaries and flat pixels."""
+    movie = _synthetic_movie(seed=5, T=24, Ly=5, Lx=6).astype(np.float32)
+    movie[:, 0, 0] = 7.0      # zero-variance corner pixel
+    movie[:, 2, 3] = -3.0     # zero-variance interior pixel
+
+    out = _accumulate_summaries(iter([(0, 11, movie[:11]), (11, 24, movie[11:])]),
+                                5, 6, neighbors=neighbors)
+    ref = _reference_vcorr(movie, neighbors=neighbors)
+    assert np.allclose(out["vcorr"], ref, atol=1e-5)
 
 
 def test_scout_mean_equals_movie_mean(tmp_path):

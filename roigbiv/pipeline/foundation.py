@@ -419,12 +419,10 @@ def _iter_S_chunks(residual_view, chunk: int = 500):
     yield from residual_view.iter_chunks(chunk)
 
 
-# 8-neighbor stencil — each pixel's correlation with each of 8 neighbors.
-_VCORR_OFFSETS_8 = [(-1, -1), (-1, 0), (-1, 1),
-                    ( 0, -1),          ( 0, 1),
-                    ( 1, -1), ( 1, 0), ( 1, 1)]
-# 4-neighbor stencil (von Neumann) — Suite2p's reduced form; ~half the work.
-_VCORR_OFFSETS_4 = [(-1, 0), (0, -1), (0, 1), (1, 0)]
+# Undirected edge families whose symmetric contributions reproduce the directed
+# 4-/8-neighbor averages while computing each pixel-pair correlation once.
+_VCORR_EDGES_8 = [(0, 1), (1, 0), (1, 1), (1, -1)]
+_VCORR_EDGES_4 = [(0, 1), (1, 0)]
 
 
 def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -> dict:
@@ -439,9 +437,9 @@ def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -
     Returns dict with keys 'mean', 'max', 'std', 'vcorr', each (Ly, Lx) float32.
     """
     if neighbors == 4:
-        offsets = _VCORR_OFFSETS_4
+        edges = _VCORR_EDGES_4
     elif neighbors == 8:
-        offsets = _VCORR_OFFSETS_8
+        edges = _VCORR_EDGES_8
     else:
         raise ValueError(f"neighbors must be 4 or 8 (got {neighbors})")
 
@@ -450,18 +448,13 @@ def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -
     sumsq = np.zeros((Ly, Lx), dtype=np.float64)
     max_ = np.full((Ly, Lx), -np.inf, dtype=np.float32)
 
-    # Per-offset accumulators: sum_x, sum_y, sum_xx, sum_yy, sum_xy, count
-    # where x is the shifted source and y is the reference.
-    # Maintaining these in float64 avoids catastrophic cancellation.
-    acc = {
-        (dy, dx): {
-            "sx": np.zeros((Ly, Lx), dtype=np.float64),
-            "sy": np.zeros((Ly, Lx), dtype=np.float64),
-            "sxx": np.zeros((Ly, Lx), dtype=np.float64),
-            "syy": np.zeros((Ly, Lx), dtype=np.float64),
-            "sxy": np.zeros((Ly, Lx), dtype=np.float64),
-            "n":  0,  # scalar — all pixels get same count since we process full chunks
-        } for (dy, dx) in offsets
+    # Per-edge cross-products. The other Pearson moments are shifted views
+    # into the global sum_/sumsq maps below. Each undirected edge contributes
+    # to both endpoint pixels during finalization, reproducing the directed
+    # neighbor average while computing each pair once.
+    sxy_by_edge = {
+        (dy, dx): np.zeros((Ly, Lx), dtype=np.float64)
+        for (dy, dx) in edges
     }
 
     t_total = 0
@@ -482,27 +475,20 @@ def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -
         sumsq += (chunk64 ** 2).sum(axis=0)
         np.maximum(max_, chunk64.max(axis=0).astype(np.float32), out=max_)
 
-        # Vcorr accumulators — for each offset, accumulate stats of pixel and its shifted neighbor
-        # over the valid (non-boundary) region. We use slicing to avoid boundary issues.
-        for (dy, dx) in offsets:
-            # "center" slice: the pixel we're computing vcorr for
-            cy0 = max(0, dy); cy1 = Ly + min(0, dy)
-            cx0 = max(0, dx); cx1 = Lx + min(0, dx)
-            # "shifted" slice: the neighbor (source of x)
-            sy0 = max(0, -dy); sy1 = Ly + min(0, -dy)
-            sx0 = max(0, -dx); sx1 = Lx + min(0, -dx)
+        # Vcorr accumulators — for each undirected edge, accumulate the
+        # cross-product over valid (non-boundary) endpoint pairs.
+        for (dy, dx) in edges:
+            py0 = max(0, -dy); py1 = Ly - max(0, dy)
+            px0 = max(0, -dx); px1 = Lx - max(0, dx)
+            qy0 = py0 + dy; qy1 = py1 + dy
+            qx0 = px0 + dx; qx1 = px1 + dx
 
-            # y (reference) and x (neighbor) — views into the pre-cast chunk64
-            y_chunk = chunk64[:, cy0:cy1, cx0:cx1]  # (cs, H', W')
-            x_chunk = chunk64[:, sy0:sy1, sx0:sx1]
+            p_chunk = chunk64[:, py0:py1, px0:px1]
+            q_chunk = chunk64[:, qy0:qy1, qx0:qx1]
 
-            a = acc[(dy, dx)]
-            a["sx"][cy0:cy1, cx0:cx1] += x_chunk.sum(axis=0)
-            a["sy"][cy0:cy1, cx0:cx1] += y_chunk.sum(axis=0)
-            a["sxx"][cy0:cy1, cx0:cx1] += (x_chunk ** 2).sum(axis=0)
-            a["syy"][cy0:cy1, cx0:cx1] += (y_chunk ** 2).sum(axis=0)
-            a["sxy"][cy0:cy1, cx0:cx1] += (x_chunk * y_chunk).sum(axis=0)
-            a["n"] += cs
+            sxy_by_edge[(dy, dx)][py0:py1, px0:px1] += (
+                p_chunk * q_chunk
+            ).sum(axis=0)
 
     mean = (sum_ / t_total).astype(np.float32)
     var = (sumsq / t_total) - (sum_ / t_total) ** 2
@@ -514,22 +500,26 @@ def _accumulate_summaries(chunk_iter, Ly: int, Lx: int, *, neighbors: int = 8) -
     vcorr = np.zeros((Ly, Lx), dtype=np.float64)
     count = np.zeros((Ly, Lx), dtype=np.int32)
     eps = 1e-12
-    for (dy, dx), a in acc.items():
-        n = a["n"]
-        if n == 0:
-            continue
-        # Validity mask: where this offset had an in-bounds neighbor
-        valid = np.zeros((Ly, Lx), dtype=bool)
-        cy0 = max(0, dy); cy1 = Ly + min(0, dy)
-        cx0 = max(0, dx); cx1 = Lx + min(0, dx)
-        valid[cy0:cy1, cx0:cx1] = True
+    for (dy, dx), sxy in sxy_by_edge.items():
+        py0 = max(0, -dy); py1 = Ly - max(0, dy)
+        px0 = max(0, -dx); px1 = Lx - max(0, dx)
+        qy0 = py0 + dy; qy1 = py1 + dy
+        qx0 = px0 + dx; qx1 = px1 + dx
 
-        num = n * a["sxy"] - a["sx"] * a["sy"]
-        den = np.sqrt(np.maximum(n * a["sxx"] - a["sx"] ** 2, 0.0) *
-                       np.maximum(n * a["syy"] - a["sy"] ** 2, 0.0))
-        r = np.where(valid & (den > eps), num / (den + eps), 0.0)
-        vcorr += r
-        count += valid.astype(np.int32)
+        sp = sum_[py0:py1, px0:px1]
+        sq = sum_[qy0:qy1, qx0:qx1]
+        spp = sumsq[py0:py1, px0:px1]
+        sqq = sumsq[qy0:qy1, qx0:qx1]
+        sxy_region = sxy[py0:py1, px0:px1]
+
+        num = t_total * sxy_region - sp * sq
+        den = np.sqrt(np.maximum(t_total * spp - sp ** 2, 0.0) *
+                       np.maximum(t_total * sqq - sq ** 2, 0.0))
+        r = np.where(den > eps, num / (den + eps), 0.0)
+        vcorr[py0:py1, px0:px1] += r
+        vcorr[qy0:qy1, qx0:qx1] += r
+        count[py0:py1, px0:px1] += 1
+        count[qy0:qy1, qx0:qx1] += 1
 
     vcorr = (vcorr / np.maximum(count, 1)).astype(np.float32)
 
