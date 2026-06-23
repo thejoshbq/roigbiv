@@ -46,6 +46,42 @@ def _build_backends(tmp_path: Path):
     return store, blob
 
 
+def test_new_fov_persists_resolved_config_blob(tmp_path: Path):
+    import json
+
+    store, blob = _build_backends(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    cfg_payload = {"profile": "prism", "auto_scale": True, "diameter": 56,
+                   "auto_adapt": {"scale_ok": True, "n_somata": 14}}
+    report = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH",
+        query=_session("q", [(16, 16), (32, 32), (48, 48)]),
+        output_dir=out_dir,
+        store=store,
+        blob_store=blob,
+        resolved_config=cfg_payload,
+    )
+    assert report["decision"] == "new_fov"
+    fov = store.get_fov(report["fov_id"])
+    assert fov.resolved_config_uri is not None
+    restored = json.loads(blob.get(fov.resolved_config_uri).decode())
+    assert restored["profile"] == "prism"
+    assert restored["auto_adapt"]["scale_ok"] is True
+
+
+def test_new_fov_without_resolved_config_leaves_column_null(tmp_path: Path):
+    store, blob = _build_backends(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    report = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH",
+        query=_session("q", [(16, 16), (32, 32), (48, 48)]),
+        output_dir=out_dir, store=store, blob_store=blob,
+    )
+    assert store.get_fov(report["fov_id"]).resolved_config_uri is None
+
+
 def test_first_run_mints_new_fov(tmp_path: Path):
     store, blob = _build_backends(tmp_path)
     query = _session("q", [(16, 16), (32, 32), (48, 48)])

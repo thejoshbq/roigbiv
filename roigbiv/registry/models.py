@@ -41,6 +41,7 @@ class FOV(Base):
     fingerprint_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     fov_embedding_uri: Mapped[str] = mapped_column(String(512), nullable=True)
     roi_embeddings_uri: Mapped[str] = mapped_column(String(512), nullable=True)
+    resolved_config_uri: Mapped[str] = mapped_column(String(512), nullable=True)
 
     cells = relationship("Cell", back_populates="fov", cascade="all, delete-orphan")
     sessions = relationship("Session", back_populates="fov", cascade="all, delete-orphan")

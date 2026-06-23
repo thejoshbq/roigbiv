@@ -65,6 +65,26 @@ from roigbiv.registry.store.base import (
 log = logging.getLogger(__name__)
 
 
+def _persist_resolved_config(
+    blob_store: BlobStore, fov_id: str, resolved_config: Optional[dict]
+) -> Optional[str]:
+    """Store the optics auto-adaptation config as a JSON blob; return its URI.
+
+    Total — a serialization/blob failure logs and returns None rather than
+    breaking registration (the resolved config is an optimization, not a
+    correctness requirement).
+    """
+    if not resolved_config:
+        return None
+    try:
+        payload = json.dumps(resolved_config, default=str).encode("utf-8")
+        return blob_store.put(f"{fov_id}/resolved_config.json", payload)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to persist resolved optics config for %s: %s",
+                    fov_id, exc)
+        return None
+
+
 def register_or_match(
     *,
     fov_stem: str,
@@ -77,6 +97,7 @@ def register_or_match(
     adapter_config: Optional[AdapterConfig] = None,
     accept_threshold: float = AUTO_ACCEPT_THRESHOLD,
     review_threshold: float = REVIEW_THRESHOLD,
+    resolved_config: Optional[dict] = None,
 ) -> dict:
     """Register a newly-processed session against the cross-session registry.
 
@@ -202,6 +223,7 @@ def register_or_match(
             output_dir=output_dir,
             fp=fp,
             match_result=best_result,
+            resolved_config=resolved_config,
         )
         return _write_report(output_dir, report)
 
@@ -229,6 +251,7 @@ def register_or_match(
         output_dir=output_dir,
         best_candidate_fov_id=best_record.fov_id if best_record else None,
         best_match_result=best_result,
+        resolved_config=resolved_config,
     )
     return _write_report(output_dir, report)
 
@@ -415,6 +438,7 @@ def _register_auto_match(
     output_dir: Path,
     fp: Fingerprint,
     match_result: FOVMatchResult,
+    resolved_config: Optional[dict] = None,
 ) -> dict:
     """Write a new session mapped via ROICaT cluster labels → global cell IDs."""
     session_id = str(uuid.uuid4())
@@ -583,6 +607,13 @@ def _register_auto_match(
         store.insert_cell(cell)
     store.insert_observations(observations)
     store.update_fov_latest_session(fov_record.fov_id, session_date)
+    # Refresh the FOV's resolved optics config from this successful run, but only
+    # if it doesn't already have one — first-write wins, so a later run can't
+    # silently overwrite the config a repeat FOV is being matched against.
+    if resolved_config is not None and not fov_record.resolved_config_uri:
+        uri = _persist_resolved_config(blob_store, fov_record.fov_id, resolved_config)
+        if uri is not None:
+            store.update_fov_resolved_config(fov_record.fov_id, uri)
 
     features = match_result.features
     return {
@@ -658,6 +689,7 @@ def _mint_new_fov(
     output_dir: Path,
     best_candidate_fov_id: Optional[str] = None,
     best_match_result: Optional[FOVMatchResult] = None,
+    resolved_config: Optional[dict] = None,
 ) -> dict:
     """Create a new FOV + session + cells keyed to fresh global IDs."""
     fov_id = str(uuid.uuid4())
@@ -669,6 +701,7 @@ def _mint_new_fov(
     )
     mean_m_uri = blob_store.put(f"{fov_id}/mean_M.npy", fingerprint.mean_m_blob)
     centroids_uri = blob_store.put(f"{fov_id}/centroids.npy", fingerprint.centroids_blob)
+    resolved_config_uri = _persist_resolved_config(blob_store, fov_id, resolved_config)
 
     # Single-session FOV: each ROI is its own cluster label.
     query_cluster_labels = np.arange(fingerprint.label_ids.size, dtype=np.int32)
@@ -692,6 +725,7 @@ def _mint_new_fov(
         # convenience — it is opaque to the legacy code path.
         fov_embedding_uri=None,
         roi_embeddings_uri=merged_masks_uri,
+        resolved_config_uri=resolved_config_uri,
     ))
     store.insert_session(SessionRecord(
         session_id=session_id,

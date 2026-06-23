@@ -26,6 +26,9 @@ class FOVRecord:
     fingerprint_version: int = 1
     fov_embedding_uri: Optional[str] = None
     roi_embeddings_uri: Optional[str] = None
+    # v5 — blob URI for the optics auto-adaptation config (profile + derived
+    # scale) that succeeded for this FOV, reused as a prior for repeat FOVs.
+    resolved_config_uri: Optional[str] = None
 
 
 @dataclass
@@ -84,6 +87,9 @@ class RegistryStore(Protocol):
     def list_fovs(self, filters: Optional[dict] = None) -> list[FOVRecord]: ...
     def insert_fov(self, fov: FOVRecord) -> None: ...
     def update_fov_latest_session(self, fov_id: str, session_date: date) -> None: ...
+    def update_fov_resolved_config(
+        self, fov_id: str, resolved_config_uri: str
+    ) -> None: ...
 
     def insert_session(self, session: SessionRecord) -> None: ...
     def list_sessions(self, fov_id: str) -> list[SessionRecord]: ...

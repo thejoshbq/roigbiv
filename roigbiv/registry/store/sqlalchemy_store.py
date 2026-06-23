@@ -151,7 +151,19 @@ class SQLAlchemyStore:
                 fingerprint_version=fov.fingerprint_version,
                 fov_embedding_uri=fov.fov_embedding_uri,
                 roi_embeddings_uri=fov.roi_embeddings_uri,
+                resolved_config_uri=fov.resolved_config_uri,
             ))
+            s.commit()
+
+    def update_fov_resolved_config(
+        self, fov_id: str, resolved_config_uri: str
+    ) -> None:
+        """Attach the optics auto-adaptation config blob URI to an existing FOV."""
+        with self._Session() as s:
+            row = s.get(m.FOV, fov_id)
+            if row is None:
+                return
+            row.resolved_config_uri = resolved_config_uri
             s.commit()
 
     def update_fov_embeddings(
@@ -307,6 +319,7 @@ def _fov_to_record(row: m.FOV) -> FOVRecord:
         fingerprint_version=row.fingerprint_version or 1,
         fov_embedding_uri=row.fov_embedding_uri,
         roi_embeddings_uri=row.roi_embeddings_uri,
+        resolved_config_uri=row.resolved_config_uri,
     )
 
 
