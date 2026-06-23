@@ -265,6 +265,25 @@ class PipelineConfig:
     # into summary_for_log so the manifest records the resolved profile.
     profile: str = "grin"
 
+    # ── Optics auto-adaptation (see pipeline/optics.py) ───────────────────
+    # auto_scale: after foundation, measure the FOV's soma scale and DERIVE the
+    # numeric gates (areas, separations, pool radii) from it, overriding the
+    # profile's hardcoded numbers but never an explicit user flag. Gated to the
+    # prism/generic profiles (or large frames) so the validated GRIN path stays
+    # byte-identical unless explicitly opted in. explicit_fields lists the cfg
+    # fields the user pinned (which derivation must not clobber); auto_adapt is
+    # the provenance record (prior reasons, measured scale, fields overridden),
+    # serialized into summary_for_log for an auditable, HITL-reviewable manifest.
+    auto_scale: bool = True
+    explicit_fields: tuple = ()
+    auto_adapt: dict = field(default_factory=dict)
+    # When auto-adaptation is uncertain (ambiguous frame size, or the measured
+    # soma scale is unreliable/implausible), the run pauses after foundation and
+    # writes needs_optics_confirmation.json for the user to confirm the optics,
+    # then continues via --resume. assume_optics=True suppresses the pause and
+    # proceeds on the best guess — for headless/batch runs that cannot prompt.
+    assume_optics: bool = False
+
     # ── Stage 1 (Cellpose) ────────────────────────────────────────────────
     cellpose_model: str = _DEFAULT_CELLPOSE_MODEL
     diameter: int = 12

@@ -367,6 +367,60 @@ def validate_tif(path) -> tuple:
     return path.stem.replace("_mc", ""), shape
 
 
+def read_tiff_optics_metadata(path) -> dict:
+    """Best-effort optics metadata (pixel size) for FOV auto-classification.
+
+    Reads, in priority order: OME-XML ``PhysicalSizeX``, ScanImage
+    ``SI.objectiveResolution`` (µm/deg, not directly µm/px — skipped unless a
+    pixel-size is derivable), and the TIFF ``XResolution``/``ResolutionUnit``
+    tags. Returns ``{"pixel_size_um": float}`` when a µm/px value is recoverable,
+    else ``{}``.
+
+    **Total** — never raises; absence of metadata is the common case. Used only
+    as a tiebreaker/confidence booster by ``optics.classify_optics_prior``; the
+    frame-size prior never depends on it.
+    """
+    path = Path(path)
+    try:
+        with tifffile.TiffFile(str(path)) as tif:
+            # 1) OME-XML PhysicalSizeX (µm by default).
+            ome = getattr(tif, "ome_metadata", None)
+            if ome:
+                import re
+                m = re.search(r'PhysicalSizeX="([0-9.eE+-]+)"', ome)
+                unit = re.search(r'PhysicalSizeXUnit="([^"]+)"', ome)
+                if m:
+                    import unicodedata
+                    val = float(m.group(1))
+                    # OME-XML uses U+03BC (Greek mu); TIFF tags often U+00B5
+                    # (micro sign). NFKC folds the micro sign to Greek mu; fold
+                    # that to ASCII 'u' so every form of "µm" matches.
+                    u = (unicodedata.normalize("NFKC", unit.group(1) if unit else "um")
+                         .strip().lower().replace("μ", "u"))
+                    if u in ("um", "micron", "microns", "micrometer", "micrometre"):
+                        return {"pixel_size_um": val}
+                    if u == "nm":
+                        return {"pixel_size_um": val / 1000.0}
+
+            # 2) Baseline TIFF resolution tags (pixels per ResolutionUnit).
+            page = tif.pages[0]
+            tags = page.tags
+            xres = tags.get("XResolution")
+            runit = tags.get("ResolutionUnit")
+            if xres is not None and xres.value:
+                num, den = xres.value if isinstance(xres.value, tuple) else (xres.value, 1)
+                if num:
+                    px_per_unit = float(num) / float(den or 1)
+                    unit_um = {2: 25400.0, 3: 10000.0}.get(
+                        int(runit.value) if runit is not None else 0
+                    )  # 2=inch, 3=cm → µm per unit
+                    if unit_um and px_per_unit > 0:
+                        return {"pixel_size_um": unit_um / px_per_unit}
+    except Exception:
+        return {}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Projection extraction
 # ---------------------------------------------------------------------------
