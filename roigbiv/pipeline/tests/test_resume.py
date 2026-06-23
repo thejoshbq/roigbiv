@@ -545,6 +545,72 @@ def test_plan_resume_missing_masks_tif_raises(workspace):
         plan_resume(out, workspace["tif_path"], cfg, enable=True)
 
 
+def test_plan_resume_uses_nested_suite2p_layout(workspace):
+    cfg = PipelineConfig(fs=7.5)
+    out = workspace["output_dir"]
+    tif = workspace["tif_path"]
+    _make_foundation(out)
+    stem = tif.stem.replace("_mc", "")
+    nested = out / stem / "suite2p"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    (out / "suite2p").rename(nested)
+    update_manifest(out, "foundation", cfg, tif)
+
+    plan = plan_resume(out, tif, cfg, enable=True)
+
+    assert plan.start_stage == "stage1"
+    assert plan.fov is not None
+    assert plan.fov.data_bin_path == nested / "plane0" / "data.bin"
+
+
+def test_foundation_manifest_update_clears_downstream_stages(workspace):
+    cfg = PipelineConfig(fs=7.5)
+    out = workspace["output_dir"]
+    tif = workspace["tif_path"]
+    update_manifest(out, "foundation", cfg, tif)
+    update_manifest(out, "stage1", cfg, tif)
+
+    update_manifest(out, "foundation", cfg, tif)
+
+    manifest = read_manifest(out)
+    assert sorted(manifest["stages"]) == ["foundation"]
+
+
+def test_confirm_resume_starts_stage1_ignoring_stale_stage_outputs(workspace):
+    out = workspace["output_dir"]
+    tif = workspace["tif_path"]
+    _make_foundation(out)
+    cfg_initial = PipelineConfig(
+        fs=7.5,
+        profile="prism",
+        auto_scale=True,
+        auto_adapt={"prior": {"profile": "prism", "confidence": "high"}},
+        assume_optics=False,
+        resume=False,
+    )
+    update_manifest(out, "foundation", cfg_initial, tif)
+    _write_stage(out, 1, accept_label_ids=[1])
+    _write_residual(out, 1)
+    update_manifest(out, "stage1", cfg_initial, tif)
+    update_manifest(out, "stage1_subtract", cfg_initial, tif)
+    (out / "needs_optics_confirmation.json").write_text("{}")
+
+    cfg_confirmed = PipelineConfig(
+        fs=7.5,
+        profile="prism",
+        auto_scale=True,
+        auto_adapt={},
+        assume_optics=True,
+        resume=True,
+    )
+    plan = plan_resume(out, tif, cfg_confirmed, enable=True)
+
+    assert plan.start_stage == "stage1"
+    assert plan.prior_reports == {}
+    assert plan.fov is not None
+    assert plan.fov.rois == []
+
+
 # ─────────────────────── ResumePlan.should_run ────────────────────────────
 
 

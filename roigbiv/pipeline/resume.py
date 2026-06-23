@@ -139,6 +139,9 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # assume_optics is a pause-suppression knob (like foundation_only): a paused
     # run resumed with --assume-optics / a confirmed profile must not mismatch.
     "assume_optics",
+    # resume is an execution-control flag: enabling it is how a prior run is
+    # continued, not a change to the artifacts' semantics.
+    "resume",
 })
 
 
@@ -154,6 +157,7 @@ def _confirm_resume_fields() -> frozenset:
         "flow_threshold", "cellprob_threshold", "min_solidity",
         "max_eccentricity", "mc_strip_height", "diameter_auto",
         "auto_scale", "assume_optics", "auto_adapt", "explicit_fields",
+        "resume",
     }
 
 
@@ -167,9 +171,10 @@ def _changed_cfg_fields(snapshot: dict, cfg: PipelineConfig) -> set:
     so the comparison is apples-to-apples. Keys present on only one side count
     as changed.
     """
-    current = cfg.summary_for_log()
-    keys = set(snapshot) | set(current)
-    return {k for k in keys if snapshot.get(k) != current.get(k)}
+    old = _json_ready(snapshot)
+    current = _json_ready(cfg.summary_for_log())
+    keys = set(old) | set(current)
+    return {k for k in keys if old.get(k) != current.get(k)}
 
 
 def compute_cfg_fingerprint(cfg: PipelineConfig, tif_path: Path) -> str:
@@ -189,7 +194,7 @@ def compute_cfg_fingerprint(cfg: PipelineConfig, tif_path: Path) -> str:
     # still detected). User-pinned fields are recorded in cfg.explicit_fields.
     if auto_scale_active(cfg):
         exclude |= (SCALE_DERIVED_FIELDS - set(getattr(cfg, "explicit_fields", ()) or ()))
-    summary = {k: v for k, v in cfg.summary_for_log().items()
+    summary = {k: _json_ready(v) for k, v in cfg.summary_for_log().items()
                if k not in exclude}
     cfg_json = json.dumps(summary, sort_keys=True, default=_json_default)
     stat = _stat_tif(Path(tif_path))
@@ -206,6 +211,19 @@ def _json_default(v):
     if isinstance(v, Path):
         return str(v)
     return str(v)
+
+
+def _json_ready(v):
+    """Recursively canonicalize values the same way JSON manifests store them."""
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, tuple):
+        return [_json_ready(x) for x in v]
+    if isinstance(v, list):
+        return [_json_ready(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_ready(val) for k, val in v.items()}
+    return v
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -257,14 +275,17 @@ def update_manifest(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = read_manifest(output_dir) or {}
-    manifest.setdefault("stages", {})
+    if step == "foundation":
+        manifest["stages"] = {}
+    else:
+        manifest.setdefault("stages", {})
 
     fingerprint = compute_cfg_fingerprint(cfg, tif_path)
     manifest["roigbiv_version"] = _ROIGBIV_VERSION
     manifest["input_tif"] = str(Path(tif_path).resolve())
     manifest["input_stat"] = _stat_tif(Path(tif_path))
     manifest["cfg_fingerprint"] = fingerprint
-    manifest["cfg_snapshot"] = cfg.summary_for_log()
+    manifest["cfg_snapshot"] = _json_ready(cfg.summary_for_log())
     manifest["stages"][step] = {
         "completed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "version": _ROIGBIV_VERSION,
@@ -293,20 +314,35 @@ def _summary_paths(output_dir: Path) -> dict:
     }
 
 
-def _foundation_paths(output_dir: Path) -> dict:
+def _suite2p_plane_dir(output_dir: Path, tif_path: Path | None = None) -> Path:
     output_dir = Path(output_dir)
+    stem = (Path(tif_path).stem.replace("_mc", "")
+            if tif_path is not None else output_dir.name)
+    candidates = (
+        output_dir / stem / "suite2p" / "plane0",
+        output_dir / "suite2p" / "plane0",
+    )
+    for plane_dir in candidates:
+        if (plane_dir / "data.bin").exists():
+            return plane_dir
+    return candidates[0]
+
+
+def _foundation_paths(output_dir: Path, tif_path: Path | None = None) -> dict:
+    output_dir = Path(output_dir)
+    plane_dir = _suite2p_plane_dir(output_dir, tif_path)
     return {
-        "data_bin":   output_dir / "suite2p" / "plane0" / "data.bin",
-        "ops":        output_dir / "suite2p" / "plane0" / "ops.npy",
+        "data_bin":   plane_dir / "data.bin",
+        "ops":        plane_dir / "ops.npy",
         "svd_factors": output_dir / "svd_factors.npz",
         "residual_meta": output_dir / "residual_S.meta.json",
         "motion_trace": output_dir / "motion_trace.npz",
     }
 
 
-def _foundation_complete(output_dir: Path) -> bool:
+def _foundation_complete(output_dir: Path, tif_path: Path | None = None) -> bool:
     """All Foundation outputs (summary, data.bin, residual, motion) present."""
-    for p in _foundation_paths(output_dir).values():
+    for p in _foundation_paths(output_dir, tif_path).values():
         if not p.exists():
             return False
     for p in _summary_paths(output_dir).values():
@@ -429,7 +465,7 @@ def _load_fov_after_foundation(
     """
     from roigbiv.pipeline.residual import ResidualView
 
-    paths = _foundation_paths(output_dir)
+    paths = _foundation_paths(output_dir, Path(tif_path))
     T, Ly, Lx = _verify_foundation_residual(
         paths["residual_meta"], paths["svd_factors"], paths["data_bin"],
     )
@@ -557,6 +593,9 @@ def plan_resume(
                           cfg_fingerprint=fingerprint,
                           enabled=True)
 
+    confirm_sentinel = output_dir / "needs_optics_confirmation.json"
+    foundation_complete = _foundation_complete(output_dir, Path(tif_path))
+
     # Optics-confirmation resume: a prior run paused after foundation for the
     # user to confirm the optics, leaving needs_optics_confirmation.json. The
     # confirmed profile legitimately changes Stage-1 config (and thus the
@@ -564,9 +603,9 @@ def plan_resume(
     # backend — so resume from Stage 1 on the existing foundation rather than
     # refusing. One-shot: consume the sentinel so later plain resumes still
     # enforce the (now-updated) fingerprint.
-    confirm_sentinel = output_dir / "needs_optics_confirmation.json"
     is_confirm_resume = False
-    if confirm_sentinel.exists() and _foundation_complete(output_dir):
+    changed = set()
+    if confirm_sentinel.exists() and foundation_complete:
         # Only bypass the fingerprint if the *only* changed fields are optics /
         # Stage-1 (the confirmed profile + its derived gates). An unrelated edit
         # (fs, tau, backend, k_background…) must still be caught — never absorbed
@@ -589,7 +628,7 @@ def plan_resume(
 
     manifest_stages = manifest.get("stages", {}) or {}
 
-    if not _foundation_complete(output_dir):
+    if not _foundation_complete(output_dir, Path(tif_path)):
         if "foundation" in manifest_stages:
             raise ResumeError(
                 "resume: manifest claims foundation completed but its "
@@ -602,6 +641,12 @@ def plan_resume(
                           enabled=True)
 
     fov = _load_fov_after_foundation(output_dir, Path(tif_path), cfg)
+    if is_confirm_resume:
+        return ResumePlan(start_stage="stage1",
+                          fov=fov,
+                          prior_reports={},
+                          cfg_fingerprint=fingerprint,
+                          enabled=True)
     prior_reports: dict = {}
     start_stage = "stage1"
 
@@ -706,8 +751,8 @@ def _describe_config_diff(
     tif_path: Path,
 ) -> str:
     """Human-readable diff for the fingerprint-mismatch error message."""
-    prior = manifest.get("cfg_snapshot", {}) or {}
-    new = cfg.summary_for_log()
+    prior = _json_ready(manifest.get("cfg_snapshot", {}) or {})
+    new = _json_ready(cfg.summary_for_log())
     changed_fields: list[str] = []
     for k in sorted(set(prior) | set(new)):
         pv, nv = prior.get(k, "<unset>"), new.get(k, "<unset>")
