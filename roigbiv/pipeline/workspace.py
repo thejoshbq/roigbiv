@@ -183,6 +183,10 @@ class FOVRunResult:
     registry: Optional[dict] = None
     roi_counts: dict = field(default_factory=dict)
     png_path: Optional[Path] = None
+    # Set when the run paused after foundation for optics confirmation (the
+    # foundation outputs are on disk; a --resume run with a confirmed profile
+    # continues from Stage 1). Carries the confirmation payload for the UI.
+    awaiting_confirmation: Optional[dict] = None
 
 
 def run_with_workspace(
@@ -418,7 +422,7 @@ def _process_one(
     skip_registry: bool,
     registry_cfg: "RegistryConfig",
 ) -> FOVRunResult:
-    from roigbiv.pipeline.run import run_pipeline
+    from roigbiv.pipeline.run import OpticsConfirmationRequired, run_pipeline
 
     stem = tif.stem.replace("_mc", "")
     out_dir = workspace.output_root / stem
@@ -431,10 +435,24 @@ def _process_one(
         return FOVRunResult(tif=tif, output_dir=out_dir,
                             error=f"invalid_tif: {exc}")
 
+    if not skip_registry:
+        cfg_overrides = _apply_registry_memory(tif, cfg_overrides, registry_cfg, log)
     cfg = _build_config(out_dir, cfg_overrides)
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif, cfg)
+    except OpticsConfirmationRequired as need:
+        # Foundation is on disk; this FOV awaits an optics decision. Skip
+        # registry/traces — there are no ROIs yet. The UI surfaces this and
+        # resumes with a confirmed profile.
+        log(f"  paused: optics confirmation needed "
+            f"(candidate '{need.payload.get('candidate_profile')}')")
+        return FOVRunResult(
+            tif=tif,
+            output_dir=out_dir,
+            duration_s=time.perf_counter() - t0,
+            awaiting_confirmation=need.payload,
+        )
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
         return FOVRunResult(
@@ -458,7 +476,10 @@ def _process_one(
             log("  registry: skipped (foundation-only dry run)")
     else:
         try:
-            registry = _register_session(stem, fov, log, registry_cfg)
+            from roigbiv.pipeline.optics import resolved_config_payload
+            registry = _register_session(
+                stem, fov, log, registry_cfg,
+                resolved_config=resolved_config_payload(cfg))
         except Exception as exc:  # noqa: BLE001
             log(f"  WARNING: registry call failed — "
                 f"{type(exc).__name__}: {exc}")
@@ -538,8 +559,60 @@ def _build_merged_masks(fov: FOVData) -> Optional[np.ndarray]:
     return label_image
 
 
+def _apply_registry_memory(
+    tif: Path, cfg_overrides: dict, registry_cfg: "RegistryConfig",
+    log: LogCallback,
+) -> dict:
+    """Reuse a known-good optics config for a repeat FOV (propose, don't impose).
+
+    For an AUTO run (cfg carries an auto-adapt prior), look up prior FOVs in the
+    same ``(animal_id, region)`` with a stored ``resolved_config``. If found,
+    overlay that profile's categorical bundle and suppress the pause-to-confirm
+    — we've processed this region before. The per-FOV scale measurement still
+    re-runs, so numerics stay FOV-specific; only the categorical profile +
+    confidence are seeded. Total: any failure returns the overrides unchanged.
+    """
+    aa = cfg_overrides.get("auto_adapt") or {}
+    if "prior" not in aa:                       # not an auto run → nothing to reuse
+        return cfg_overrides
+    try:
+        import json as _json
+
+        from roigbiv.pipeline.profiles import get_profile
+        from roigbiv.registry import build_blob_store, build_store
+        from roigbiv.registry.filename import parse_filename_metadata
+
+        meta = parse_filename_metadata(tif.stem.replace("_mc", ""))
+        store = build_store(registry_cfg)
+        store.ensure_schema()
+        hit = next((c for c in store.find_candidates(meta.animal_id, meta.region)
+                    if getattr(c, "resolved_config_uri", None)), None)
+        if hit is None:
+            return cfg_overrides
+        stored = _json.loads(
+            build_blob_store(registry_cfg).get(hit.resolved_config_uri).decode())
+        sp = stored.get("profile") or cfg_overrides.get("profile", "grin")
+        overlay = get_profile(sp)
+        # auto_scale derives the diameter post-foundation, so force per-image
+        # diameter_auto off even when the stored profile (e.g. generic) sets it.
+        overlay["diameter_auto"] = False
+        log(f"  registry memory: reusing '{sp}' from FOV {hit.fov_id[:8]} "
+            f"({meta.animal_id}/{meta.region}) — skipping optics confirmation")
+        return {
+            **cfg_overrides, **overlay,
+            "profile": sp,
+            "assume_optics": True,
+            "auto_adapt": {**aa, "registry_prior": {
+                "fov_id": hit.fov_id, "profile": sp}},
+        }
+    except Exception as exc:  # noqa: BLE001
+        log(f"  registry memory lookup skipped — {type(exc).__name__}: {exc}")
+        return cfg_overrides
+
+
 def _register_session(
-    stem: str, fov: FOVData, log: LogCallback, cfg: "RegistryConfig"
+    stem: str, fov: FOVData, log: LogCallback, cfg: "RegistryConfig",
+    *, resolved_config: Optional[dict] = None,
 ) -> Optional[dict]:
     """Mirror of ``roigbiv.pipeline.run._register_fov_after_pipeline``.
 
@@ -585,6 +658,7 @@ def _register_session(
         calibration=calibration,
         accept_threshold=cfg.fov_accept_threshold,
         review_threshold=cfg.fov_review_threshold,
+        resolved_config=resolved_config,
     )
     decision = report.get("decision", "unknown")
     posterior = report.get("fov_posterior") or report.get("fov_sim")

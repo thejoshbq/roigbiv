@@ -155,46 +155,13 @@ def _estimate_diameter_px(
     """Robust per-image cell-diameter estimate via DoG peaks + Otsu sizing.
 
     Returns the median equivalent-diameter (px) across detected somata, or
-    None if too few peaks are found to be reliable.
+    None if too few peaks are found to be reliable. Delegates to
+    ``optics.measure_soma_scale`` — the single source of truth for soma sizing,
+    shared with the post-foundation scale-derivation path.
     """
-    try:
-        from skimage.feature import peak_local_max
-        from skimage.filters import difference_of_gaussians, threshold_otsu
-        from skimage.measure import label as _label, regionprops
-    except ImportError:
-        return None
-
-    arr = img.astype(np.float32)
-    H, W = arr.shape
-    # DoG sigmas span GRIN→prism cell radii (~3 to ~15 px).
-    dog = difference_of_gaussians(arr, low_sigma=3.0, high_sigma=15.0)
-    peaks = peak_local_max(
-        dog, min_distance=20, threshold_rel=0.15,
-        num_peaks=n_peaks, exclude_border=box_radius,
-    )
-    diameters: list[float] = []
-    for (y, x) in peaks:
-        y0, y1 = max(0, y - box_radius), min(H, y + box_radius)
-        x0, x1 = max(0, x - box_radius), min(W, x + box_radius)
-        crop = arr[y0:y1, x0:x1]
-        if crop.size < 100:
-            continue
-        try:
-            t = threshold_otsu(crop)
-        except Exception:
-            continue
-        labels = _label(crop > t)
-        cy, cx = y - y0, x - x0
-        target = labels[cy, cx]
-        if target == 0:
-            continue
-        for r in regionprops((labels == target).astype(np.uint8)):
-            if 30 <= r.area <= 8000:
-                diameters.append(float(r.equivalent_diameter))
-            break
-    if len(diameters) < 5:
-        return None
-    return float(np.median(diameters))
+    from roigbiv.pipeline.optics import measure_soma_scale
+    scale = measure_soma_scale(img, n_peaks=n_peaks, box_radius=box_radius)
+    return scale.diameter_med if scale.ok else None
 
 
 def _effective_diameter(morph_input: np.ndarray, cfg: PipelineConfig) -> int:

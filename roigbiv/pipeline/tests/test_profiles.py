@@ -165,9 +165,22 @@ def test_explicit_flag_overrides_prism_profile_in_cfg():
     assert cfg.channels == (0, 0)         # untouched profile value remains
 
 
-def test_resolve_profile_name_auto_maps_to_grin_for_now(tmp_path):
-    assert _resolve_profile_name(AUTO, tmp_path) == "grin"
-    assert _resolve_profile_name("prism", tmp_path) == "prism"
+def test_resolve_profile_name_concrete_passthrough(tmp_path):
+    # Explicit names pass through unchanged and carry no prior.
+    assert _resolve_profile_name("prism", tmp_path) == ("prism", None)
+    assert _resolve_profile_name("grin", tmp_path) == ("grin", None)
+
+
+def test_resolve_profile_name_auto_without_shape_is_legacy_grin(tmp_path):
+    # No peekable shape → byte-identical legacy fallback.
+    assert _resolve_profile_name(AUTO, tmp_path) == ("grin", None)
+
+
+def test_resolve_profile_name_auto_with_shape_uses_prior(tmp_path):
+    name, prior = _resolve_profile_name(AUTO, tmp_path, shape=(1000, 1024, 1024))
+    assert name == "prism" and prior is not None and prior.confidence == "high"
+    name, prior = _resolve_profile_name(AUTO, tmp_path, shape=(1000, 512, 512))
+    assert name == "grin" and prior.confidence == "high"
 
 
 def test_profile_serializes_in_summary_for_log():

@@ -26,6 +26,11 @@ import numpy as np
 import tifffile
 
 from roigbiv.pipeline import fmt
+from roigbiv.pipeline.optics import (
+    OpticsPrior,
+    auto_scale_active,
+    classify_optics_prior,
+)
 from roigbiv.pipeline.profiles import (
     AUTO,
     STAGE1_CLI_DEFAULTS,
@@ -35,6 +40,25 @@ from roigbiv.pipeline.profiles import (
     merged_overrides,
 )
 from roigbiv.pipeline.types import FOVData, PipelineConfig
+
+
+class OpticsConfirmationRequired(Exception):
+    """Raised after foundation when auto-adaptation is too uncertain to proceed.
+
+    The foundation outputs are already on disk (its manifest entry is written),
+    so resolving the optics and re-running with ``--resume`` continues from
+    Stage 1 — nothing recomputes. ``payload`` is the confirmation context
+    (candidate profile, prior reasons, measured scale) also written to
+    ``needs_optics_confirmation.json``.
+    """
+
+    def __init__(self, output_dir: "Path", payload: dict) -> None:
+        self.output_dir = output_dir
+        self.payload = payload
+        super().__init__(
+            f"optics confirmation required for {Path(output_dir).name}: "
+            f"candidate profile {payload.get('candidate_profile')!r}"
+        )
 
 
 _GATE2_MIN_SCALE = 3 / 4   # gate2_min_area / gate1_min_area at GRIN defaults (60/80)
@@ -469,6 +493,18 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             f"(T={fov.shape[0]}, H={fov.shape[1]}, W={fov.shape[2]})"
         ), flush=True)
 
+    # ── Optics auto-scale (post-foundation, pre-Stage-1) ──────────────────
+    # Derive the numeric gates (areas/diameter/separations/pool radii) from the
+    # FOV's own measured soma scale, overriding the profile's hardcoded numbers
+    # but never an explicit user flag (cfg.explicit_fields). Gated to
+    # prism/generic so the validated GRIN path stays byte-identical, and only
+    # when Stage 1 will actually run. Re-derives identically on resume (it reads
+    # the on-disk mean_M), which is why these fields are excluded from the resume
+    # fingerprint. Runs before the foundation-only short-circuit so a dry run
+    # still records the measured scale for the user to inspect.
+    if rp.should_run("stage1") and auto_scale_active(cfg):
+        _apply_auto_scale(cfg, fov)
+
     # ── Foundation-only short-circuit ─────────────────────────────────────
     # Stop before any ROI detection so the motion-corrected FOV + summary
     # images can be inspected first. A sentinel marks the dry run; the
@@ -493,6 +529,22 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None) -> FOVData:
             from roigbiv.pipeline.napari_viewer import display_pipeline_results
             display_pipeline_results(fov, review_queue=[])
         return fov
+
+    # ── Optics confirmation gate (pause-to-confirm) ───────────────────────
+    # When auto-adaptation is too uncertain, stop here (foundation is on disk,
+    # like a foundation-only dry run) and ask the user to confirm the optics.
+    # --assume-optics proceeds on the best guess for headless/batch runs.
+    if rp.should_run("stage1") and not getattr(cfg, "assume_optics", False):
+        _confirm = _optics_confirmation_decision(cfg)
+        if _confirm is not None:
+            sentinel = _write_optics_confirmation_sentinel(output_dir, cfg, _confirm)
+            print(fmt.sub_phase(
+                f"Optics confirmation needed → wrote {sentinel.name}. "
+                f"Candidate '{_confirm['candidate_profile']}' "
+                f"({_confirm.get('confidence')}). Re-run with --resume "
+                f"[--profile <choice>] to continue, or --assume-optics to proceed."
+            ), flush=True)
+            raise OpticsConfirmationRequired(output_dir, _confirm)
 
     # ── Stage 1 Cellpose detection ────────────────────────────────────────
     if rp.should_run("stage1"):
@@ -1147,21 +1199,245 @@ def _resolve_model(spec: str) -> str:
     return spec
 
 
-def _resolve_profile_name(name: str, input_path: Path) -> str:
-    """Resolve ``--profile`` to a concrete profile name.
+def _resolve_profile_name(
+    name: str,
+    input_path: Path,
+    *,
+    shape: "tuple | None" = None,
+    metadata: "dict | None" = None,
+) -> "tuple[str, OpticsPrior | None]":
+    """Resolve ``--profile`` to a concrete profile name (+ the optics prior).
 
-    ``auto`` currently maps to ``grin`` (no FOV-optics sniffing yet); concrete
-    names pass through. Resolution happens here — where explicit-vs-default
-    flags are still distinguishable — not inside ``get_profile`` (which rejects
-    ``auto``). Raises on an unknown name so a typo fails fast.
+    A concrete ``name`` passes through unchanged (explicit ``--profile``/UI
+    dropdown always wins) and returns ``(name, None)``. ``auto`` is resolved from
+    the pre-foundation optics prior when a frame ``shape`` is available; with no
+    peekable shape it falls back to the legacy ``"grin"`` for byte-identical
+    behavior. Resolution happens here — where explicit-vs-default flags are still
+    distinguishable — not inside ``get_profile`` (which rejects ``auto``). Raises
+    on an unknown concrete name so a typo fails fast.
     """
     if name == AUTO:
-        return "grin"   # TODO: sniff optics from input_path to pick prism/grin
+        if shape is None:
+            return "grin", None   # no peek available → legacy default
+        prior = classify_optics_prior(shape, metadata)
+        return prior.profile_name, prior
     if not is_profile(name):
         raise ValueError(
             f"unknown profile {name!r}; choose one of {list_profiles()}."
         )
-    return name
+    return name, None
+
+
+def _peek_optics(tif_path: Path) -> "tuple[tuple | None, dict]":
+    """Peek a TIF's (T,H,W) shape + optional pixel-size metadata. Total."""
+    from roigbiv.io import read_tiff_optics_metadata, validate_tif
+    shape = None
+    try:
+        _, shape = validate_tif(tif_path)
+    except Exception:
+        shape = None
+    try:
+        md = read_tiff_optics_metadata(tif_path)
+    except Exception:
+        md = {}
+    return shape, md
+
+
+def _classify_workspace_optics(tifs: "list[Path]") -> "OpticsPrior | None":
+    """Aggregate a per-FOV optics prior across a directory of TIFs.
+
+    A workspace is usually one imaging session → one lens, so the common case is
+    a unanimous high-confidence class. Mixed frame sizes (rare) resolve to the
+    safe ``generic`` profile at low confidence — Phase-2 per-FOV scale derivation
+    then corrects the numeric gates per FOV regardless of the batch profile.
+    Returns ``None`` if nothing could be peeked (→ caller keeps legacy default).
+    """
+    priors: list[OpticsPrior] = []
+    for t in tifs:
+        shape, md = _peek_optics(t)
+        if shape is not None:
+            priors.append(classify_optics_prior(shape, md))
+    if not priors:
+        return None
+    names = {p.profile_name for p in priors}
+    if len(names) == 1 and all(p.confidence == "high" for p in priors):
+        return priors[0]  # unanimous, confident → representative prior
+    if len(names) == 1:
+        return priors[0]  # unanimous but low-confidence → carries the confirm flag
+    # Mixed optics in one workspace → safest single-channel fallback + confirm.
+    max_dim = max(p.max_dim for p in priors)
+    return OpticsPrior(
+        "generic", "low",
+        [f"mixed frame sizes across {len(priors)} FOVs ({sorted(names)}) → "
+         f"generic; confirm per-FOV optics"],
+        max_dim, None,
+    )
+
+
+def build_auto_workspace_overrides(tifs: "list[Path]", base: dict) -> dict:
+    """Build per-FOV overrides for an AUTO-profile workspace run (UI + CLI share).
+
+    Classifies the optics prior across *tifs*, resolves the categorical profile,
+    and merges it over *base* (defaults < profile), enabling auto-scale and the
+    pause-to-confirm path. *base* carries the non-optics fields (fs, tau,
+    backend, stage flags, resume…). Numeric gates are derived post-foundation, so
+    nothing here pins them. Returns a flat dict for ``PipelineConfig(**...)``.
+    """
+    prior = _classify_workspace_optics(list(tifs))
+    resolved = prior.profile_name if prior is not None else "grin"
+    return merged_overrides(resolved, {
+        **base,
+        "auto_scale": True,
+        "assume_optics": False,
+        "explicit_fields": (),
+        "auto_adapt": _seed_auto_adapt(prior),
+        "no_viewer": True,
+    }, [])
+
+
+def _user_pinned_scale_fields(args: argparse.Namespace) -> tuple:
+    """Scale-derived cfg fields the user pinned via CLI (derivation must not clobber).
+
+    Only the scale-derived fields with a direct CLI flag are checkable here; the
+    rest have no flag so can never be user-pinned. Recorded on
+    ``cfg.explicit_fields`` and consumed by both ``_apply_auto_scale`` and the
+    resume fingerprint.
+    """
+    pinned: list[str] = []
+    for arg_name, cfg_key in (
+        ("diameter", "diameter"),
+        ("min_area", "min_area"),
+        ("max_area", "max_area"),
+        ("tile_norm_blocksize", "tile_norm_blocksize"),
+    ):
+        if getattr(args, arg_name, None) is not None:
+            pinned.append(cfg_key)
+    return tuple(pinned)
+
+
+def _seed_auto_adapt(prior: "OpticsPrior | None") -> dict:
+    """Provenance seed for cfg.auto_adapt from the pre-foundation prior (or {})."""
+    if prior is None:
+        return {}
+    return {"prior": {
+        "profile": prior.profile_name,
+        "confidence": prior.confidence,
+        "reasons": list(prior.reasons),
+        "max_dim": prior.max_dim,
+        "pixel_size_um": prior.pixel_size_um,
+    }}
+
+
+def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
+    """Post-foundation: measure the FOV's soma scale and derive its numeric gates.
+
+    Mutates *cfg* in place when the measurement is trustworthy, honoring
+    ``cfg.explicit_fields`` so a user-pinned flag is never overwritten, and
+    records provenance in ``cfg.auto_adapt``. Total — a failed or implausible
+    measurement leaves the profile fallback untouched and records low confidence
+    (Phase 3 turns that into pause-to-confirm).
+    """
+    from roigbiv.pipeline.optics import (
+        derive_scale_params,
+        measure_soma_scale,
+        scale_plausible,
+    )
+
+    scale = measure_soma_scale(fov.mean_M, getattr(fov, "dog_map", None))
+    pinned = set(cfg.explicit_fields or ())
+
+    if scale.ok and scale_plausible(scale, cfg.profile):
+        applied: dict = {}
+        for k, v in derive_scale_params(scale).items():
+            if k in pinned:
+                continue
+            setattr(cfg, k, v)
+            applied[k] = v
+        # The derived diameter is authoritative and is what the Gate-1 area
+        # bounds were derived from. Disable per-image diameter_auto (the generic
+        # profile sets it) so Stage 1 doesn't re-estimate from a different image
+        # and desync the Cellpose diameter from the area gates.
+        if "diameter" in applied:
+            cfg.diameter_auto = False
+        cfg.auto_adapt = {
+            **cfg.auto_adapt,
+            "scale_ok": True,
+            "soma_diameter_med": round(scale.diameter_med, 1),
+            "n_somata": scale.n_somata,
+            "applied": applied,
+            "pinned": sorted(pinned),
+        }
+        print(fmt.sub_phase(
+            f"Auto-scale: soma d≈{scale.diameter_med:.0f}px (n={scale.n_somata}) "
+            f"→ diameter={cfg.diameter}, area=[{cfg.min_area},{cfg.max_area}]"
+            + (f"  (pinned: {sorted(pinned)})" if pinned else "")
+        ), flush=True)
+    else:
+        cfg.auto_adapt = {
+            **cfg.auto_adapt,
+            "scale_ok": False,
+            "n_somata": scale.n_somata,
+            "reason": "too few/implausible somata to size reliably; kept profile fallback",
+        }
+        print(fmt.sub_phase(
+            f"Auto-scale: measurement not trustworthy (n={scale.n_somata}); "
+            f"keeping '{cfg.profile}' defaults "
+            f"[diameter={cfg.diameter}, area={cfg.min_area}..{cfg.max_area}]"
+        ), flush=True)
+
+
+def _optics_confirmation_decision(cfg: PipelineConfig) -> "dict | None":
+    """Decide whether the run should pause for the user to confirm the optics.
+
+    Pauses only in AUTO mode (a pre-foundation prior was recorded) when either
+    the prior is low-confidence (ambiguous frame size / mixed workspace) or the
+    post-foundation scale measurement was untrustworthy. Explicit ``--profile``
+    runs (no prior) never pause — the user already asserted the optics. Returns
+    the confirmation payload, or ``None`` to proceed.
+    """
+    aa = cfg.auto_adapt or {}
+    prior = aa.get("prior")
+    if prior is None:
+        return None                                  # explicit profile → never pause
+    low_conf = prior.get("confidence") == "low"
+    scale_failed = auto_scale_active(cfg) and not aa.get("scale_ok", False)
+    if not (low_conf or scale_failed):
+        return None
+    reasons = list(prior.get("reasons", []))
+    if scale_failed:
+        reasons.append(
+            f"post-foundation soma scale unreliable (n={aa.get('n_somata', 0)})"
+        )
+    return {
+        "candidate_profile": cfg.profile,
+        "confidence": prior.get("confidence"),
+        "scale_ok": bool(aa.get("scale_ok", False)),
+        "soma_diameter_med": aa.get("soma_diameter_med"),
+        "n_somata": aa.get("n_somata", 0),
+        "reasons": reasons,
+        "choices": list(list_profiles()),
+    }
+
+
+def _write_optics_confirmation_sentinel(
+    output_dir: Path, cfg: PipelineConfig, decision: dict,
+) -> Path:
+    """Write needs_optics_confirmation.json (mirrors the foundation_only sentinel)."""
+    path = output_dir / "needs_optics_confirmation.json"
+    path.write_text(json.dumps({
+        "mode": "needs_optics_confirmation",
+        "candidate_profile": decision["candidate_profile"],
+        "confidence": decision.get("confidence"),
+        "soma_diameter_med": decision.get("soma_diameter_med"),
+        "n_somata": decision.get("n_somata"),
+        "reasons": decision.get("reasons", []),
+        "choices": decision.get("choices", []),
+        "note": ("Auto-adaptation was uncertain. Foundation is complete on "
+                 "disk; confirm the optics and re-run with --resume (and "
+                 "--profile <choice> to override) to continue from Stage 1, "
+                 "or re-run with --assume-optics to proceed on the best guess."),
+    }, indent=2))
+    return path
 
 
 def _build_explicit_stage1(args: argparse.Namespace, profile_bundle: dict) -> dict:
@@ -1398,6 +1674,23 @@ def main(argv: "list[str] | None" = None) -> int:
                               "registry). A later --resume run (without this flag) "
                               "continues from Stage 1. Incompatible with --scout, "
                               "--resume, and --no-stage-N toggles."))
+    parser.add_argument("--auto-scale", dest="auto_scale",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help=("Optics auto-scale: after foundation, measure the "
+                              "FOV's soma scale and DERIVE the numeric gates "
+                              "(areas/diameter/separations/pool radii) from it, "
+                              "overriding the profile's hardcoded numbers but "
+                              "never an explicit flag. Active on the prism/"
+                              "generic profiles only (GRIN stays byte-identical). "
+                              "Pass --no-auto-scale to keep the profile's fixed "
+                              "gates."))
+    parser.add_argument("--assume-optics", dest="assume_optics",
+                        action="store_true", default=False,
+                        help=("Suppress the optics pause-to-confirm: when "
+                              "auto-adaptation is uncertain (ambiguous frame "
+                              "size / unreliable soma scale), proceed on the "
+                              "best guess instead of stopping for confirmation. "
+                              "Use for headless/batch runs that cannot prompt."))
     # Per-stage flags. BooleanOptionalAction gives us --stage-N / --no-stage-N.
     parser.add_argument("--stage-2", dest="enable_stage_2",
                         action=argparse.BooleanOptionalAction, default=None,
@@ -1698,7 +1991,14 @@ def _run_single(
     # _build_explicit_stage1 owns the channels/diameter/cellprob/flow/model
     # backfill; stage1_overrides (min/max/tile) and the other *_overrides are
     # already None-filtered explicit dicts and likewise win over the profile.
-    profile_name = _resolve_profile_name(args.profile, tif_path)
+    _opt_shape, _opt_md = _peek_optics(tif_path)
+    profile_name, optics_prior = _resolve_profile_name(
+        args.profile, tif_path, shape=_opt_shape, metadata=_opt_md)
+    if optics_prior is not None:
+        print(fmt.sub_phase(
+            f"Optics auto-profile → {profile_name} ({optics_prior.confidence}): "
+            f"{'; '.join(optics_prior.reasons)}"
+        ), flush=True)
     explicit_stage1 = _build_explicit_stage1(args, get_profile(profile_name))
     base = {
         "fs": args.fs,
@@ -1713,6 +2013,13 @@ def _run_single(
         "scout_vcorr_stride": args.scout_vcorr_stride,
         "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
         "foundation_only": args.foundation_only,
+        # Scale derivation pairs with auto-resolution: an explicit --profile keeps
+        # its tuned gates unless the user opted in. optics_prior is non-None only
+        # when the profile was auto-resolved. --no-auto-scale disables it.
+        "auto_scale": bool(args.auto_scale) and optics_prior is not None,
+        "assume_optics": args.assume_optics,
+        "explicit_fields": _user_pinned_scale_fields(args),
+        "auto_adapt": _seed_auto_adapt(optics_prior),
     }
     cfg = PipelineConfig(**merged_overrides(
         profile_name, base,
@@ -1725,6 +2032,24 @@ def _run_single(
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif_path, cfg)
+    except OpticsConfirmationRequired as need:
+        p = need.payload
+        print(
+            "\n".join([
+                "",
+                "⏸  Optics confirmation needed — pipeline paused after foundation.",
+                f"   Candidate profile: {p['candidate_profile']} "
+                f"({p.get('confidence')})",
+                *(f"   • {r}" for r in p.get("reasons", [])),
+                f"   Sentinel: {need.output_dir / 'needs_optics_confirmation.json'}",
+                "   Continue with:",
+                f"     roigbiv-pipeline --input {tif_path} --fs {cfg.fs} "
+                f"--resume --profile <{'/'.join(p.get('choices', []))}>",
+                "   …or proceed on the best guess: add --assume-optics.",
+            ]),
+            file=sys.stderr, flush=True,
+        )
+        return 5
     except BaseException as exc:  # noqa: BLE001
         import traceback as _tb
         _tb.print_exc()
@@ -1757,7 +2082,9 @@ def _run_single(
 
     report = None
     if args.registry:
-        report = _register_fov_after_pipeline(tif_path, fov)
+        from roigbiv.pipeline.optics import resolved_config_payload
+        report = _register_fov_after_pipeline(
+            tif_path, fov, resolved_config=resolved_config_payload(cfg))
     _write_traces_bundle(fov, cfg, registry_report=report)
 
     png_path = None
@@ -1908,7 +2235,17 @@ def _run_workspace(
     # Resolve the lens profile and merge (defaults < profile < explicit flags).
     # The merged dict (incl. the resolved "profile" label + backfilled Stage-1
     # fields) becomes the per-FOV cfg overrides consumed by run_with_workspace.
-    profile_name = _resolve_profile_name(args.profile, input_path)
+    if args.profile == AUTO:
+        optics_prior = _classify_workspace_optics(list(workspace.tifs))
+        profile_name = optics_prior.profile_name if optics_prior is not None else "grin"
+    else:
+        profile_name, optics_prior = _resolve_profile_name(args.profile, input_path)
+    if optics_prior is not None:
+        print(
+            f"Optics auto-profile → {profile_name} ({optics_prior.confidence}): "
+            f"{'; '.join(optics_prior.reasons)}",
+            flush=True,
+        )
     explicit_stage1 = _build_explicit_stage1(args, get_profile(profile_name))
     base = {
         "fs": args.fs,
@@ -1919,6 +2256,13 @@ def _run_workspace(
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         "foundation_only": args.foundation_only,
+        # Scale derivation pairs with auto-resolution: an explicit --profile keeps
+        # its tuned gates unless the user opted in. optics_prior is non-None only
+        # when the profile was auto-resolved. --no-auto-scale disables it.
+        "auto_scale": bool(args.auto_scale) and optics_prior is not None,
+        "assume_optics": args.assume_optics,
+        "explicit_fields": _user_pinned_scale_fields(args),
+        "auto_adapt": _seed_auto_adapt(optics_prior),
     }
     overrides = merged_overrides(
         profile_name, base,
@@ -2016,7 +2360,9 @@ def _run_workspace(
     return 3 if email_failed else (4 if slack_failed else 0)
 
 
-def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":
+def _register_fov_after_pipeline(
+    tif_path: Path, fov: FOVData, *, resolved_config: "dict | None" = None,
+) -> "dict | None":
     """Call the registry with the live FOVData after `run_pipeline` returns.
 
     Returns the registry report dict, or ``None`` if the registry call was
@@ -2064,6 +2410,7 @@ def _register_fov_after_pipeline(tif_path: Path, fov: FOVData) -> "dict | None":
         calibration=calibration,
         accept_threshold=cfg.fov_accept_threshold,
         review_threshold=cfg.fov_review_threshold,
+        resolved_config=resolved_config,
     )
     decision = report.get("decision")
     posterior = report.get("fov_posterior") or report.get("fov_sim") or 1.0

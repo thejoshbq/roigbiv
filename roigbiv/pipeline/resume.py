@@ -132,7 +132,44 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # the "foundation" manifest entry, then a later --resume run (with the flag
     # off) must continue from Stage 1 without a fingerprint mismatch.
     "foundation_only",
+    # Optics auto-adaptation provenance: recorded for the manifest, not a
+    # correctness knob, and mutated post-foundation. Hashing it would make every
+    # auto-scaled run un-resumable (resume recomputes the pre-derivation cfg).
+    "auto_adapt", "explicit_fields",
+    # assume_optics is a pause-suppression knob (like foundation_only): a paused
+    # run resumed with --assume-optics / a confirmed profile must not mismatch.
+    "assume_optics",
 })
+
+
+# Fields an optics-confirmation resume is allowed to change without forcing a
+# foundation re-run: the resolved profile + every categorical/scale knob it
+# implies. Anything outside this set (fs, tau, backend, k_background…) must still
+# trip the fingerprint guard. Built from the scale-derived set plus the Stage-1
+# categoricals + optics provenance/control fields.
+def _confirm_resume_fields() -> frozenset:
+    from roigbiv.pipeline.optics import SCALE_DERIVED_FIELDS
+    return SCALE_DERIVED_FIELDS | {
+        "profile", "channels", "cellpose_model", "use_denoise",
+        "flow_threshold", "cellprob_threshold", "min_solidity",
+        "max_eccentricity", "mc_strip_height", "diameter_auto",
+        "auto_scale", "assume_optics", "auto_adapt", "explicit_fields",
+    }
+
+
+_CONFIRM_RESUME_FIELDS: frozenset = _confirm_resume_fields()
+
+
+def _changed_cfg_fields(snapshot: dict, cfg: PipelineConfig) -> set:
+    """Field names whose value differs between a manifest cfg_snapshot and *cfg*.
+
+    Both sides are normalized through ``summary_for_log`` form (tuples → lists)
+    so the comparison is apples-to-apples. Keys present on only one side count
+    as changed.
+    """
+    current = cfg.summary_for_log()
+    keys = set(snapshot) | set(current)
+    return {k for k in keys if snapshot.get(k) != current.get(k)}
 
 
 def compute_cfg_fingerprint(cfg: PipelineConfig, tif_path: Path) -> str:
@@ -144,8 +181,16 @@ def compute_cfg_fingerprint(cfg: PipelineConfig, tif_path: Path) -> str:
     listed in ``_FINGERPRINT_EXCLUDE`` are intentionally dropped before
     hashing so users can flip a stage on with ``--resume``.
     """
+    from roigbiv.pipeline.optics import SCALE_DERIVED_FIELDS, auto_scale_active
+    exclude = set(_FINGERPRINT_EXCLUDE)
+    # When auto-scale is active, the gate numerics are re-derived identically on
+    # resume from the on-disk mean_M, so exclude them — EXCEPT any the user
+    # pinned explicitly (those stay in the fingerprint so a changed flag is
+    # still detected). User-pinned fields are recorded in cfg.explicit_fields.
+    if auto_scale_active(cfg):
+        exclude |= (SCALE_DERIVED_FIELDS - set(getattr(cfg, "explicit_fields", ()) or ()))
     summary = {k: v for k, v in cfg.summary_for_log().items()
-               if k not in _FINGERPRINT_EXCLUDE}
+               if k not in exclude}
     cfg_json = json.dumps(summary, sort_keys=True, default=_json_default)
     stat = _stat_tif(Path(tif_path))
     payload = f"{cfg_json}|{stat['size']}|{stat['mtime_ns']}"
@@ -512,13 +557,35 @@ def plan_resume(
                           cfg_fingerprint=fingerprint,
                           enabled=True)
 
+    # Optics-confirmation resume: a prior run paused after foundation for the
+    # user to confirm the optics, leaving needs_optics_confirmation.json. The
+    # confirmed profile legitimately changes Stage-1 config (and thus the
+    # fingerprint), but foundation is profile-independent for the default
+    # backend — so resume from Stage 1 on the existing foundation rather than
+    # refusing. One-shot: consume the sentinel so later plain resumes still
+    # enforce the (now-updated) fingerprint.
+    confirm_sentinel = output_dir / "needs_optics_confirmation.json"
+    is_confirm_resume = False
+    if confirm_sentinel.exists() and _foundation_complete(output_dir):
+        # Only bypass the fingerprint if the *only* changed fields are optics /
+        # Stage-1 (the confirmed profile + its derived gates). An unrelated edit
+        # (fs, tau, backend, k_background…) must still be caught — never absorbed
+        # silently by the confirmation path.
+        changed = _changed_cfg_fields(manifest.get("cfg_snapshot", {}) or {}, cfg)
+        is_confirm_resume = bool(changed) and changed <= _CONFIRM_RESUME_FIELDS
+
     prior_fp = manifest.get("cfg_fingerprint", "")
-    if prior_fp and prior_fp != fingerprint:
+    if prior_fp and prior_fp != fingerprint and not is_confirm_resume:
         diff = _describe_config_diff(manifest, cfg, Path(tif_path))
         raise ResumeError(
             f"resume: config or input changed since last run "
             f"({diff}); re-run without --resume to discard prior outputs."
         )
+    if is_confirm_resume:
+        try:
+            confirm_sentinel.unlink()
+        except OSError:
+            pass
 
     manifest_stages = manifest.get("stages", {}) or {}
 
