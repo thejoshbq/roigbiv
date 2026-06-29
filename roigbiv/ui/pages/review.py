@@ -116,22 +116,13 @@ def layout() -> html.Div:
                 _canvas_toolbar(),
                 html.Div(id="roigbiv-review-canvas"),
                 html.Hr(),
-                html.H5("FOV signal — per-session mean",
+                html.H5("FOV signal — mean trace (accepted highlighted)",
                         className="mb-2 text-muted"),
                 dcc.Graph(
                     id="roigbiv-review-fov-trace",
                     figure=_placeholder_fig("Select a FOV to load traces."),
                     config=_TRACE_CONFIG,
                     style={"height": "420px"},
-                ),
-                html.Hr(className="my-2"),
-                html.H5("Accepted ROI mean activity",
-                        className="mb-2 text-muted"),
-                dcc.Graph(
-                    id="roigbiv-review-roi-mean-trace",
-                    figure=_placeholder_fig("Select a FOV to load traces."),
-                    config=_TRACE_CONFIG,
-                    style={"height": "280px"},
                 ),
             ], id=MAIN_COL_ID, md=6),
             dbc.Col([
@@ -589,45 +580,12 @@ def register_callbacks(app: dash.Dash) -> None:
             chosen = all_sessions[:1]
         try:
             if len(chosen) == 1:
-                return build_mean_single(fov_meta, chosen[0], theme=theme)
-            return build_mean_multi(fov_meta, chosen, theme=theme)
+                return build_mean_single(fov_meta, chosen[0],
+                                         accepted_overlay=True, theme=theme)
+            return build_mean_multi(fov_meta, chosen,
+                                    accepted_overlay=True, theme=theme)
         except Exception as exc:  # noqa: BLE001
             return user_error_figure(exc, "Building FOV-level trace figure",
-                                     theme=theme)
-
-    @app.callback(
-        Output("roigbiv-review-roi-mean-trace", "figure"),
-        Input("roigbiv-review-state", "data"),
-        Input("roigbiv-review-session-check", "value"),
-        Input("roigbiv-review-kind", "value"),
-        Input("roigbiv-theme", "data"),
-    )
-    def _render_roi_mean_trace(viewer_state, selected_ids, kind, theme):
-        if not (viewer_state and viewer_state.get("fov_id")):
-            return _placeholder_fig("Select a FOV to load traces.", theme)
-        kind = kind or "f"
-        fov_id = viewer_state["fov_id"]
-        cfg = get_app_state().registry_config
-        fov_meta = _lookup_fov_meta(fov_id, cfg=cfg)
-        sel_set = set(selected_ids or [])
-        try:
-            all_sessions = collect_sessions_for_fov(fov_id, kind=kind, cfg=cfg)
-        except Exception as exc:  # noqa: BLE001
-            return user_error_figure(exc, "Loading accepted ROI traces",
-                                     theme=theme)
-        if not all_sessions:
-            return _placeholder_fig("No sessions on this FOV yet.", theme)
-        chosen = [s for s in all_sessions if s.session_id in sel_set]
-        if not chosen:
-            chosen = all_sessions[:1]
-        try:
-            if len(chosen) == 1:
-                return build_mean_single(fov_meta, chosen[0],
-                                         gate_filter={"accept"}, theme=theme)
-            return build_mean_multi(fov_meta, chosen,
-                                    gate_filter={"accept"}, theme=theme)
-        except Exception as exc:  # noqa: BLE001
-            return user_error_figure(exc, "Building accepted ROI mean figure",
                                      theme=theme)
 
     @app.callback(

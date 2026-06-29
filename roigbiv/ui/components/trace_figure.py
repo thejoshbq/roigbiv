@@ -159,6 +159,7 @@ def build_mean_single(
     sess: SessionTraces,
     *,
     gate_filter: Optional[set[str]] = None,
+    accepted_overlay: bool = False,
     theme: Optional[str] = None,
 ) -> go.Figure:
     title = _fov_title(
@@ -167,6 +168,76 @@ def build_mean_single(
     )
     if sess.matrix is None or sess.matrix.size == 0:
         return _empty_fig(title, _note_for(sess), theme=theme)
+
+    if accepted_overlay:
+        all_matrix = sess.matrix
+        t = _time_axis(sess)
+        all_mean = np.nanmean(all_matrix, axis=0)
+        n_all = int(all_matrix.shape[0])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=t, y=all_mean,
+            mode="lines",
+            line={"color": _dim(MEAN_COLOR, alpha=0.20), "width": 0.9},
+            name=f"all ROIs (n={n_all})",
+            showlegend=False,
+            hovertemplate=(
+                f"session {sess.session_id or '—'}<br>"
+                f"all ROIs (n={n_all})<br>"
+                f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
+                "<extra></extra>"
+            ),
+        ))
+        if not sess.rows:
+            fig.add_annotation(
+                text="No ROI metadata — accepted filter unavailable.",
+                xref="paper", yref="paper", x=0.5, y=0.5,
+                showarrow=False,
+                font={"size": 12, "color": axis_muted_color(theme)},
+            )
+        else:
+            idx = [r["row_index"] for r in sess.rows
+                   if r.get("gate_outcome") == "accept"]
+            if idx:
+                acc_mean = np.nanmean(all_matrix[idx], axis=0)
+                n_acc = len(idx)
+                fig.add_trace(go.Scatter(
+                    x=t, y=acc_mean,
+                    mode="lines",
+                    line={"color": MEAN_COLOR, "width": 2.0},
+                    name=f"accepted (n={n_acc})",
+                    hovertemplate=(
+                        f"session {sess.session_id or '—'}<br>"
+                        f"accepted (n={n_acc})<br>"
+                        f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
+                        "<extra></extra>"
+                    ),
+                ))
+            else:
+                fig.add_annotation(
+                    text="No accepted ROIs in this session.",
+                    xref="paper", yref="paper", x=0.5, y=0.5,
+                    showarrow=False,
+                    font={"size": 12, "color": axis_muted_color(theme)},
+                )
+        fig.update_layout(
+            title=title,
+            template=plotly_template(theme),
+            autosize=True,
+            xaxis_title="time (s)" if sess.fs else "frame",
+            yaxis_title=Y_LABELS[sess.kind],
+            margin={"l": 60, "r": 20, "t": 60, "b": 50},
+            hovermode="x unified",
+        )
+        if sess.source_label and sess.source_label != "pipeline":
+            fig.add_annotation(
+                text=f"source: {sess.source_label}",
+                xref="paper", yref="paper",
+                x=1.0, y=1.02, xanchor="right", yanchor="bottom",
+                showarrow=False,
+                font={"size": 10, "color": axis_muted_color(theme)},
+            )
+        return fig
 
     matrix = sess.matrix
     if gate_filter is not None:
@@ -220,6 +291,7 @@ def build_mean_multi(
     sessions: list[SessionTraces],
     *,
     gate_filter: Optional[set[str]] = None,
+    accepted_overlay: bool = False,
     show_grand_average: bool = False,
     theme: Optional[str] = None,
 ) -> go.Figure:
@@ -249,33 +321,100 @@ def build_mean_multi(
     gate_skipped = 0
 
     for color, sess in zip(palette, usable):
-        matrix = sess.matrix
-        if gate_filter is not None:
+        if accepted_overlay:
+            matrix = sess.matrix
+            t = _time_axis(sess)
+            y_all = np.nanmean(matrix, axis=0).astype(np.float32)
+            n_all = int(matrix.shape[0])
+            fig.add_trace(go.Scatter(
+                x=t, y=y_all, mode="lines",
+                line={"color": _dim(color, alpha=0.15), "width": 0.8},
+                showlegend=False,
+                name=_session_label(sess),
+                hovertemplate=(
+                    f"session {sess.session_id or '—'}<br>"
+                    f"all ROIs (n={n_all})<br>"
+                    f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
+                    "<extra></extra>"
+                ),
+            ))
             if not sess.rows:
                 gate_skipped += 1
                 continue
             idx = [r["row_index"] for r in sess.rows
-                   if r.get("gate_outcome") in gate_filter]
-            matrix = matrix[idx] if idx else np.empty(
-                (0, sess.n_frames), dtype=np.float32)
-        if matrix.size == 0:
-            skipped += 1
-            continue
-        t = _time_axis(sess)
-        y = np.nanmean(matrix, axis=0).astype(np.float32)
-        fig.add_trace(go.Scatter(
-            x=t, y=y, mode="lines",
-            line={"color": color, "width": 1.3},
-            name=_session_label(sess),
-            hovertemplate=(
-                f"session {sess.session_id or '—'}<br>"
-                f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
-                "<extra></extra>"
-            ),
-        ))
-        lines_for_avg.append((t, y, sess.fs or None))
+                   if r.get("gate_outcome") == "accept"]
+            if not idx:
+                continue   # backdrop already shown; no foreground to add
+            y_acc = np.nanmean(matrix[idx], axis=0).astype(np.float32)
+            n_acc = len(idx)
+            fig.add_trace(go.Scatter(
+                x=t, y=y_acc, mode="lines",
+                line={"color": color, "width": 1.5},
+                name=f"{_session_label(sess)} · {n_acc} accepted",
+                hovertemplate=(
+                    f"session {sess.session_id or '—'}<br>"
+                    f"accepted (n={n_acc})<br>"
+                    f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
+                    "<extra></extra>"
+                ),
+            ))
+            lines_for_avg.append((t, y_acc, sess.fs or None))
+        else:
+            matrix = sess.matrix
+            if gate_filter is not None:
+                if not sess.rows:
+                    gate_skipped += 1
+                    continue
+                idx = [r["row_index"] for r in sess.rows
+                       if r.get("gate_outcome") in gate_filter]
+                matrix = matrix[idx] if idx else np.empty(
+                    (0, sess.n_frames), dtype=np.float32)
+            if matrix.size == 0:
+                skipped += 1
+                continue
+            t = _time_axis(sess)
+            y = np.nanmean(matrix, axis=0).astype(np.float32)
+            fig.add_trace(go.Scatter(
+                x=t, y=y, mode="lines",
+                line={"color": color, "width": 1.3},
+                name=_session_label(sess),
+                hovertemplate=(
+                    f"session {sess.session_id or '—'}<br>"
+                    f"t = %{{x:.2f}} s<br>{Y_LABELS[sess.kind]} = %{{y:.4f}}"
+                    "<extra></extra>"
+                ),
+            ))
+            lines_for_avg.append((t, y, sess.fs or None))
 
     if not lines_for_avg:
+        if accepted_overlay:
+            # Backdrop traces are already in fig; return fig with annotation so the
+            # all-ROI context is still visible even when no accepted ROIs exist.
+            fig.update_layout(
+                title=title,
+                template=plotly_template(theme),
+                autosize=True,
+                xaxis_title="time (s)" if any(s.fs for s in usable) else "frame",
+                yaxis_title=ylabel,
+                margin={"l": 60, "r": 20, "t": 70, "b": 50},
+                hovermode="x unified",
+                legend={"orientation": "v", "x": 1.02, "y": 1.0, "xanchor": "left"},
+            )
+            fig.add_annotation(
+                text="No accepted ROIs in any selected session.",
+                xref="paper", yref="paper", x=0.5, y=0.5,
+                showarrow=False,
+                font={"size": 14, "color": axis_muted_color(theme)},
+            )
+            if gate_skipped:
+                fig.add_annotation(
+                    text=f"skipped {gate_skipped} session(s) with no ROI metadata",
+                    xref="paper", yref="paper",
+                    x=1.0, y=1.06, xanchor="right", yanchor="bottom",
+                    showarrow=False,
+                    font={"size": 10, "color": axis_muted_color(theme)},
+                )
+            return fig
         return _empty_fig(title, "No accepted ROIs in any selected session.",
                           theme=theme)
 
