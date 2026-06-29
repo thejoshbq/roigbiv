@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-PROJECT = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+PROJECT = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
 sys.path.insert(0, str(PROJECT))
 
 from roigbiv.pipeline.gate1 import evaluate_gate1  # noqa: E402

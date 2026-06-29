@@ -21,7 +21,7 @@ import numpy as np
 import tifffile
 
 # Add project root to path so local imports resolve
-PROJECT = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+PROJECT = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
 sys.path.insert(0, str(PROJECT))
 sys.path.insert(0, str(PROJECT / "scripts"))
 
