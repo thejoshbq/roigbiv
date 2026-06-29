@@ -26,7 +26,7 @@ os.environ.setdefault("OLLAMA_KEEP_ALIVE", "0")   # avoid ollama VRAM contention
 import numpy as np
 import tifffile
 
-ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
 sys.path.insert(0, str(ROOT))
 
 from roigbiv.pipeline.types import PipelineConfig

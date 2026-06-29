@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
 ON = ROOT / "experiments/runs/phase4_channel/ab_results.json"
 OFF = ROOT / "experiments/runs/phase_denoise_ab/off_results.json"
 

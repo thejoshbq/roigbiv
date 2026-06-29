@@ -8,7 +8,7 @@ import json, os, sys
 from pathlib import Path
 
 os.environ.setdefault("OLLAMA_KEEP_ALIVE", "0")
-ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+ROOT = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
 sys.path.insert(0, str(ROOT))
 
 from roigbiv.pipeline.types import PipelineConfig
