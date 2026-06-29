@@ -156,14 +156,14 @@ Use the Cellpose GUI to visually inspect model output, correct masks, and feed c
 ```bash
 conda activate roigbiv
 cellpose \
-  --pretrained_model ~/Otis-Lab/Projects/roigbiv/models/deployed/current_model \
-  --image_path ~/Otis-Lab/Projects/roigbiv/data/annotated/T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH_PT2-002_mc_mean.tif
+  --pretrained_model ~/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/models/deployed/current_model \
+  --image_path ~/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/data/annotated/T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH_PT2-002_mc_mean.tif
 ```
 
 **Option B — Launch GUI and open image manually (recommended for exploration)**
 ```bash
 conda activate roigbiv
-cellpose --pretrained_model ~/Otis-Lab/Projects/roigbiv/models/deployed/current_model
+cellpose --pretrained_model ~/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/models/deployed/current_model
 ```
 Then: File → Open image → navigate to `data/annotated/` and pick any `*_mean.tif`.
 

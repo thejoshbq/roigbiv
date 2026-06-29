@@ -255,7 +255,7 @@ classify:
   min_transients_sparse: 5
 
 paths:
-  # All paths relative to project root (~/Otis-Lab/Projects/roigbiv)
+  # All paths relative to project root (~/Otis-Lab/Projects/Phoxel-Workbench/roigbiv)
   raw_dir: data/raw
   annotated_dir: data/annotated
   masks_dir: data/masks
