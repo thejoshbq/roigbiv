@@ -158,6 +158,7 @@ def build_mean_single(
     fov_meta: dict,
     sess: SessionTraces,
     *,
+    gate_filter: Optional[set[str]] = None,
     theme: Optional[str] = None,
 ) -> go.Figure:
     title = _fov_title(
@@ -167,9 +168,21 @@ def build_mean_single(
     if sess.matrix is None or sess.matrix.size == 0:
         return _empty_fig(title, _note_for(sess), theme=theme)
 
+    matrix = sess.matrix
+    if gate_filter is not None:
+        if not sess.rows:
+            return _empty_fig(
+                title, "No ROI metadata — cannot apply gate filter.", theme=theme)
+        idx = [r["row_index"] for r in sess.rows
+               if r.get("gate_outcome") in gate_filter]
+        matrix = matrix[idx] if idx else np.empty(
+            (0, sess.n_frames), dtype=np.float32)
+    if matrix.size == 0:
+        return _empty_fig(title, "No accepted ROIs in this session.", theme=theme)
+
     t = _time_axis(sess)
-    mean = np.nanmean(sess.matrix, axis=0)
-    n_rois = int(sess.matrix.shape[0])
+    mean = np.nanmean(matrix, axis=0)
+    n_rois = int(matrix.shape[0])
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -206,6 +219,7 @@ def build_mean_multi(
     fov_meta: dict,
     sessions: list[SessionTraces],
     *,
+    gate_filter: Optional[set[str]] = None,
     show_grand_average: bool = False,
     theme: Optional[str] = None,
 ) -> go.Figure:
@@ -229,14 +243,26 @@ def build_mean_multi(
                           theme=theme)
 
     palette = session_colors(len(usable))
-    mixed_fs = _multi_fs_mismatch(usable)
 
     fig = go.Figure()
     lines_for_avg: list[tuple[np.ndarray, np.ndarray, Optional[float]]] = []
+    gate_skipped = 0
 
     for color, sess in zip(palette, usable):
+        matrix = sess.matrix
+        if gate_filter is not None:
+            if not sess.rows:
+                gate_skipped += 1
+                continue
+            idx = [r["row_index"] for r in sess.rows
+                   if r.get("gate_outcome") in gate_filter]
+            matrix = matrix[idx] if idx else np.empty(
+                (0, sess.n_frames), dtype=np.float32)
+        if matrix.size == 0:
+            skipped += 1
+            continue
         t = _time_axis(sess)
-        y = np.nanmean(sess.matrix, axis=0).astype(np.float32)
+        y = np.nanmean(matrix, axis=0).astype(np.float32)
         fig.add_trace(go.Scatter(
             x=t, y=y, mode="lines",
             line={"color": color, "width": 1.3},
@@ -249,6 +275,16 @@ def build_mean_multi(
         ))
         lines_for_avg.append((t, y, sess.fs or None))
 
+    if not lines_for_avg:
+        return _empty_fig(title, "No accepted ROIs in any selected session.",
+                          theme=theme)
+
+    # Recompute mixed_fs from contributing sessions only; gate_filter may have
+    # pruned sessions that would have caused a false mismatch warning.
+    plotted_fs = [fs for (_, _, fs) in lines_for_avg]
+    mixed_fs = (any(f in (None, 0) for f in plotted_fs) or
+                len({round(float(f), 3) for f in plotted_fs if f}) > 1)
+
     if show_grand_average:
         avg = _grand_average(lines_for_avg)
         if avg is not None:
@@ -256,14 +292,14 @@ def build_mean_multi(
             fig.add_trace(go.Scatter(
                 x=t_avg, y=y_avg, mode="lines",
                 line={"color": GRAND_AVERAGE_COLOR, "width": 2.5},
-                name=f"grand average (n={len(usable)})",
+                name=f"grand average (n={len(lines_for_avg)})",
                 hovertemplate=(
                     "grand average<br>"
                     f"t = %{{x:.2f}} s<br>{ylabel} = %{{y:.4f}}<extra></extra>"
                 ),
             ))
 
-    any_fs = any(s.fs for s in usable)
+    any_fs = any(fs for (_, _, fs) in lines_for_avg)
     fig.update_layout(
         title=title,
         template=plotly_template(theme),
@@ -282,6 +318,14 @@ def build_mean_multi(
             text=f"skipped {skipped} session(s) with no trace data",
             xref="paper", yref="paper",
             x=1.0, y=1.02, xanchor="right", yanchor="bottom",
+            showarrow=False,
+            font={"size": 10, "color": axis_muted_color(theme)},
+        )
+    if gate_skipped:
+        fig.add_annotation(
+            text=f"skipped {gate_skipped} session(s) with no ROI metadata",
+            xref="paper", yref="paper",
+            x=1.0, y=1.06, xanchor="right", yanchor="bottom",
             showarrow=False,
             font={"size": 10, "color": axis_muted_color(theme)},
         )
