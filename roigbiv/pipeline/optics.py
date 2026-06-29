@@ -48,18 +48,27 @@ __all__ = [
     "PRISM_MIN_DIM",
 ]
 
-# Profiles for which post-foundation scale derivation runs. GRIN (512²) is the
-# validated baseline and is left byte-identical: a user on the GRIN profile has
-# asserted the optics, so we don't second-guess its tuned gates.
-_AUTO_SCALE_PROFILES = ("prism", "generic")
+# Profiles for which post-foundation scale derivation runs when auto_scale=True.
+# GRIN (512²) is the validated baseline and byte-identical BY DEFAULT (auto_scale
+# is False unless the user opts in via --auto-scale). Including "grin" here allows
+# non-standard GRIN-class FOVs to use scale derivation when the user opts in.
+_AUTO_SCALE_PROFILES = ("grin", "prism", "generic")
 
 # The numeric gate fields ``derive_scale_params`` writes. Kept here so resume's
 # fingerprint can exclude the auto-derived ones (a deterministic function of the
 # on-disk mean_M + profile) without re-listing them.
 SCALE_DERIVED_FIELDS = frozenset({
+    # Core 9 — existing
     "diameter", "min_area", "max_area", "gate1_merge_peak_min_separation",
     "spatial_pool_radius", "cluster_distance", "stage4_min_area",
     "stage4_max_area", "tile_norm_blocksize",
+    # 13 spatial-radius / area parameters added for full FOV-scale coverage
+    "corr_neighbor_radius_inner", "corr_neighbor_radius_outer",
+    "gate2_spatial_radius", "gate4_spatial_radius",
+    "gate2_near_distance", "gate2_min_area", "gate2_max_area",
+    "gate1_merge_peak_min_area", "flag_area_margin",
+    "annulus_inner_buffer", "annulus_outer_radius",
+    "neuropil_inner_buffer", "neuropil_outer_radius",
 })
 
 
@@ -294,36 +303,67 @@ def derive_scale_params(scale: SomaScale) -> dict:
     """Derive the *continuous* numeric gate params from a measured soma scale.
 
     Returns a flat dict keyed by ``PipelineConfig`` field names (overlays the
-    profile's hardcoded numerics). Grounded so GRIN (d≈12) and PRISM (d≈56) both
-    fall out of one formula:
+    profile's hardcoded numerics). All formulas are grounded so that GRIN (d≈12)
+    recovers the exact ``types.py`` defaults and PRISM (d≈56) produces geometrically
+    sensible values:
 
-    - ``d=12``  → min_area≈45,  max_area≈340   (near the tuned 80/600, conservative)
-    - ``d=56``  → min_area≈985, max_area≈7389  (inside the validated 900..9000 band)
-
-    The ``0.40``/``1.5`` multipliers are provisional — tune against PRISM ground
-    truth before treating as load-bearing (see ``profiles.py`` provenance note).
+    - ``d=12``  → all new params == types.py default (zero drift from current behavior)
+    - ``d=56``  → corr_inner=28, corr_outer=70, spatial_radius=93, gate2_max=8621, …
     """
     d = max(1.0, float(scale.diameter_med))
-    a_circ = math.pi * (d / 2.0) ** 2
+    r = d / 2.0
+    a_circ = math.pi * r ** 2
 
-    # Percentile-anchored bounds (matches measure_prism_scale.py's own suggestion)
-    # with a circular-area floor/ceiling so a thin measurement cannot collapse
-    # or explode the gate. The hard floor of 30 px² matches measure_soma_scale's
-    # own minimum sized-component area — below that a "soma" is noise, so the gate
-    # must not open wider than that even on a sparse small-soma FOV.
+    # Stage 1 / Gate 1 area bounds — percentile-anchored, circular-area floored.
+    # The hard floor of 30 px² matches measure_soma_scale's minimum component area.
     min_area = max(30, int(round(min(0.40 * a_circ, 0.6 * scale.area_p5))))
     max_area = int(round(max(1.5 * scale.area_p95, 3.0 * a_circ)))
 
+    # Stage 4 correlation contrast: inner disk = soma radius, outer = 2.5× inner.
+    # At d=12: inner=6, outer=15. At d=56: inner=28, outer=70.
+    corr_inner = max(4, int(round(r)))
+    corr_outer = max(15, int(round(2.5 * corr_inner)))
+
+    # Annulus ring geometry: inner buffer = d/6 from soma edge, outer = 1.25×d.
+    # Recovers annulus_inner_buffer=2, annulus_outer_radius=15 at d=12.
+    ann_inner = max(2, int(round(d / 6.0)))
+    ann_outer = max(15, int(round(d * 1.25)))
+
+    # Gate 2/3/4 spatial neighborhood = 5d/3 (≈1.67 soma diameters).
+    # Recovers gate2_spatial_radius=20 and gate4_spatial_radius=20 at d=12.
+    spatial_radius = max(20, int(round(5.0 * d / 3.0)))
+
+    # Gate 2 Suite2p area bounds — 0.53×a_circ and 3.5×a_circ recover 60/400 at d=12.
+    gate2_min = max(60, int(round(0.53 * a_circ)))
+    gate2_max = max(400, int(round(3.5 * a_circ)))
+
     return {
-        "diameter": int(round(d)),
-        "min_area": min_area,
-        "max_area": max_area,
-        "gate1_merge_peak_min_separation": int(round(d / 2.0)),
-        "spatial_pool_radius": max(4, int(round(d / 2.0))),
-        "cluster_distance": max(6, int(round(d * 0.6))),
-        "stage4_min_area": int(round(0.6 * min_area)),
-        "stage4_max_area": int(round(0.6 * max_area)),
-        "tile_norm_blocksize": 256 if d > 28 else 128,
+        # ── Existing 9 fields ───────────────────────────────────────────────────
+        "diameter":                        int(round(d)),
+        "min_area":                        min_area,
+        "max_area":                        max_area,
+        "gate1_merge_peak_min_separation": int(round(r)),
+        "spatial_pool_radius":             max(4, int(round(r))),
+        "cluster_distance":                max(6, int(round(d * 0.6))),
+        "stage4_min_area":                 int(round(0.6 * min_area)),
+        "stage4_max_area":                 int(round(0.6 * max_area)),
+        "tile_norm_blocksize":             256 if d > 28 else 128,
+        # ── 13 new spatial-radius / area fields ────────────────────────────────
+        "corr_neighbor_radius_inner":      corr_inner,
+        "corr_neighbor_radius_outer":      corr_outer,
+        "gate2_spatial_radius":            spatial_radius,
+        "gate4_spatial_radius":            spatial_radius,
+        "gate2_near_distance":             max(5, int(round(d * 0.4))),
+        "gate2_min_area":                  gate2_min,
+        "gate2_max_area":                  gate2_max,
+        # Merge-peak inert at GRIN (max_area < 4000); fires at 3×a_circ for PRISM.
+        "gate1_merge_peak_min_area":       max(4000, int(round(3.0 * a_circ))),
+        # Flag margin = 18% of circular area; recovers 20 at d=12.
+        "flag_area_margin":                max(20, int(round(0.18 * a_circ))),
+        "annulus_inner_buffer":            ann_inner,
+        "annulus_outer_radius":            ann_outer,
+        "neuropil_inner_buffer":           ann_inner,
+        "neuropil_outer_radius":           ann_outer,
     }
 
 

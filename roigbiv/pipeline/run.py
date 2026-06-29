@@ -94,6 +94,10 @@ def _build_gate2_overrides(args: "argparse.Namespace") -> dict:
 
     Suite2p footprints run ~0.75× the Cellpose footprint area at the same
     cell scale; the scale factors preserve that ratio from the GRIN defaults.
+
+    NOTE: When auto_scale is active, _apply_auto_scale() runs post-foundation and
+    overwrites gate2_min_area / gate2_max_area via derive_scale_params(). Intentional
+    — measured soma diameter is more authoritative than the proportional CLI hint.
     """
     out: dict = {}
     g2_min = getattr(args, "gate2_min_area", None)
