@@ -79,7 +79,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--base",
-        default="/home/thejoshbq/Otis-Lab/Projects/roigbiv/data/logan_cousa_trial/output",
+        default="/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/data/logan_cousa_trial/output",
     )
     parser.add_argument(
         "--fovs",

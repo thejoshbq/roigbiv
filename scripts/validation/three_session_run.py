@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 def main() -> int:
-    project_root = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv")
+    project_root = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv")
     fresh_db = project_root / "inference" / "registry_roicat.db"
     fresh_blob = project_root / "inference" / "fingerprints_v3"
 

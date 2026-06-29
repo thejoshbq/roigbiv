@@ -14,7 +14,7 @@ import numpy as np
 import tifffile
 
 
-PROJ_DIR = Path("/home/thejoshbq/Otis-Lab/Projects/roigbiv/data/annotated")
+PROJ_DIR = Path("/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/data/annotated")
 STEM = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_PRE-002"
 
 
@@ -38,7 +38,7 @@ def test_stage1_on_real_projections():
     print(f"  loaded {mean_S.shape} mean, {vcorr_S.shape} vcorr")
 
     # Use deployed fine-tuned model if it exists, else cyto3
-    model_path = "/home/thejoshbq/Otis-Lab/Projects/roigbiv/models/deployed/current_model"
+    model_path = "/home/thejoshbq/Otis-Lab/Projects/Phoxel-Workbench/roigbiv/models/deployed/current_model"
     if not Path(model_path).exists():
         model_path = "cyto3"
     cfg = PipelineConfig(
