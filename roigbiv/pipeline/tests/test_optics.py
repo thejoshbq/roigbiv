@@ -260,15 +260,21 @@ def test_changed_cfg_fields_and_confirm_resume_scope():
     assert not (changed2 <= _CONFIRM_RESUME_FIELDS)
 
 
-def test_fingerprint_grin_unaffected_by_autoscale_fields(tmp_path):
+def test_fingerprint_grin_autoscale_excludes_derived_fields(tmp_path):
     from roigbiv.pipeline.resume import compute_cfg_fingerprint
     from roigbiv.pipeline.types import PipelineConfig
 
     tif = _dummy_tif(tmp_path)
-    # GRIN: auto-scale inactive → derived fields stay in the fingerprint as usual.
-    a = PipelineConfig(profile="grin", min_area=80)
-    b = PipelineConfig(profile="grin", min_area=120)
-    assert compute_cfg_fingerprint(a, tif) != compute_cfg_fingerprint(b, tif)
+    # GRIN + auto_scale=True (the default): derived fields are excluded, so
+    # different min_area values produce identical fingerprints.
+    a = PipelineConfig(profile="grin", auto_scale=True, min_area=80)
+    b = PipelineConfig(profile="grin", auto_scale=True, min_area=120)
+    assert compute_cfg_fingerprint(a, tif) == compute_cfg_fingerprint(b, tif)
+
+    # GRIN + auto_scale=False: derived fields stay in the fingerprint.
+    c = PipelineConfig(profile="grin", auto_scale=False, min_area=80)
+    d = PipelineConfig(profile="grin", auto_scale=False, min_area=120)
+    assert compute_cfg_fingerprint(c, tif) != compute_cfg_fingerprint(d, tif)
 
 
 # ── _estimate_diameter_px regression (refactored onto measure_soma_scale) ────
@@ -325,11 +331,22 @@ def test_confirmation_pauses_on_scale_failure_even_if_confident():
     assert any("scale" in r for r in d["reasons"])
 
 
-def test_confirmation_grin_never_pauses_on_scale():
+def test_confirmation_grin_pauses_on_scale_failure():
     from roigbiv.pipeline.run import _optics_confirmation_decision
-    # grin: auto-scale inactive → scale failure can't trigger; prior is high.
+    # grin + auto_scale=True: scale failure now triggers a pause (GRIN is a full
+    # participant in auto_scale since _AUTO_SCALE_PROFILES includes it).
     cfg = _cfg_with_adapt(
         profile="grin", auto_scale=True,
+        auto_adapt={"prior": {"confidence": "high", "reasons": []}, "scale_ok": False})
+    d = _optics_confirmation_decision(cfg)
+    assert d is not None
+    assert any("scale" in r for r in d["reasons"])
+
+def test_confirmation_grin_no_pause_when_auto_scale_off():
+    from roigbiv.pipeline.run import _optics_confirmation_decision
+    # grin + auto_scale=False: scale_failed is False regardless → no pause.
+    cfg = _cfg_with_adapt(
+        profile="grin", auto_scale=False,
         auto_adapt={"prior": {"confidence": "high", "reasons": []}, "scale_ok": False})
     assert _optics_confirmation_decision(cfg) is None
 
