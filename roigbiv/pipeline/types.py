@@ -22,6 +22,9 @@ _DEFAULT_CELLPOSE_MODEL = str(
     Path(__file__).resolve().parents[2] / "models" / "deployed" / "current_model"
 )
 
+PIPELINE_MODES = ("cascade_legacy", "candidate_union", "candidate_union_with_residual_refinement", "benchmark_only")
+DEFAULT_PIPELINE_MODE = "cascade_legacy"
+
 
 @dataclass
 class ROI:
@@ -188,6 +191,21 @@ class PipelineConfig:
     # before committing to ROI detection. Writes a foundation_only.json sentinel.
     # Resumable: a later --resume run (without the flag) continues from Stage 1.
     foundation_only: bool = False
+
+    # ── Pipeline mode (top-level architecture switch) ──────────────────────
+    # "cascade_legacy":  sequential subtractive detection (default) — each
+    #                    stage detects on the residual after prior stages
+    #                    subtract their sources. The pipeline as currently run.
+    # "candidate_union": non-destructive candidate-union architecture (ADR-0001)
+    #                    — stages propose candidates against the undisturbed
+    #                    signal instead of a subtracted residual.
+    # "candidate_union_with_residual_refinement": candidate union with an
+    #                    additional residual-based refinement pass layered on top.
+    # "benchmark_only":  reserved for the benchmark harness (Milestone A) to
+    #                    run comparative passes without committing to a mode.
+    # Currently inert plumbing: no stage reads this field yet. Behavior lands
+    # in a later ADR-0001 implementation issue.
+    pipeline_mode: str = DEFAULT_PIPELINE_MODE
 
     # ── Motion correction backend ─────────────────────────────────────────
     # "phasecorr":   Suite2p rigid + non-rigid registration (default). Robust on

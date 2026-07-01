@@ -39,7 +39,12 @@ from roigbiv.pipeline.profiles import (
     list_profiles,
     merged_overrides,
 )
-from roigbiv.pipeline.types import FOVData, PipelineConfig
+from roigbiv.pipeline.types import (
+    DEFAULT_PIPELINE_MODE,
+    FOVData,
+    PIPELINE_MODES,
+    PipelineConfig,
+)
 
 
 class OpticsConfirmationRequired(Exception):
@@ -1782,6 +1787,17 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--mc-granularity", dest="mc_granularity", default=None,
                         help=("legacy: SIMA HMM2D granularity, 'row' (non-rigid, "
                               "default) or 'frame' (rigid)."))
+    parser.add_argument("--pipeline-mode", dest="pipeline_mode",
+                        choices=PIPELINE_MODES, default=DEFAULT_PIPELINE_MODE,
+                        help=("Pipeline execution mode (ADR-0001 migration switch). "
+                              "'cascade_legacy': sequential subtractive detection "
+                              "(default; current behavior). 'candidate_union': "
+                              "non-destructive candidate-union architecture. "
+                              "'candidate_union_with_residual_refinement': candidate "
+                              "union plus a residual-refinement pass. "
+                              "'benchmark_only': reserved for the benchmark harness. "
+                              "Currently inert plumbing only — no stage branches on "
+                              f"this yet. Default: {DEFAULT_PIPELINE_MODE}."))
     parser.add_argument("--mc-max-displacement", dest="mc_max_displacement",
                         type=int, default=None,
                         help=("rowwise-pcc: max per-frame/per-strip shift in px "
@@ -2058,6 +2074,7 @@ def _run_single(
         "scout_vcorr_stride": args.scout_vcorr_stride,
         "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
         "foundation_only": args.foundation_only,
+        "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.
@@ -2074,6 +2091,7 @@ def _run_single(
 
     fov_stem = tif_path.stem.replace("_mc", "")
     print(fmt.fov_banner(tif_path.name, 1, 1), flush=True)
+    print(fmt.sub_phase(f"Pipeline mode: {cfg.pipeline_mode}"), flush=True)
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif_path, cfg)
@@ -2301,6 +2319,7 @@ def _run_workspace(
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         "foundation_only": args.foundation_only,
+        "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.
@@ -2314,6 +2333,8 @@ def _run_workspace(
         [explicit_stage1, stage_overrides, ws_solver_overrides, ws_mc_overrides,
          ws_stage1_overrides, ws_gate2_overrides, ws_stage3_overrides],
     )
+
+    print(fmt.sub_phase(f"Pipeline mode: {overrides['pipeline_mode']}"), flush=True)
 
     ws_results = run_with_workspace(
         workspace, overrides,
