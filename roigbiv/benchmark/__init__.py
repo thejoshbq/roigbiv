@@ -1,1 +1,1 @@
-"""Benchmark harness data models and utilities for roigbiv."""
+"""Benchmark / guardrail harness for roigbiv — dataset manifest schema, metrics, synthetic soma injection."""
