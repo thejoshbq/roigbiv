@@ -75,7 +75,11 @@ Output masks + traces feed downstream to [pynapse](https://github.com/Otis-Lab-M
 for calcium signal extraction and peri-event analysis.
 
 **→ For the full purpose statement and a comprehensive breakdown of the pipeline and every
-integrated algorithm, see [`docs/OVERVIEW.md`](docs/OVERVIEW.md).**
+integrated algorithm, see [`docs/design/OVERVIEW.md`](docs/design/OVERVIEW.md).**
+
+**→ Architecture direction:** the pipeline is pivoting from the destructive subtractive cascade
+toward a non-destructive candidate union + joint validation — see
+[ADR-0001](docs/adr/0001-non-destructive-candidate-union.md).
 
 ---
 
