@@ -147,6 +147,11 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # this exclude set once a stage reads it and its value can actually change
     # pipeline output.
     "pipeline_mode",
+    # Denoised-branch config (Milestone B): foundation.py validates these at
+    # run time but does not produce different pipeline output artifacts.
+    # Changing these fields must not invalidate a resume.
+    "enable_denoised_branch", "denoiser_backend", "denoiser_model_path",
+    "denoised_branch_cache", "validate_denoised_against_raw",
 })
 
 
