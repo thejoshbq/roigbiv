@@ -44,6 +44,14 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- `docs/adr/0001-non-destructive-candidate-union.md` — first Architecture
+  Decision Record, establishing the `docs/adr/` convention. Records the
+  pivot from the destructive subtractive cascade toward a non-destructive
+  candidate union + joint validation (Stages 1–4 become proposal
+  generators; inter-stage subtraction deprecated as the default control
+  flow; L+S+T decomposition out of scope). Linked from `README.md` and
+  `docs/design/OVERVIEW.md` §14; also fixes README's stale
+  `docs/OVERVIEW.md` link (the file now lives at `docs/design/OVERVIEW.md`).
 - `--n-workers` flag on `roigbiv-pipeline`: in workspace mode (directory
   input), > 1 fans heavy pipeline calls through `pipeline/batch.run_batch`
   with the existing 2-worker GPU lock. Light post-pipeline steps
