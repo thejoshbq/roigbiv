@@ -168,6 +168,10 @@ class FOVData:
     F_neu: Optional[np.ndarray] = None
     F_corrected: Optional[np.ndarray] = None
 
+    # DeepCAD-RT sidecar output ({stem}_deepcad.tif); recorded only — no stage
+    # consumes this yet (raw-vs-denoised branch routing is a separate issue).
+    denoised_path: Optional[Path] = None
+
 
 @dataclass
 class PipelineConfig:
@@ -341,6 +345,16 @@ class PipelineConfig:
     # Path to the cp-sam env python. "" → auto-resolve: $ROIGBIV_CPSAM_PYTHON,
     # else the sibling `cp-sam` conda env of the running interpreter.
     cpsam_sidecar_python: str = ""
+
+    # ── Foundation denoising (DeepCAD-RT out-of-process sidecar) ───────────
+    # Out-of-process DeepCAD-RT denoising (see roigbiv/pipeline/deepcad.py).
+    # When deepcad_denoise=False (default), foundation.py does not call the
+    # sidecar and behavior is unchanged.
+    deepcad_denoise: bool = False
+    deepcad_env: str = "deepcad"             # conda env hosting DeepCAD-RT
+    deepcad_python: str = ""                 # interpreter override; "" → auto-resolve
+    deepcad_script: str = ""                 # worker script path override; "" → default
+    deepcad_model: str = ""                  # optional pretrained model checkpoint path
 
     # ── Stage 1 channel-2 content (Phase 4; OFF default — vcorr_S unchanged) ──
     # The morphological channel-1 is always mean_M (raw movie mean). This selects

@@ -744,7 +744,9 @@ def run_foundation(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary").mkdir(exist_ok=True)
 
-    # Validate denoising configuration.
+    # Validate denoising configuration (issue #34's generic denoiser_backend
+    # config surface — inert/documentary; issue #37's deepcad_denoise below is
+    # the only backend currently wired to execution).
     backend = getattr(cfg, "denoiser_backend", "none")
     if backend not in ("deepcad_rt", "deepinterpolation", "pmd", "none"):
         raise ValueError(
@@ -767,6 +769,16 @@ def run_foundation(
             f"denoiser_backend {backend!r} requires denoiser_model_path to "
             f"be set."
         )
+
+    # DeepCAD-RT out-of-process denoising (opt-in). Runs on the RAW input
+    # movie, before motion correction. Skipped in scout_mode: scout is a fast
+    # FOV/model triage path, and running an expensive out-of-process denoise
+    # just to discard the result (scout's FOVData does not carry it) would be
+    # wasted work — re-run without --scout for the full denoised path.
+    denoised_path = None
+    if getattr(cfg, "deepcad_denoise", False) and not getattr(cfg, "scout_mode", False):
+        from roigbiv.pipeline.deepcad import run_deepcad_denoise
+        denoised_path = run_deepcad_denoise(tif_path, output_dir, cfg, gpu_lock=gpu_lock)
 
     # Header reflects the actual mode: a pre-corrected input runs Suite2p in
     # detection-only mode (cfg.do_registration is False across all three backends),
@@ -889,4 +901,5 @@ def run_foundation(
         stage_counts={},
         ops=ops_snapshot,
         branches=[branch_view],
+        denoised_path=denoised_path,
     )
