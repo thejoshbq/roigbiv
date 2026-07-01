@@ -710,11 +710,40 @@ def run_foundation(
 
     Returns a populated FOVData with summary images in RAM and a lazy
     ResidualView (reconstructs S = M − L on demand from data.bin + SVD factors).
+
+    Raises:
+        ValueError: if cfg's denoising fields are misconfigured (unknown
+            denoiser_backend, enable_denoised_branch=True with backend='none',
+            or a real backend selected without denoiser_model_path).
     """
     tif_path = Path(tif_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary").mkdir(exist_ok=True)
+
+    # Validate denoising configuration.
+    backend = getattr(cfg, "denoiser_backend", "none")
+    if backend not in ("deepcad_rt", "deepinterpolation", "pmd", "none"):
+        raise ValueError(
+            f"Unknown denoiser_backend {backend!r}; expected 'deepcad_rt', "
+            f"'deepinterpolation', 'pmd', or 'none'."
+        )
+
+    enable_denoised = getattr(cfg, "enable_denoised_branch", False)
+    if enable_denoised and backend == "none":
+        raise ValueError(
+            "enable_denoised_branch=True requires a denoiser_backend other "
+            "than 'none'."
+        )
+
+    # Model path is required whenever a real backend is selected, independent of
+    # enable_denoised_branch; this catches incomplete configs early.
+    model_path = getattr(cfg, "denoiser_model_path", None)
+    if backend != "none" and model_path is None:
+        raise ValueError(
+            f"denoiser_backend {backend!r} requires denoiser_model_path to "
+            f"be set."
+        )
 
     # Header reflects the actual mode: a pre-corrected input runs Suite2p in
     # detection-only mode (cfg.do_registration is False across all three backends),

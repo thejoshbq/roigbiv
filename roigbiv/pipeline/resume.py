@@ -142,6 +142,11 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # resume is an execution-control flag: enabling it is how a prior run is
     # continued, not a change to the artifacts' semantics.
     "resume",
+    # Denoised-branch config (Milestone B): foundation.py validates these at
+    # run time but does not produce different pipeline output artifacts.
+    # Changing these fields must not invalidate a resume.
+    "enable_denoised_branch", "denoiser_backend", "denoiser_model_path",
+    "denoised_branch_cache", "validate_denoised_against_raw",
 })
 
 

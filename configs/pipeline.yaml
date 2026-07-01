@@ -254,6 +254,14 @@ classify:
   cv_tonic: 0.3
   min_transients_sparse: 5
 
+denoised:
+  # ── Milestone B — config surface only, not yet wired ──
+  enable_denoised_branch: false        # master switch; false preserves current behavior
+  denoiser_backend: none               # one of: deepcad_rt, deepinterpolation, pmd, none
+  denoiser_model_path: null            # path to denoiser checkpoint; required when backend != none
+  denoised_branch_cache: null          # cache dir for denoised intermediates
+  validate_denoised_against_raw: true  # QC: compare denoised output against raw
+
 paths:
   # All paths relative to project root (~/Otis-Lab/Projects/Phoxel-Workbench/roigbiv)
   raw_dir: data/raw

@@ -501,6 +501,17 @@ class PipelineConfig:
     enable_stage_4: bool = True
     force_cpu: bool = False
 
+    # ── Denoised branch (Milestone B — config surface only, not yet wired) ──
+    # Orthogonal to use_denoise (Cellpose3 restoration, line ~298) and
+    # use_pmd_denoise (Phase-2 spatiotemporal PMD, line ~463). These fields
+    # surface the denoising API; foundation.py validates membership and
+    # consistency at run time (raises ValueError on misconfiguration).
+    enable_denoised_branch: bool = False
+    denoiser_backend: str = "none"  # {"deepcad_rt", "deepinterpolation", "pmd", "none"}
+    denoiser_model_path: Optional[Path] = None
+    denoised_branch_cache: Optional[Path] = None
+    validate_denoised_against_raw: bool = True
+
     def summary_for_log(self) -> dict:
         """JSON-serializable snapshot of all config values for pipeline_log.json."""
         out = {}

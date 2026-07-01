@@ -1834,6 +1834,33 @@ def main(argv: "list[str] | None" = None) -> int:
                         action=argparse.BooleanOptionalAction, default=None,
                         help=("phasecorr: rigid pass then non-rigid (default off). "
                               "Keeps the raw movie for the second pass."))
+    # ── Denoising configuration ──────────────────────────────────
+    parser.add_argument("--denoised-branch", dest="enable_denoised_branch",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Enable denoised parallel branch in foundation "
+                              "stage. Default: uses PipelineConfig default "
+                              "(disabled). Pass --no-denoised-branch to force "
+                              "off."))
+    parser.add_argument("--denoiser-backend", dest="denoiser_backend",
+                        choices=("deepcad_rt", "deepinterpolation", "pmd", "none"),
+                        default=None,
+                        help=("Denoiser algorithm backend. Default: uses "
+                              "PipelineConfig default ('none')."))
+    parser.add_argument("--denoiser-model-path", dest="denoiser_model_path",
+                        type=Path, default=None,
+                        help=("Path to denoiser model checkpoint, required "
+                              "when --denoiser-backend is not 'none'."))
+    parser.add_argument("--denoised-branch-cache", dest="denoised_branch_cache",
+                        type=Path, default=None,
+                        help=("Output directory for cached denoised movie "
+                              "and intermediate products."))
+    parser.add_argument("--validate-denoised-against-raw",
+                        dest="validate_denoised_against_raw",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Compute validation metrics comparing denoised "
+                              "vs raw. Default: uses PipelineConfig default "
+                              "(enabled). Pass --no-validate-denoised-against-raw "
+                              "to skip."))
     parser.add_argument("--cpu", dest="force_cpu", action="store_true",
                         default=False,
                         help=("Force CPU-only execution for all Torch and "
@@ -2032,6 +2059,17 @@ def _run_single(
         }.items()
         if v is not None
     }
+    denoising_overrides = {
+        k: v
+        for k, v in {
+            "enable_denoised_branch": args.enable_denoised_branch,
+            "denoiser_backend": args.denoiser_backend,
+            "denoiser_model_path": args.denoiser_model_path,
+            "denoised_branch_cache": args.denoised_branch_cache,
+            "validate_denoised_against_raw": args.validate_denoised_against_raw,
+        }.items()
+        if v is not None
+    }
     # Resolve the lens profile, then merge: defaults < profile < explicit flags.
     # _build_explicit_stage1 owns the channels/diameter/cellprob/flow/model
     # backfill; stage1_overrides (min/max/tile) and the other *_overrides are
@@ -2069,7 +2107,8 @@ def _run_single(
     cfg = PipelineConfig(**merged_overrides(
         profile_name, base,
         [explicit_stage1, stage_overrides, solver_overrides, mc_overrides,
-         stage1_overrides, gate2_overrides, stage3_overrides],
+         stage1_overrides, gate2_overrides, stage3_overrides,
+         denoising_overrides],
     ))
 
     fov_stem = tif_path.stem.replace("_mc", "")
@@ -2277,6 +2316,17 @@ def _run_workspace(
         }.items()
         if v is not None
     }
+    ws_denoising_overrides = {
+        k: v
+        for k, v in {
+            "enable_denoised_branch": args.enable_denoised_branch,
+            "denoiser_backend": args.denoiser_backend,
+            "denoiser_model_path": args.denoiser_model_path,
+            "denoised_branch_cache": args.denoised_branch_cache,
+            "validate_denoised_against_raw": args.validate_denoised_against_raw,
+        }.items()
+        if v is not None
+    }
     # Resolve the lens profile and merge (defaults < profile < explicit flags).
     # The merged dict (incl. the resolved "profile" label + backfilled Stage-1
     # fields) becomes the per-FOV cfg overrides consumed by run_with_workspace.
@@ -2312,7 +2362,8 @@ def _run_workspace(
     overrides = merged_overrides(
         profile_name, base,
         [explicit_stage1, stage_overrides, ws_solver_overrides, ws_mc_overrides,
-         ws_stage1_overrides, ws_gate2_overrides, ws_stage3_overrides],
+         ws_stage1_overrides, ws_gate2_overrides, ws_stage3_overrides,
+         ws_denoising_overrides],
     )
 
     ws_results = run_with_workspace(
