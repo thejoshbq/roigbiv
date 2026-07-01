@@ -116,7 +116,7 @@ def layout() -> html.Div:
                 _canvas_toolbar(),
                 html.Div(id="roigbiv-review-canvas"),
                 html.Hr(),
-                html.H5("FOV signal — per-session mean",
+                html.H5("FOV signal — mean trace (accepted highlighted)",
                         className="mb-2 text-muted"),
                 dcc.Graph(
                     id="roigbiv-review-fov-trace",
@@ -580,8 +580,10 @@ def register_callbacks(app: dash.Dash) -> None:
             chosen = all_sessions[:1]
         try:
             if len(chosen) == 1:
-                return build_mean_single(fov_meta, chosen[0], theme=theme)
-            return build_mean_multi(fov_meta, chosen, theme=theme)
+                return build_mean_single(fov_meta, chosen[0],
+                                         accepted_overlay=True, theme=theme)
+            return build_mean_multi(fov_meta, chosen,
+                                    accepted_overlay=True, theme=theme)
         except Exception as exc:  # noqa: BLE001
             return user_error_figure(exc, "Building FOV-level trace figure",
                                      theme=theme)
