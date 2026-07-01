@@ -1,0 +1,48 @@
+# Sidecar conda env for the legacy SIMA motion-correction backend.
+#
+# SIMA 1.3.2 (2017, abandoned) cannot install in the roigbiv Python 3.10 env:
+# its shipped Cython C references CPython exception-state fields (`exc_type`)
+# removed in Python 3.7+. The PyPI sdist ships ONLY the stale pre-generated
+# `_motion.c` (no `.pyx`), so even on 3.8 the cached wheel fails to compile.
+# The fix is to install from the GitHub source (which carries the `.pyx`) so a
+# modern Cython re-generates compatible C. That step needs `--no-build-isolation`
+# (to see this env's Cython), which conda's `pip:` section cannot express — so
+# SIMA is installed by envs/build_sima_legacy.sh, NOT listed here.
+#
+# Build (one command):   bash envs/build_sima_legacy.sh
+#   (creates this env, then pip-installs SIMA from git tag 1.3.2, then verifies)
+# Verify:  conda run -n sima-legacy python -c \
+#            "import sima.motion; from sima.motion import HiddenMarkov2D; print(sima.__version__)"
+#
+# The roigbiv pipeline shells out to this env via
+# `conda run -n sima-legacy python scripts/sima_mc_worker.py ...`
+# (see roigbiv/pipeline/legacy_mc.py). This env must never import roigbiv.
+#
+# Pin rationale:
+#   numpy<1.20      SIMA uses np.int / np.float (deprecated 1.20, removed 1.24).
+#   scipy 1.5       pairs with numpy 1.19; later scipy drops APIs SIMA calls.
+#   scikit-image    pre-0.19 transform/measure API era.
+#   cython 0.29     re-cythonizes SIMA's .pyx into 3.8-compatible C at build time.
+#   h5py 2.10       2.x API (SIMA's HDF5 Sequence predates h5py 3.x str changes).
+#   tifffile        MODERN, for OUR frame writing (SIMA's vendored writer throws
+#                   "integer out of range for 'I'" on these stacks).
+#   scikit-learn / shapely  SIMA runtime deps (provided via conda for binary
+#                   reliability rather than pip-built during the git install).
+name: sima-legacy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - numpy=1.19.*
+  - scipy=1.5.*
+  - scikit-image=0.16.*
+  - cython=0.29.*
+  - future
+  - six
+  - pillow=7.*
+  - h5py=2.10.*
+  - tifffile
+  - scikit-learn
+  - shapely
+  - pip
+  # SIMA itself is installed by envs/build_sima_legacy.sh (git + --no-build-isolation).

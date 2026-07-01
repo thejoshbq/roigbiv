@@ -1,0 +1,22 @@
+# Sidecar conda env for the Cellpose-SAM (CP4) bake-off detector.
+#
+# cellpose>=4 (Cellpose-SAM) cannot coexist with the roigbiv env's
+# `cellpose<4.0.0` pin — the deployed checkpoints are CP3-format and the CP4 API
+# is incompatible. So CP4 lives here and is invoked as a subprocess sidecar
+# (scripts/cv_bakeoff/detectors/cp_sam.py -> workers/cp_sam_worker.py). This env
+# must never import roigbiv.
+#
+# Build (one command):   bash envs/build_cellpose_sam.sh
+#   (creates this env, pip-installs torch + cellpose>=4, then verifies the import)
+# Verify:  conda run -n cp-sam python -c "import cellpose; print(cellpose.version)"
+#
+# cellpose + torch are pip-installed by the build script (not listed here) so the
+# build can pick a CUDA-matched torch wheel for this workstation's GPU.
+name: cp-sam
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - tifffile

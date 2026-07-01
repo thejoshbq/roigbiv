@@ -1,0 +1,21 @@
+# Sidecar conda env for the StarDist 2D bake-off detector.
+#
+# StarDist pulls in a TensorFlow stack that conflicts with the roigbiv env's
+# torch/CUDA install, so it lives here and is invoked as a subprocess sidecar
+# (scripts/cv_bakeoff/detectors/stardist.py -> workers/stardist_worker.py). This
+# env must never import roigbiv.
+#
+# Build (one command):   bash envs/build_stardist.sh
+#   (creates this env, pip-installs stardist + tensorflow, then verifies)
+# Verify:  conda run -n stardist python -c "import stardist; print(stardist.__version__)"
+#
+# stardist + tensorflow + csbdeep are pip-installed by the build script so the
+# tensorflow wheel can be matched to this workstation's CUDA.
+name: stardist
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - tifffile
