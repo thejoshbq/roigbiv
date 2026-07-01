@@ -1,6 +1,6 @@
-# ROI G. Biv — Consensus Cell Detection Pipeline
+# ROI G. Biv — Sequential Subtractive Cell Detection Pipeline
 
-**Two-photon calcium imaging · Suite2p + Cellpose · GOLD / SILVER / BRONZE confidence tiers**
+**Two-photon calcium imaging · Cellpose + Suite2p · four sequential detection stages with per-stage validation gates**
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/Otis-Lab-MUSC/roigbiv/releases)
 [![Python](https://img.shields.io/badge/python-3.9+-blue)](https://www.python.org)
@@ -41,27 +41,41 @@ pip install https://github.com/Otis-Lab-MUSC/roigbiv/releases/latest/download/ro
 
 ## Overview
 
-ROI G. Biv is a **consensus cell-detection pipeline** for two-photon calcium imaging.
-It combines two independent Suite2p detection modes (activity-based and anatomy-based)
-with a fine-tuned Cellpose model, merging their outputs via spatial IoU matching to
-produce three-tier confidence ROI masks.
+ROI G. Biv is a **sequential subtractive** ROI-detection pipeline for two-photon calcium
+imaging. A shared Foundation prepares the movie (motion correction → truncated-SVD
+low-rank/sparse background split → summary images), then **four detection stages run in
+order**, each operating on the *residual* left after the previous stages subtract the
+sources they found — so the detectors are complementary rather than redundant:
 
-| Tier | Condition | Interpretation |
-|------|-----------|----------------|
-| **GOLD** | Both Suite2p passes agree (IoU ≥ 0.3) | Highest confidence — morphology and activity agree |
-| **SILVER** | Anatomy pass only | Morphologically neuron-shaped; silent during recording |
-| **BRONZE** | Activity pass only | Was active; not anatomically prominent in mean image |
+| Stage | Detector | Finds |
+|------|----------|-------|
+| **1** | Cellpose (fine-tuned CP3) | soma-shaped objects on the morphological image |
+| **2** | Suite2p classifier | active neurons Stage 1 missed morphologically |
+| **3** | GCaMP matched-filter template sweep | isolated transients too sparse for Suite2p |
+| **4** | tonic-neuron search (bandpass + correlation contrast) | steady/tonic firers with no discrete transients |
+
+Each stage is paired with a **validation gate** (morphology → temporal cross-validation →
+waveform → correlation-contrast) that accepts, flags, or rejects every candidate before it
+is subtracted. Every ROI carries full provenance: which stage found it, its gate outcome,
+a confidence level, and the stage-specific score behind it.
+
+> **Note:** this replaces the older parallel three-branch **GOLD/SILVER/BRONZE consensus**
+> design. That architecture is retired.
 
 Key capabilities:
 
-- **End-to-end Colab notebook** — upload TIFs to Drive, run everything in Colab
-- **Consensus detection** combining temporal correlation + mean-image morphology
-- **Cellpose probability scoring** per ROI for post-hoc thresholding
-- **Resumable batch processing** — skips completed FOVs after disconnects
-- **Interactive viewer** — ipywidgets FOV explorer with tier + probability filters
-- **pip-installable package** distributed via GitHub releases
+- **Sequential subtractive detection** — four complementary detectors on a shared residual
+- **Per-stage validation gates** with per-ROI provenance (`source_stage`, `gate_outcome`, `confidence`)
+- **Human-in-the-loop review package** — prioritized review queue + additive corrections that retrain Cellpose
+- **Cross-session FOV & cell registry** (ROICaT embeddings, `roigbiv-registry`)
+- **Resumable processing** — `--resume` skips completed stages/FOVs after interruptions
+- **Dash web app** (`roigbiv-ui`) and **end-to-end Colab notebook**
 
-Output masks feed directly into [pynapse](https://github.com/Otis-Lab-MUSC/pynapse) for calcium signal extraction and peri-event analysis.
+Output masks + traces feed downstream to [pynapse](https://github.com/Otis-Lab-MUSC/pynapse)
+for calcium signal extraction and peri-event analysis.
+
+**→ For the full purpose statement and a comprehensive breakdown of the pipeline and every
+integrated algorithm, see [`docs/OVERVIEW.md`](docs/OVERVIEW.md).**
 
 ---
 
