@@ -30,7 +30,7 @@ import tifffile
 
 from roigbiv.pipeline import fmt
 from roigbiv.pipeline.device import cuda_compute_capable
-from roigbiv.pipeline.types import FOVData, PipelineConfig
+from roigbiv.pipeline.types import FOVData, PipelineConfig, BranchView
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -615,6 +615,29 @@ def compute_nuclear_shadow_map(
     return (g_outer - g_inner).astype(np.float32)
 
 
+def _build_branches_manifest(branches: list, summary_dir: Path) -> list:
+    """JSON-safe manifest records for ``branches.json``, referencing on-disk summary TIFFs.
+
+    Filters out any ``summary_images`` entries that are ``None`` — a BranchView's
+    array set is only a subset of the standard names for some sources (e.g. a
+    future denoised branch may not produce all seven).
+    """
+    manifest = []
+    for branch in branches:
+        summary_image_paths = {
+            name: str(summary_dir / f"{name}.tif")
+            for name, arr in branch.summary_images.items()
+            if arr is not None
+        }
+        manifest.append({
+            "branch_name": branch.branch_name,
+            "is_denoised": branch.is_denoised,
+            "provenance": branch.provenance,
+            "summary_image_paths": summary_image_paths,
+        })
+    return manifest
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────
@@ -793,6 +816,29 @@ def run_foundation(
     ops_snapshot = {k: v for k, v in ops.items()
                     if isinstance(v, (int, float, str, bool, list, tuple))}
 
+    summary_images = {
+        "mean_M": mean_M, "mean_S": mean_S, "max_S": max_S, "std_S": std_S,
+        "vcorr_S": vcorr_S, "mean_L": mean_L, "dog_map": dog_map,
+    }
+    branch_provenance = {
+        "motion_correction_backend": cfg.motion_correction_backend,
+        "k_used": int(k_used),
+        "fs": cfg.fs,
+        "tau": cfg.tau,
+        "n_svd": cfg.n_svd,
+    }
+
+    branch_view = BranchView(
+        branch_name="raw",
+        movie_view=data_bin_path,
+        summary_images=summary_images,
+        provenance=branch_provenance,
+        is_denoised=False,
+    )
+
+    branches_manifest = _build_branches_manifest([branch_view], summary_dir)
+    (output_dir / "branches.json").write_text(json.dumps(branches_manifest, indent=2))
+
     return FOVData(
         raw_path=tif_path,
         output_dir=output_dir,
@@ -813,4 +859,5 @@ def run_foundation(
         rois=[],
         stage_counts={},
         ops=ops_snapshot,
+        branches=[branch_view],
     )

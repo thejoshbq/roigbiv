@@ -105,6 +105,16 @@ def _jsonable_features(features: dict) -> dict:
 
 
 @dataclass
+class BranchView:
+    """A view of preprocessed movie data for a given branch (raw, denoised, etc.)."""
+    branch_name: str
+    movie_view: Path                                     # path to this branch's movie data (e.g. data.bin for raw)
+    summary_images: dict = field(default_factory=dict)   # {name: Optional[np.ndarray]}
+    provenance: dict = field(default_factory=dict)
+    is_denoised: bool = False
+
+
+@dataclass
 class FOVData:
     """Container for all per-FOV intermediate products.
 
@@ -139,6 +149,7 @@ class FOVData:
 
     k_background: int = 30
     rois: list = field(default_factory=list)        # list[ROI]
+    branches: list = field(default_factory=list)   # list[BranchView]
     stage_counts: dict = field(default_factory=dict)
 
     ops: Optional[dict] = None              # Suite2p ops dict (lightweight snapshot)
