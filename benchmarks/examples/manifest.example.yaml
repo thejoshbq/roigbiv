@@ -1,0 +1,66 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# BENCHMARK DATASET MANIFEST — TEMPLATE
+# ──────────────────────────────────────────────────────────────────────────────
+# This is a TEMPLATE file demonstrating the schema for benchmark dataset manifests.
+# All paths are PLACEHOLDERS and SYNTHETIC — not real lab data.
+#
+# HOW TO USE THIS FILE:
+# 1. Copy this file to your own manifest (e.g., benchmarks/my_benchmark.yaml).
+# 2. Adapt the `entries` list with real FOV paths and metadata.
+# 3. All `path` values are resolved RELATIVE to the manifest file's parent
+#    directory. (If this file is at benchmarks/my_benchmark.yaml, paths like
+#    "samples/fov_001/" resolve to benchmarks/samples/fov_001/.)
+# 4. Both single-TIF files (classic mode) and directories (workspace mode) are
+#    valid `path` targets. The roigbiv pipeline accepts either.
+# 5. For template authoring before real data lands, use:
+#      roigbiv-benchmark --allow-missing-paths path/to/manifest.yaml
+#
+# SCHEMA:
+# - dataset_id (str): Name of the dataset group (e.g., lab cohort, experimental condition).
+# - fov_id (str): Unique identifier for this FOV across the entire manifest.
+# - path (str): Relative path to input (file or directory), resolved against manifest's parent.
+# - fs (float): Effective sampling rate in Hz. Use 7.5 for 4x frame-averaged stacks.
+#   [IMPORTANT: This lab's convention is 7.5 Hz for online-averaged stacks,
+#    NOT the raw 30.0 Hz acquisition rate. Incorrect fs miscalibrates Stage 3
+#    templates and Stage 4 deconvolution. See CLAUDE.md for details.]
+# - frame_averaging (int, optional): Number of frames averaged online. Defaults to 1.
+# - lens_type (str, optional): "grin", "prism", or "generic". Defaults to "generic".
+# - quality_tier (str, REQUIRED): "high", "medium", or "low" (no default).
+# - has_manual_masks (bool): True if ROIs were manually drawn / edited.
+# - has_longitudinal_ids (bool): True if FOVs are longitudinally tracked across sessions.
+# - has_synthetic_injections (bool): True if synthetic activity was injected.
+# - notes (str, optional): Free-text documentation (e.g., animal ID, session notes, caveats).
+# ──────────────────────────────────────────────────────────────────────────────
+
+entries:
+  - dataset_id: "demo_cohort_001"
+    fov_id: "grin_high_quality_001"
+    path: "samples/sample_001/"
+    fs: 7.5
+    frame_averaging: 4
+    lens_type: "grin"
+    quality_tier: "high"
+    has_manual_masks: true
+    has_longitudinal_ids: false
+    has_synthetic_injections: false
+    notes: "Primary visual cortex (V1), male mouse aged 8w, saline baseline. Motion correction stable, high signal-to-noise. Used for Model A validation."
+
+  - dataset_id: "demo_cohort_001"
+    fov_id: "prism_medium_quality_001"
+    # sample_002.tif is a zero-byte placeholder for `.exists()` checks only —
+    # not a loadable TIFF. Replace with a real stack path for actual use.
+    path: "samples/sample_002.tif"
+    fs: 7.5
+    quality_tier: "medium"
+    has_manual_masks: false
+    has_longitudinal_ids: true
+    has_synthetic_injections: false
+
+  - dataset_id: "demo_cohort_002"
+    fov_id: "generic_low_quality_001"
+    path: "samples/sample_003/"
+    fs: 7.5
+    quality_tier: "low"
+    has_manual_masks: false
+    has_longitudinal_ids: false
+    has_synthetic_injections: true
