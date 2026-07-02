@@ -6,6 +6,12 @@ All notable changes to roigbiv are documented here.
 
 ### Changed
 
+- **`roigbiv-benchmark` restructured into subcommands.** Manifest
+  validation moved from a bare positional argument to an explicit
+  `roigbiv-benchmark validate <manifest>` subcommand (was
+  `roigbiv-benchmark <manifest>`) — a breaking CLI change with no
+  backward-compat shim. Added alongside it: `roigbiv-benchmark report`
+  (issue #32, see below).
 - **Overlay PNG draws every ROI by default.** `roigbiv/overlay.py`
   previously skipped `reject` ROIs silently; now `accept` (green),
   `flag` (orange), and `reject` (red) are all drawn, so gate-discard
@@ -44,6 +50,20 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- **`roigbiv-benchmark report`** (issue #32, roadmap A8): generates
+  `report.md` + `report.json` comparing one or more benchmark runs
+  (`--run <benchmark_run.json>`, repeatable). Tables by quality tier,
+  lens type, detector/stage, runtime, and split/merge counts; a
+  Warnings section for FOVs with no ground truth; a provenance table
+  with git commit, working-tree dirty state, and config hash per run.
+  Introduces `roigbiv/benchmark/results.py` (`BenchmarkRun`,
+  `BenchmarkRunResult`, `DetectorStageCount`) as the on-disk
+  `benchmark_run.json` contract — defined ahead of the runner (#28)
+  and object-level matcher (#30), which are still open; those should
+  write to this contract when they land. `roigbiv/benchmark/provenance.py`
+  adds `get_git_commit`/`is_git_dirty`/`compute_config_hash`, the
+  repo's first git-commit-hash capture utility. `roigbiv/benchmark/report.py`
+  holds the pure Markdown/JSON report-building logic.
 - `docs/adr/0001-non-destructive-candidate-union.md` — first Architecture
   Decision Record, establishing the `docs/adr/` convention. Records the
   pivot from the destructive subtractive cascade toward a non-destructive
