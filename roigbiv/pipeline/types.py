@@ -7,11 +7,13 @@ without schema changes.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import numpy as np
+import tifffile
 
 
 # Anchor the default Cellpose model path to the package root (not cwd) so
@@ -163,6 +165,137 @@ class CandidateROI:
             "summary_features": _jsonable_features(self.summary_features),
             "temporal_features": _jsonable_features(self.temporal_features),
         }
+
+
+@dataclass
+class CandidateUnion:
+    """Non-destructive container for candidates from every detector/branch,
+    pre-validation (ADR-0001 Decision 2).
+
+    Pure container: no dedup, no deconfliction, no overlap resolution — that's
+    the joint deconfliction step (Milestone D, issue #55+). The only invariant
+    this class enforces is candidate_id uniqueness.
+    """
+    candidates: dict = field(default_factory=dict)  # {candidate_id: CandidateROI}, insertion-ordered
+
+    def add(self, candidate: CandidateROI) -> None:
+        """Add a candidate. Raises ValueError on a duplicate candidate_id or a
+        mask shape that disagrees with the rest of the union (all candidates
+        in a union come from the same FOV and must share one frame geometry)."""
+        if candidate.candidate_id in self.candidates:
+            raise ValueError(f"duplicate candidate_id: {candidate.candidate_id!r}")
+        if self.candidates:
+            expected_shape = next(iter(self.candidates.values())).mask.shape
+            if candidate.mask.shape != expected_shape:
+                raise ValueError(
+                    f"candidate {candidate.candidate_id!r} mask shape {candidate.mask.shape} "
+                    f"does not match this union's shape {expected_shape}"
+                )
+        self.candidates[candidate.candidate_id] = candidate
+
+    def iter_by_detector(self, source_detector: str) -> Iterator[CandidateROI]:
+        """Iterate candidates proposed by a given detector, in insertion order."""
+        return (c for c in self.candidates.values() if c.source_detector == source_detector)
+
+    def iter_by_branch(self, branch: str) -> Iterator[CandidateROI]:
+        """Iterate candidates drawn from a given branch, in insertion order."""
+        return (c for c in self.candidates.values() if c.branch == branch)
+
+    def to_label_image(self, shape: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """Render all candidate masks into one (H, W) uint16 label image.
+
+        Label ids are assigned 1..N in insertion order. Overlapping candidates
+        are not deconflicted here — a later-inserted candidate's pixels simply
+        overwrite an earlier one's in the shared array. This flattening is lossy
+        under overlap by construction; it's a visualization aid only, not the
+        persistence format (see save/load, which keep each candidate's mask
+        independent so overlap doesn't corrupt round-tripped geometry).
+        """
+        if shape is None:
+            if not self.candidates:
+                raise ValueError("cannot infer shape from an empty CandidateUnion; pass shape explicitly")
+            shape = next(iter(self.candidates.values())).mask.shape
+        if len(self.candidates) > 65535:
+            raise ValueError(
+                f"to_label_image supports at most 65535 candidates (uint16 label ids); "
+                f"got {len(self.candidates)}"
+            )
+        label_image = np.zeros(shape, dtype=np.uint16)
+        for i, candidate in enumerate(self.candidates.values(), start=1):
+            label_image[candidate.mask] = i
+        return label_image
+
+    def save(self, path: Path) -> None:
+        """Persist masks (candidate_masks.tif) and provenance (candidate_metadata.json).
+
+        Masks are written as one page per candidate (N, H, W), not flattened
+        into a single label image — candidates in a union routinely overlap
+        (that's the point of a pre-deconfliction container), and a shared
+        (H, W) label image would let a later candidate's pixels silently
+        overwrite an earlier one's on the very next load(). Metadata entries
+        carry the label_id assigned to their page (1-indexed) so load() can
+        map each JSON record back to its mask page.
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        meta_list = []
+        masks = []
+        for i, candidate in enumerate(self.candidates.values(), start=1):
+            masks.append(candidate.mask)
+            entry = candidate.to_serializable()
+            entry["label_id"] = i
+            meta_list.append(entry)
+
+        mask_stack = (
+            np.stack(masks).astype(np.uint8) if masks
+            else np.zeros((0, 0, 0), dtype=np.uint8)
+        )
+        tifffile.imwrite(str(path / "candidate_masks.tif"), mask_stack)
+        (path / "candidate_metadata.json").write_text(json.dumps(meta_list, indent=2))
+
+    @classmethod
+    def load(cls, path: Path) -> "CandidateUnion":
+        """Reconstruct a CandidateUnion from save()'s output directory.
+
+        Each candidate's mask round-trips exactly from its own stack page,
+        independent of any other candidate's mask — including overlapping
+        ones. sparse_pixels does not round-trip — CandidateROI.to_serializable()
+        already drops it, so no weight values survive a save/load cycle;
+        load() synthesizes a placeholder (all-ones weights) from the
+        reconstructed mask.
+        """
+        path = Path(path)
+        mask_stack = tifffile.imread(str(path / "candidate_masks.tif"))
+        if mask_stack.ndim == 2:
+            # tifffile squeezes a single-page write back down to (H, W).
+            mask_stack = mask_stack[np.newaxis, ...]
+        meta_list = json.loads((path / "candidate_metadata.json").read_text())
+
+        union = cls()
+        for entry in sorted(meta_list, key=lambda e: e["label_id"]):
+            mask = mask_stack[entry["label_id"] - 1].astype(bool)
+            indices = np.flatnonzero(mask)
+            weights = np.ones(len(indices), dtype=np.float32)
+            candidate = CandidateROI(
+                candidate_id=entry["candidate_id"],
+                source_detector=entry["source_detector"],
+                source_stage=entry["source_stage"],
+                branch=entry["branch"],
+                mask=mask,
+                sparse_pixels=(indices, weights),
+                centroid=tuple(entry["centroid"]),
+                bbox=tuple(entry["bbox"]),
+                area=entry["area"],
+                detector_score=entry["detector_score"],
+                validation_status=entry["validation_status"],
+                provenance=entry["provenance"],
+                seed_frames=entry["seed_frames"],
+                summary_features=entry["summary_features"],
+                temporal_features=entry["temporal_features"],
+            )
+            union.add(candidate)
+        return union
 
 
 @dataclass
