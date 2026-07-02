@@ -22,6 +22,9 @@ _DEFAULT_CELLPOSE_MODEL = str(
     Path(__file__).resolve().parents[2] / "models" / "deployed" / "current_model"
 )
 
+PIPELINE_MODES = ("cascade_legacy", "candidate_union", "candidate_union_with_residual_refinement", "benchmark_only")
+DEFAULT_PIPELINE_MODE = "cascade_legacy"
+
 
 @dataclass
 class ROI:
@@ -105,6 +108,16 @@ def _jsonable_features(features: dict) -> dict:
 
 
 @dataclass
+class BranchView:
+    """A view of preprocessed movie data for a given branch (raw, denoised, etc.)."""
+    branch_name: str
+    movie_view: Path                                     # path to this branch's movie data (e.g. data.bin for raw)
+    summary_images: dict = field(default_factory=dict)   # {name: Optional[np.ndarray]}
+    provenance: dict = field(default_factory=dict)
+    is_denoised: bool = False
+
+
+@dataclass
 class FOVData:
     """Container for all per-FOV intermediate products.
 
@@ -139,6 +152,7 @@ class FOVData:
 
     k_background: int = 30
     rois: list = field(default_factory=list)        # list[ROI]
+    branches: list = field(default_factory=list)   # list[BranchView]
     stage_counts: dict = field(default_factory=dict)
 
     ops: Optional[dict] = None              # Suite2p ops dict (lightweight snapshot)
@@ -153,6 +167,10 @@ class FOVData:
     F_raw: Optional[np.ndarray] = None
     F_neu: Optional[np.ndarray] = None
     F_corrected: Optional[np.ndarray] = None
+
+    # DeepCAD-RT sidecar output ({stem}_deepcad.tif); recorded only — no stage
+    # consumes this yet (raw-vs-denoised branch routing is a separate issue).
+    denoised_path: Optional[Path] = None
 
 
 @dataclass
@@ -188,6 +206,21 @@ class PipelineConfig:
     # before committing to ROI detection. Writes a foundation_only.json sentinel.
     # Resumable: a later --resume run (without the flag) continues from Stage 1.
     foundation_only: bool = False
+
+    # ── Pipeline mode (top-level architecture switch) ──────────────────────
+    # "cascade_legacy":  sequential subtractive detection (default) — each
+    #                    stage detects on the residual after prior stages
+    #                    subtract their sources. The pipeline as currently run.
+    # "candidate_union": non-destructive candidate-union architecture (ADR-0001)
+    #                    — stages propose candidates against the undisturbed
+    #                    signal instead of a subtracted residual.
+    # "candidate_union_with_residual_refinement": candidate union with an
+    #                    additional residual-based refinement pass layered on top.
+    # "benchmark_only":  reserved for the benchmark harness (Milestone A) to
+    #                    run comparative passes without committing to a mode.
+    # Currently inert plumbing: no stage reads this field yet. Behavior lands
+    # in a later ADR-0001 implementation issue.
+    pipeline_mode: str = DEFAULT_PIPELINE_MODE
 
     # ── Motion correction backend ─────────────────────────────────────────
     # "phasecorr":   Suite2p rigid + non-rigid registration (default). Robust on
@@ -312,6 +345,16 @@ class PipelineConfig:
     # Path to the cp-sam env python. "" → auto-resolve: $ROIGBIV_CPSAM_PYTHON,
     # else the sibling `cp-sam` conda env of the running interpreter.
     cpsam_sidecar_python: str = ""
+
+    # ── Foundation denoising (DeepCAD-RT out-of-process sidecar) ───────────
+    # Out-of-process DeepCAD-RT denoising (see roigbiv/pipeline/deepcad.py).
+    # When deepcad_denoise=False (default), foundation.py does not call the
+    # sidecar and behavior is unchanged.
+    deepcad_denoise: bool = False
+    deepcad_env: str = "deepcad"             # conda env hosting DeepCAD-RT
+    deepcad_python: str = ""                 # interpreter override; "" → auto-resolve
+    deepcad_script: str = ""                 # worker script path override; "" → default
+    deepcad_model: str = ""                  # optional pretrained model checkpoint path
 
     # ── Stage 1 channel-2 content (Phase 4; OFF default — vcorr_S unchanged) ──
     # The morphological channel-1 is always mean_M (raw movie mean). This selects
@@ -500,6 +543,17 @@ class PipelineConfig:
     enable_stage_3: bool = True
     enable_stage_4: bool = True
     force_cpu: bool = False
+
+    # ── Denoised branch (Milestone B — config surface only, not yet wired) ──
+    # Orthogonal to use_denoise (Cellpose3 restoration, line ~298) and
+    # use_pmd_denoise (Phase-2 spatiotemporal PMD, line ~463). These fields
+    # surface the denoising API; foundation.py validates membership and
+    # consistency at run time (raises ValueError on misconfiguration).
+    enable_denoised_branch: bool = False
+    denoiser_backend: str = "none"  # {"deepcad_rt", "deepinterpolation", "pmd", "none"}
+    denoiser_model_path: Optional[Path] = None
+    denoised_branch_cache: Optional[Path] = None
+    validate_denoised_against_raw: bool = True
 
     def summary_for_log(self) -> dict:
         """JSON-serializable snapshot of all config values for pipeline_log.json."""

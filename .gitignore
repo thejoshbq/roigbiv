@@ -94,3 +94,6 @@ logs/*.log
 *.tmp
 *.temp
 tmp/
+
+# ── Personal scratch notes ────────────────────────────────────────────────────
+READING_NOTES.md

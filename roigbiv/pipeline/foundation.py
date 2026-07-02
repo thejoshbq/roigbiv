@@ -30,7 +30,7 @@ import tifffile
 
 from roigbiv.pipeline import fmt
 from roigbiv.pipeline.device import cuda_compute_capable
-from roigbiv.pipeline.types import FOVData, PipelineConfig
+from roigbiv.pipeline.types import FOVData, PipelineConfig, BranchView
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -615,6 +615,29 @@ def compute_nuclear_shadow_map(
     return (g_outer - g_inner).astype(np.float32)
 
 
+def _build_branches_manifest(branches: list, summary_dir: Path) -> list:
+    """JSON-safe manifest records for ``branches.json``, referencing on-disk summary TIFFs.
+
+    Filters out any ``summary_images`` entries that are ``None`` — a BranchView's
+    array set is only a subset of the standard names for some sources (e.g. a
+    future denoised branch may not produce all seven).
+    """
+    manifest = []
+    for branch in branches:
+        summary_image_paths = {
+            name: str(summary_dir / f"{name}.tif")
+            for name, arr in branch.summary_images.items()
+            if arr is not None
+        }
+        manifest.append({
+            "branch_name": branch.branch_name,
+            "is_denoised": branch.is_denoised,
+            "provenance": branch.provenance,
+            "summary_image_paths": summary_image_paths,
+        })
+    return manifest
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────
@@ -710,11 +733,52 @@ def run_foundation(
 
     Returns a populated FOVData with summary images in RAM and a lazy
     ResidualView (reconstructs S = M − L on demand from data.bin + SVD factors).
+
+    Raises:
+        ValueError: if cfg's denoising fields are misconfigured (unknown
+            denoiser_backend, enable_denoised_branch=True with backend='none',
+            or a real backend selected without denoiser_model_path).
     """
     tif_path = Path(tif_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary").mkdir(exist_ok=True)
+
+    # Validate denoising configuration (issue #34's generic denoiser_backend
+    # config surface — inert/documentary; issue #37's deepcad_denoise below is
+    # the only backend currently wired to execution).
+    backend = getattr(cfg, "denoiser_backend", "none")
+    if backend not in ("deepcad_rt", "deepinterpolation", "pmd", "none"):
+        raise ValueError(
+            f"Unknown denoiser_backend {backend!r}; expected 'deepcad_rt', "
+            f"'deepinterpolation', 'pmd', or 'none'."
+        )
+
+    enable_denoised = getattr(cfg, "enable_denoised_branch", False)
+    if enable_denoised and backend == "none":
+        raise ValueError(
+            "enable_denoised_branch=True requires a denoiser_backend other "
+            "than 'none'."
+        )
+
+    # Model path is required whenever a real backend is selected, independent of
+    # enable_denoised_branch; this catches incomplete configs early.
+    model_path = getattr(cfg, "denoiser_model_path", None)
+    if backend != "none" and model_path is None:
+        raise ValueError(
+            f"denoiser_backend {backend!r} requires denoiser_model_path to "
+            f"be set."
+        )
+
+    # DeepCAD-RT out-of-process denoising (opt-in). Runs on the RAW input
+    # movie, before motion correction. Skipped in scout_mode: scout is a fast
+    # FOV/model triage path, and running an expensive out-of-process denoise
+    # just to discard the result (scout's FOVData does not carry it) would be
+    # wasted work — re-run without --scout for the full denoised path.
+    denoised_path = None
+    if getattr(cfg, "deepcad_denoise", False) and not getattr(cfg, "scout_mode", False):
+        from roigbiv.pipeline.deepcad import run_deepcad_denoise
+        denoised_path = run_deepcad_denoise(tif_path, output_dir, cfg, gpu_lock=gpu_lock)
 
     # Header reflects the actual mode: a pre-corrected input runs Suite2p in
     # detection-only mode (cfg.do_registration is False across all three backends),
@@ -793,6 +857,29 @@ def run_foundation(
     ops_snapshot = {k: v for k, v in ops.items()
                     if isinstance(v, (int, float, str, bool, list, tuple))}
 
+    summary_images = {
+        "mean_M": mean_M, "mean_S": mean_S, "max_S": max_S, "std_S": std_S,
+        "vcorr_S": vcorr_S, "mean_L": mean_L, "dog_map": dog_map,
+    }
+    branch_provenance = {
+        "motion_correction_backend": cfg.motion_correction_backend,
+        "k_used": int(k_used),
+        "fs": cfg.fs,
+        "tau": cfg.tau,
+        "n_svd": cfg.n_svd,
+    }
+
+    branch_view = BranchView(
+        branch_name="raw",
+        movie_view=data_bin_path,
+        summary_images=summary_images,
+        provenance=branch_provenance,
+        is_denoised=False,
+    )
+
+    branches_manifest = _build_branches_manifest([branch_view], summary_dir)
+    (output_dir / "branches.json").write_text(json.dumps(branches_manifest, indent=2))
+
     return FOVData(
         raw_path=tif_path,
         output_dir=output_dir,
@@ -813,4 +900,6 @@ def run_foundation(
         rois=[],
         stage_counts={},
         ops=ops_snapshot,
+        branches=[branch_view],
+        denoised_path=denoised_path,
     )
