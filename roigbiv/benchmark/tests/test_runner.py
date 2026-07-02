@@ -304,3 +304,129 @@ def test_hardware_info_best_effort_no_raise(monkeypatch):
     info = _hardware_info()
     assert info["platform"] is None
     assert isinstance(info, dict)
+
+
+# ---------------------------------------------------------------------------
+# Ablation support (issue #33)
+# ---------------------------------------------------------------------------
+
+def test_run_one_fov_applies_ablation_override(tmp_path: Path):
+    tif = tmp_path / "fov1.tif"
+    tif.write_bytes(b"")
+    entry = _entry(path="fov1.tif")
+    out_dir = tmp_path / "out" / entry.fov_id
+    log_path = tmp_path / "out" / "logs" / f"{entry.fov_id}.log"
+
+    captured_cfg = {}
+
+    def _capture(tif_path, cfg):
+        captured_cfg["cfg"] = cfg
+        return _fake_fov()
+
+    with patch("roigbiv.pipeline.run.run_pipeline", side_effect=_capture):
+        result = _run_one_fov(entry, tmp_path, out_dir, log_path, "stage3_off")
+
+    assert result.status == "success"
+    assert result.ablation == "stage3_off"
+    assert captured_cfg["cfg"].enable_stage_3 is False
+
+
+def test_run_one_fov_unknown_ablation_recorded_as_setup_error(tmp_path: Path):
+    tif = tmp_path / "fov1.tif"
+    tif.write_bytes(b"")
+    entry = _entry(path="fov1.tif")
+    out_dir = tmp_path / "out" / entry.fov_id
+    log_path = tmp_path / "out" / "logs" / f"{entry.fov_id}.log"
+
+    result = _run_one_fov(entry, tmp_path, out_dir, log_path, "not-a-real-ablation")
+
+    assert result.status == "error"
+    assert result.error.startswith("setup:")
+
+
+def test_run_benchmark_groups_output_by_ablation_name(tmp_path: Path):
+    ok_dir = tmp_path / "ok_fov"
+    ok_dir.mkdir()
+    (ok_dir / "data.tif").write_bytes(b"")
+    entries = [{
+        "dataset_id": "ds1", "fov_id": "ok_fov", "path": "ok_fov", "fs": 7.5,
+        "has_manual_masks": False, "has_longitudinal_ids": False,
+        "has_synthetic_injections": False, "quality_tier": "high",
+    }]
+    manifest_path = _write_manifest(tmp_path, entries)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        report = run_benchmark(manifest_path, output_dir,
+                                ablations=["raw_only", "stage3_off"])
+
+    assert report.ablations == ["raw_only", "stage3_off"]
+    assert len(report.fov_results) == 2
+    assert {r.ablation for r in report.fov_results} == {"raw_only", "stage3_off"}
+    assert (output_dir / "raw_only" / "ok_fov").exists()
+    assert (output_dir / "raw_only" / "logs" / "ok_fov.log").exists()
+    assert (output_dir / "stage3_off" / "ok_fov").exists()
+    assert (output_dir / "stage3_off" / "logs" / "ok_fov.log").exists()
+    # Legacy flat layout must not appear when ablations are requested.
+    assert not (output_dir / "ok_fov").exists()
+
+
+def test_run_benchmark_all_sentinel_expands_to_every_registered_ablation(tmp_path: Path):
+    from roigbiv.benchmark.ablations import ABLATIONS
+
+    ok_dir = tmp_path / "ok_fov"
+    ok_dir.mkdir()
+    (ok_dir / "data.tif").write_bytes(b"")
+    entries = [{
+        "dataset_id": "ds1", "fov_id": "ok_fov", "path": "ok_fov", "fs": 7.5,
+        "has_manual_masks": False, "has_longitudinal_ids": False,
+        "has_synthetic_injections": False, "quality_tier": "high",
+    }]
+    manifest_path = _write_manifest(tmp_path, entries)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        report = run_benchmark(manifest_path, output_dir, ablations=["all"])
+
+    assert set(report.ablations) == set(ABLATIONS)
+    assert len(report.fov_results) == len(ABLATIONS)
+
+
+def test_run_benchmark_unknown_ablation_raises_before_any_fov_runs(tmp_path: Path):
+    ok_dir = tmp_path / "ok_fov"
+    ok_dir.mkdir()
+    (ok_dir / "data.tif").write_bytes(b"")
+    entries = [{
+        "dataset_id": "ds1", "fov_id": "ok_fov", "path": "ok_fov", "fs": 7.5,
+        "has_manual_masks": False, "has_longitudinal_ids": False,
+        "has_synthetic_injections": False, "quality_tier": "high",
+    }]
+    manifest_path = _write_manifest(tmp_path, entries)
+    output_dir = tmp_path / "bench_out"
+
+    with pytest.raises(ValueError):
+        run_benchmark(manifest_path, output_dir, ablations=["nope"])
+
+    assert not (output_dir / "nope").exists()
+    assert not (output_dir / "benchmark_run.json").exists()
+
+
+def test_run_benchmark_legacy_layout_unchanged_when_ablations_omitted(tmp_path: Path):
+    ok_dir = tmp_path / "ok_fov"
+    ok_dir.mkdir()
+    (ok_dir / "data.tif").write_bytes(b"")
+    entries = [{
+        "dataset_id": "ds1", "fov_id": "ok_fov", "path": "ok_fov", "fs": 7.5,
+        "has_manual_masks": False, "has_longitudinal_ids": False,
+        "has_synthetic_injections": False, "quality_tier": "high",
+    }]
+    manifest_path = _write_manifest(tmp_path, entries)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        report = run_benchmark(manifest_path, output_dir)
+
+    assert report.ablations == []
+    assert report.fov_results[0].ablation is None
+    assert (output_dir / "ok_fov").exists()
+    assert (output_dir / "logs" / "ok_fov.log").exists()

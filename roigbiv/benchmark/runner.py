@@ -31,6 +31,8 @@ class FovRunResult:
     fov_id: str
     dataset_id: str
     status: str                       # "success" | "error"
+    ablation: Optional[str] = None    # ablation preset name, or None for a
+                                       # legacy/non-ablation run
     duration_s: Optional[float] = None
     output_dir: Optional[str] = None
     log_path: Optional[str] = None
@@ -53,6 +55,8 @@ class BenchmarkRunReport:
     git_dirty: Optional[bool]
     hardware: dict
     roigbiv_version: Optional[str]
+    ablations: list            # list[str] — resolved ablation names run, in
+                                # order; [] for a legacy/non-ablation run
     fov_results: list          # list[FovRunResult]
 
     def to_json_dict(self) -> dict:
@@ -174,15 +178,22 @@ def _resolve_entry_tif(entry, source_path: Path) -> Path:
     return tifs[0]
 
 
-def _run_one_fov(entry, source_path: Path, fov_output_dir: Path, log_path: Path) -> FovRunResult:
+def _run_one_fov(entry, source_path: Path, fov_output_dir: Path, log_path: Path,
+                  ablation_name: Optional[str] = None) -> FovRunResult:
     """Run the pipeline on one manifest entry, capturing stdout/stderr to
     log_path. Returns a fully populated FovRunResult. Never raises —
     every failure mode (discovery, optics confirmation, abort, generic
     exception) is caught and recorded on the result.
+
+    ablation_name : if given, looked up in roigbiv.benchmark.ablations and
+        applied as the highest-precedence config override (wins over the
+        lens/optics profile bundle, since an ablation is an intentional
+        experimental override, not a lens-tuning default). None (default)
+        reproduces the exact pre-#33 behavior.
     """
     result = FovRunResult(
         fov_id=entry.fov_id, dataset_id=entry.dataset_id, status="error",
-        output_dir=str(fov_output_dir),
+        ablation=ablation_name, output_dir=str(fov_output_dir),
     )
 
     # Everything below is wrapped in a single top-level handler so a setup
@@ -206,6 +217,11 @@ def _run_one_fov(entry, source_path: Path, fov_output_dir: Path, log_path: Path)
         from roigbiv.pipeline.types import PipelineConfig
         from roigbiv.pipeline.resume import compute_cfg_fingerprint
 
+        ablation_overrides: dict = {}
+        if ablation_name is not None:
+            from roigbiv.benchmark.ablations import get_ablation
+            ablation_overrides = get_ablation(ablation_name)
+
         overrides = merged_overrides(
             entry.lens_type,
             base={
@@ -214,7 +230,7 @@ def _run_one_fov(entry, source_path: Path, fov_output_dir: Path, log_path: Path)
                 "output_dir": fov_output_dir,
                 "no_viewer": True,
             },
-            explicit_dicts=[],
+            explicit_dicts=[ablation_overrides],
         )
         cfg = PipelineConfig(**overrides)
         result.config_used = cfg.summary_for_log()
@@ -267,18 +283,34 @@ def _run_one_fov(entry, source_path: Path, fov_output_dir: Path, log_path: Path)
         return result
 
 
-def run_benchmark(manifest_path: Path, output_dir: Path) -> BenchmarkRunReport:
+def run_benchmark(manifest_path: Path, output_dir: Path,
+                   ablations: Optional[list] = None) -> BenchmarkRunReport:
     """Load + validate the manifest, run the current ROIGBIV pipeline on
     every entry, and return a BenchmarkRunReport. Writes per-FOV output
     dirs and per-FOV log files under output_dir as a side effect (log
     files are written incrementally, per FOV, as each entry completes —
     NOT deferred to the end).
 
+    ablations : optional list of ablation preset names (see
+        roigbiv.benchmark.ablations). ``"all"`` expands to every registered
+        preset. Names are resolved and validated up front — before any FOV
+        runs — so an unknown name raises with zero side effects, the same
+        fail-fast contract as manifest validation. None/empty (default)
+        reproduces the exact pre-#33 behavior: a single flat run with no
+        ablation grouping.
+
+        When ablations are given, each manifest entry is run once per
+        ablation, and outputs/logs are grouped into a self-contained
+        subtree per ablation: output_dir/<ablation_name>/<fov_id>/... and
+        output_dir/<ablation_name>/logs/<fov_id>.log. The legacy (no
+        ablations) layout — output_dir/<fov_id>/..., output_dir/logs/
+        <fov_id>.log — is unchanged.
+
     Raises ManifestError / FileNotFoundError if the manifest itself cannot
-    be loaded/parsed — the caller (CLI) is responsible for turning that
-    into exit code 2 before any FOV has run. Per-FOV failures never raise
-    out of this function; they are recorded on the corresponding
-    FovRunResult instead.
+    be loaded/parsed, or ValueError if an ablation name is unknown — the
+    caller (CLI) is responsible for turning that into exit code 2 before
+    any FOV has run. Per-FOV failures never raise out of this function;
+    they are recorded on the corresponding FovRunResult instead.
     """
     from datetime import datetime, timezone
     from roigbiv.benchmark.schema import load_manifest, validate_manifest, ManifestError
@@ -294,31 +326,47 @@ def run_benchmark(manifest_path: Path, output_dir: Path) -> BenchmarkRunReport:
             + "; ".join(str(e) for e in errors)
         )
 
+    resolved_ablations: list = []
+    if ablations:
+        from roigbiv.benchmark.ablations import ABLATIONS, ALL, get_ablation
+        if ALL in ablations:
+            resolved_ablations = sorted(ABLATIONS)
+        else:
+            resolved_ablations = list(dict.fromkeys(ablations))  # de-dup, preserve order
+            for name in resolved_ablations:
+                get_ablation(name)  # raises ValueError on an unknown name — fail fast
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir = output_dir / "logs"
 
     repo_dir = Path(__file__).resolve().parents[2]  # roigbiv/benchmark/runner.py -> repo root
 
     fov_results: list = []
-    for entry in manifest.entries:
-        fov_output_dir = output_dir / entry.fov_id
-        log_path = logs_dir / f"{entry.fov_id}.log"
-        t_fov = time.perf_counter()
-        result = _run_one_fov(entry, manifest.source_path, fov_output_dir, log_path)
-        elapsed = time.perf_counter() - t_fov
-        if result.status == "success":
-            counts = result.roi_counts
-            print(
-                f"[{entry.fov_id}] OK ({elapsed:.1f}s) — "
-                f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
-                f"reject={counts.get('reject', 0)}",
-                flush=True,
-            )
-        else:
-            print(f"[{entry.fov_id}] ERROR ({elapsed:.1f}s) — {result.error}",
-                  file=sys.stderr, flush=True)
-        fov_results.append(result)
+    ablation_groups = resolved_ablations if resolved_ablations else [None]
+    for ablation_name in ablation_groups:
+        if ablation_name is not None:
+            print(f"=== ablation: {ablation_name} ===", flush=True)
+        group_dir = output_dir if ablation_name is None else output_dir / ablation_name
+        logs_dir = group_dir / "logs"
+        for entry in manifest.entries:
+            fov_output_dir = group_dir / entry.fov_id
+            log_path = logs_dir / f"{entry.fov_id}.log"
+            t_fov = time.perf_counter()
+            result = _run_one_fov(entry, manifest.source_path, fov_output_dir,
+                                   log_path, ablation_name)
+            elapsed = time.perf_counter() - t_fov
+            if result.status == "success":
+                counts = result.roi_counts
+                print(
+                    f"[{entry.fov_id}] OK ({elapsed:.1f}s) — "
+                    f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
+                    f"reject={counts.get('reject', 0)}",
+                    flush=True,
+                )
+            else:
+                print(f"[{entry.fov_id}] ERROR ({elapsed:.1f}s) — {result.error}",
+                      file=sys.stderr, flush=True)
+            fov_results.append(result)
 
     finished = datetime.now(timezone.utc)
     report = BenchmarkRunReport(
@@ -331,6 +379,7 @@ def run_benchmark(manifest_path: Path, output_dir: Path) -> BenchmarkRunReport:
         git_dirty=_git_dirty(repo_dir),
         hardware=_hardware_info(),
         roigbiv_version=_roigbiv_version(),
+        ablations=resolved_ablations,
         fov_results=fov_results,
     )
     return report

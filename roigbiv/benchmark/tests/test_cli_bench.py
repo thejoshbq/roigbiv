@@ -112,3 +112,77 @@ def test_run_manifest_invalid_returns_two(tmp_path: Path) -> None:
 def test_cli_requires_subcommand() -> None:
     with pytest.raises(SystemExit):
         main([])
+
+
+# ---------------------------------------------------------------------------
+# --ablation (issue #33)
+# ---------------------------------------------------------------------------
+
+def test_run_with_ablation_flag_groups_output(tmp_path: Path, capsys) -> None:
+    manifest_dict = {"entries": [_valid_entry_dict(tmp_path, "fov1")]}
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_yaml(manifest_dict, manifest_path)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        result = main(["run", "--manifest", str(manifest_path),
+                       "--output-dir", str(output_dir), "--ablation", "raw_only"])
+
+    assert result == 0
+    assert (output_dir / "raw_only" / "fov1").exists()
+    with open(output_dir / "benchmark_run.json") as f:
+        report = json.load(f)
+    assert report["ablations"] == ["raw_only"]
+    captured = capsys.readouterr()
+    assert "ablation summary" in captured.out
+
+
+def test_run_with_multiple_ablations(tmp_path: Path) -> None:
+    manifest_dict = {"entries": [_valid_entry_dict(tmp_path, "fov1")]}
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_yaml(manifest_dict, manifest_path)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        result = main(["run", "--manifest", str(manifest_path),
+                       "--output-dir", str(output_dir),
+                       "--ablation", "raw_only", "stage3_off"])
+
+    assert result == 0
+    assert (output_dir / "raw_only" / "fov1").exists()
+    assert (output_dir / "stage3_off" / "fov1").exists()
+    with open(output_dir / "benchmark_run.json") as f:
+        report = json.load(f)
+    assert report["ablations"] == ["raw_only", "stage3_off"]
+
+
+def test_run_with_all_ablation_sentinel(tmp_path: Path) -> None:
+    from roigbiv.benchmark.ablations import ABLATIONS
+
+    manifest_dict = {"entries": [_valid_entry_dict(tmp_path, "fov1")]}
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_yaml(manifest_dict, manifest_path)
+    output_dir = tmp_path / "bench_out"
+
+    with patch("roigbiv.pipeline.run.run_pipeline", return_value=_fake_fov()):
+        result = main(["run", "--manifest", str(manifest_path),
+                       "--output-dir", str(output_dir), "--ablation", "all"])
+
+    assert result == 0
+    with open(output_dir / "benchmark_run.json") as f:
+        report = json.load(f)
+    assert set(report["ablations"]) == set(ABLATIONS)
+
+
+def test_run_with_unknown_ablation_raises_systemexit(tmp_path: Path) -> None:
+    # argparse's own `choices=` validation rejects an unknown --ablation value
+    # before _cmd_run is ever entered — this is argparse's SystemExit(2), not
+    # _cmd_run's `return 2`, so main() never returns here.
+    manifest_dict = {"entries": [_valid_entry_dict(tmp_path, "fov1")]}
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_yaml(manifest_dict, manifest_path)
+    output_dir = tmp_path / "bench_out"
+
+    with pytest.raises(SystemExit):
+        main(["run", "--manifest", str(manifest_path),
+             "--output-dir", str(output_dir), "--ablation", "not-a-real-one"])

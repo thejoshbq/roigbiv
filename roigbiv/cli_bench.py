@@ -1,7 +1,9 @@
 """Terminal entry point: roigbiv-bench — the benchmark harness runner.
 
 Subcommands:
-  run    — run the current ROIGBIV pipeline over every entry in a manifest.
+  run    — run the current ROIGBIV pipeline over every entry in a manifest,
+           optionally under one or more named ablation presets (--ablation;
+           see roigbiv/benchmark/ablations.py, issue #33).
 
 Deliberately subcommand-based (argparse.add_subparsers), distinct from the
 flat single-command `roigbiv-benchmark` (manifest validator, issue #27).
@@ -41,17 +43,32 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Path to a validated benchmark manifest (YAML/JSON).")
     run_p.add_argument("--output-dir", type=Path, required=True,
                         help="Directory to write per-FOV outputs, logs, and benchmark_run.json into.")
+    from roigbiv.benchmark.ablations import list_ablations
+    run_p.add_argument(
+        "--ablation", type=str, nargs="+", default=None,
+        choices=list_ablations(),
+        help=(
+            "Run one or more named ablation presets (see "
+            "roigbiv/benchmark/ablations.py) instead of the plain current "
+            "pipeline. Space-separated for multiple, or 'all' to run every "
+            "registered preset. Outputs are grouped under "
+            "output_dir/<ablation_name>/. Omit entirely for the legacy "
+            "single-run behavior (flat output_dir layout, no ablation "
+            "overrides applied)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
     if args.cmd == "run":
-        return _cmd_run(args.manifest, args.output_dir)
+        return _cmd_run(args.manifest, args.output_dir, args.ablation)
 
     parser.print_help(sys.stderr)
     return 2
 
 
-def _cmd_run(manifest_path: Path, output_dir: Path) -> int:
+def _cmd_run(manifest_path: Path, output_dir: Path,
+              ablations: Optional[list] = None) -> int:
     from roigbiv.benchmark.runner import run_benchmark
     from roigbiv.benchmark.schema import ManifestError
 
@@ -60,8 +77,12 @@ def _cmd_run(manifest_path: Path, output_dir: Path) -> int:
         return 2
 
     try:
-        report = run_benchmark(manifest_path, output_dir)
-    except (ManifestError, FileNotFoundError) as exc:
+        report = run_benchmark(manifest_path, output_dir, ablations=ablations)
+    except (ManifestError, FileNotFoundError, ValueError) as exc:
+        # ValueError: run_benchmark's own ablation-name validation. argparse's
+        # `choices=` already catches this for the CLI path (SystemExit(2)
+        # before _cmd_run is ever entered) — this is defense-in-depth for
+        # run_benchmark's other callers (it's a public library function).
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -77,8 +98,32 @@ def _cmd_run(manifest_path: Path, output_dir: Path) -> int:
         f"({report.total_runtime_s:.1f}s total). "
         f"Report: {report_path}"
     )
+    if report.ablations:
+        _print_ablation_summary(report)
 
     return 1 if n_err > 0 else 0
+
+
+def _print_ablation_summary(report) -> None:
+    """Per-ablation pass/fail + aggregate ROI counts, side by side. Minimal
+    console table — full comparison-report rendering is issue #32's job, not
+    this module's."""
+    from collections import defaultdict
+
+    groups: dict = defaultdict(list)
+    for r in report.fov_results:
+        groups[r.ablation].append(r)
+
+    print("\nablation summary:")
+    print(f"  {'ablation':<28} {'ok/total':>9} {'accept':>7} {'flag':>6} {'reject':>7}")
+    for name in report.ablations:  # preserves run order from the report
+        results = groups.get(name, [])
+        ok = sum(1 for r in results if r.status == "success")
+        accept = sum(r.roi_counts.get("accept", 0) for r in results)
+        flag = sum(r.roi_counts.get("flag", 0) for r in results)
+        reject = sum(r.roi_counts.get("reject", 0) for r in results)
+        ok_total = f"{ok}/{len(results)}"
+        print(f"  {name:<28} {ok_total:>9} {accept:>7} {flag:>6} {reject:>7}")
 
 
 if __name__ == "__main__":
