@@ -79,7 +79,9 @@ integrated algorithm, see [`docs/design/OVERVIEW.md`](docs/design/OVERVIEW.md).*
 
 **→ Architecture direction:** the pipeline is pivoting from the destructive subtractive cascade
 toward a non-destructive candidate union + joint validation — see
-[ADR-0001](docs/adr/0001-non-destructive-candidate-union.md).
+[ADR-0001](docs/adr/0001-non-destructive-candidate-union.md). The criteria and migration path
+for when `candidate_union` becomes the default are recorded in
+[ADR-0002](docs/adr/0002-cascade-default-deprecation-criteria.md).
 
 ---
 

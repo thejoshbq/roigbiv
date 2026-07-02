@@ -816,7 +816,7 @@ For the exhaustive per-threshold rationale with method-level citations, see
 ### Where each source of truth lives
 | Intent | Source of truth |
 |---|---|
-| Architecture decisions (direction, deprecations) | `docs/adr/` — [ADR-0001: non-destructive candidate union](../adr/0001-non-destructive-candidate-union.md) |
+| Architecture decisions (direction, deprecations) | `docs/adr/` — [ADR-0001: non-destructive candidate union](../adr/0001-non-destructive-candidate-union.md), [ADR-0002: cascade deprecation criteria](../adr/0002-cascade-default-deprecation-criteria.md) |
 | Pipeline behavior, gate logic, ROI schema | `docs/roi-pipeline-specification.md` (design intent) |
 | Algorithm methods, per-threshold citations | `docs/publication/algorithms_v2.md` (as-built, authoritative) |
 | Runtime defaults | `roigbiv/pipeline/types.py::PipelineConfig` (**canonical**) |
