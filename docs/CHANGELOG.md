@@ -52,6 +52,14 @@ All notable changes to roigbiv are documented here.
   flow; L+S+T decomposition out of scope). Linked from `README.md` and
   `docs/design/OVERVIEW.md` §14; also fixes README's stale
   `docs/OVERVIEW.md` link (the file now lives at `docs/design/OVERVIEW.md`).
+- `docs/adr/0002-cascade-default-deprecation-criteria.md` — operationalizes
+  ADR-0001 with fixed, benchmark-checkable go/no-go criteria (detection F1,
+  split/merge counts, false-transient rate, review burden, runtime) for
+  when `candidate_union` becomes the default `pipeline_mode`, plus the
+  migration path once that criteria set passes. Does **not** flip
+  `DEFAULT_PIPELINE_MODE` or implement any benchmark tooling — planning doc
+  only, per roadmap item H5. Linked from `README.md` and
+  `docs/design/OVERVIEW.md` §14.
 - `--n-workers` flag on `roigbiv-pipeline`: in workspace mode (directory
   input), > 1 fans heavy pipeline calls through `pipeline/batch.run_batch`
   with the existing 2-worker GPU lock. Light post-pipeline steps
