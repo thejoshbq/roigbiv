@@ -321,6 +321,7 @@ def _write_stage4_outputs(
     stage4_rois: list,
     cfg: PipelineConfig,
     output_dir: Path,
+    manifest_path: Path,
 ) -> None:
     """Write Stage 4 per-FOV outputs: masks, contrast maps, corr scores, report."""
     import json
@@ -356,6 +357,7 @@ def _write_stage4_outputs(
     n_flag = sum(1 for r in stage4_rois if r.gate_outcome == "flag")
     n_rej = sum(1 for r in stage4_rois if r.gate_outcome == "reject")
     (stage4_dir / "stage4_report.json").write_text(json.dumps({
+        "run_manifest_path": str(manifest_path) if manifest_path.exists() else None,
         "detected": n_det,
         "accepted": 0,   # by design — Gate 4 has no accept tier
         "flagged": n_flag,
@@ -455,6 +457,20 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Reproducibility bundle — written early (even before Stage 1) so a run
+    # that aborts partway still leaves a manifest; write_manifest() is
+    # fail-open and never raises, but we belt-and-suspenders it here too. It
+    # is re-written after optics auto-scale (below) once cfg reflects the
+    # values Stage 1+ actually run with. Stage-report writers check
+    # manifest_path.exists() rather than assuming this succeeded.
+    from roigbiv.pipeline import manifest as _manifest
+    manifest_path = _manifest.run_manifest_path(output_dir)
+    try:
+        _manifest.write_manifest(cfg, tif_path, output_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(fmt.sub_phase(f"WARN: reproducibility manifest write failed: {exc}"),
+              flush=True)
+
     stage_timings: dict = {}
     warnings: list[str] = []
 
@@ -545,6 +561,15 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
     # still records the measured scale for the user to inspect.
     if rp.should_run("stage1") and auto_scale_active(cfg):
         _apply_auto_scale(cfg, fov)
+
+    # Re-write the reproducibility manifest now that cfg reflects any
+    # auto-scale adaptation — the earlier write (pre-foundation, for
+    # abort-safety) may otherwise capture pre-adaptation param values.
+    try:
+        _manifest.write_manifest(cfg, tif_path, output_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(fmt.sub_phase(f"WARN: reproducibility manifest re-write failed: {exc}"),
+              flush=True)
 
     # ── Foundation-only short-circuit ─────────────────────────────────────
     # Stop before any ROI detection so the motion-corrected FOV + summary
@@ -645,6 +670,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
                          stage1_mask_img)
 
         stage1_report = {
+            "run_manifest_path": str(manifest_path) if manifest_path.exists() else None,
             "detected": n_detected,
             "accepted": n_accept,
             "flagged": n_flag,
@@ -787,6 +813,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         tifffile.imwrite(str(output_dir / "stage2" / "stage2_masks.tif"),
                          stage2_mask_img)
         (output_dir / "stage2" / "stage2_report.json").write_text(json.dumps({
+            "run_manifest_path": str(manifest_path) if manifest_path.exists() else None,
             "detected": n2_det, "accepted": n2_acc, "flagged": n2_flag,
             "rejected": n2_rej,
             "rois": [r.to_serializable() for r in stage2_rois],
@@ -944,6 +971,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         np.save(str(output_dir / "stage3" / "stage3_events.npy"),
                 np.array(events_blob, dtype=object), allow_pickle=True)
         (output_dir / "stage3" / "stage3_report.json").write_text(json.dumps({
+            "run_manifest_path": str(manifest_path) if manifest_path.exists() else None,
             "detected": n3_det, "accepted": n3_acc, "flagged": n3_flag,
             "rejected": n3_rej,
             "rois": [r.to_serializable() for r in stage3_rois],
@@ -1059,7 +1087,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         n4_rej = sum(1 for r in stage4_rois if r.gate_outcome == "reject")
         print(fmt.gate_outcome(4, n4_det, 0, n4_flag, n4_rej), flush=True)
 
-        _write_stage4_outputs(fov, stage4_rois, cfg, output_dir)
+        _write_stage4_outputs(fov, stage4_rois, cfg, output_dir, manifest_path)
         fov.rois.extend([r for r in stage4_rois if r.gate_outcome != "reject"])
         fov.stage_counts["stage4"] = {
             "detected": n4_det,
