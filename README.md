@@ -81,6 +81,9 @@ integrated algorithm, see [`docs/design/OVERVIEW.md`](docs/design/OVERVIEW.md).*
 toward a non-destructive candidate union + joint validation — see
 [ADR-0001](docs/adr/0001-non-destructive-candidate-union.md).
 
+**→ Limitations:** for what ROI G. Biv does *not* claim — detection scope, denoising
+validation, calibration scope, and more — see [`docs/limitations.md`](docs/limitations.md).
+
 ---
 
 ## Role in Ecosystem
