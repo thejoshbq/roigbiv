@@ -32,6 +32,9 @@ from roigbiv.pipeline import fmt
 from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.types import FOVData, PipelineConfig, BranchView
 
+# RNG seed for reproducibility (torch.manual_seed, torch.cuda.manual_seed_all)
+RNG_SEED = 0
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Motion correction (Suite2p wrapper)
@@ -277,9 +280,9 @@ def _binned_svd_gpu(
     # subspace it returns drifts run-to-run (mean principal-angle cosine ≈0.65
     # on real movies), which propagates into S → vcorr_S → Cellpose channel 2
     # and shifts borderline detections.
-    torch.manual_seed(0)
+    torch.manual_seed(RNG_SEED)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(0)
+        torch.cuda.manual_seed_all(RNG_SEED)
     # Move M_bin^T (N_pix, T_bin) to GPU; if it doesn't fit, fall back to CPU
     try:
         A = torch.from_numpy(M_bin.T).to(device)  # shape (N_pix, T_bin)
@@ -290,7 +293,7 @@ def _binned_svd_gpu(
     except (torch.cuda.OutOfMemoryError, RuntimeError):
         # GPU OOM or unavailable — fall back to CPU. Re-seed since the failed
         # GPU call already consumed RNG state.
-        torch.manual_seed(0)
+        torch.manual_seed(RNG_SEED)
         A = torch.from_numpy(M_bin.T)
         U_t, S_t, V_t = torch.svd_lowrank(A, q=int(n_svd), niter=2)
         U = U_t.numpy().astype(np.float32)
