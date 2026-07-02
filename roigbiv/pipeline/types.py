@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -105,6 +105,64 @@ def _jsonable_features(features: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+@dataclass
+class CandidateROI:
+    """A pre-final candidate detection under ADR-0001's non-destructive
+    candidate-union architecture (docs/adr/0001-non-destructive-candidate-union.md).
+
+    Distinct from ROI: a CandidateROI is one detector's proposal before joint
+    deconfliction/validation decides its fate. Field order matters — dataclass
+    requires all no-default fields before any defaulted field.
+    """
+    candidate_id: str
+    source_detector: str                    # "cellpose" | "suite2p" | "template_sweep" | "tonic_search"
+    source_stage: int                       # 1, 2, 3, or 4
+    branch: str                             # BranchView.branch_name (by value, not object)
+    mask: np.ndarray                        # (H, W) bool
+    sparse_pixels: Tuple[np.ndarray, np.ndarray]   # (flat indices into H*W, values)
+    centroid: Tuple[float, float]           # (cy, cx)
+    bbox: Tuple[int, int, int, int]         # (y_min, x_min, y_max, x_max)
+    area: int
+
+    # Stage-specific raw score; NOT normalized to [0, 1] — each source_detector
+    # has its own native scale (mirrors ROI's cellpose_prob/iscell_prob/etc.)
+    detector_score: Optional[float] = None
+
+    # "pending" | "accepted" | "rejected" — set by the future deconfliction step
+    validation_status: str = "pending"
+
+    # Free-form detector params / config snapshot
+    provenance: dict = field(default_factory=dict)
+
+    # Frame indices with supporting temporal evidence; empty for pure-spatial
+    # (Stage 1) candidates
+    seed_frames: list = field(default_factory=list)
+
+    # Spatial/summary-image-derived features (parallel to ROI.features)
+    summary_features: dict = field(default_factory=dict)
+
+    # Trace-derived features (parallel to compute_temporal_features output)
+    temporal_features: dict = field(default_factory=dict)
+
+    def to_serializable(self) -> dict:
+        """Return a JSON-safe dict (drops mask and sparse_pixels, keeps metadata)."""
+        return {
+            "candidate_id": self.candidate_id,
+            "source_detector": self.source_detector,
+            "source_stage": int(self.source_stage),
+            "branch": self.branch,
+            "centroid": [float(self.centroid[0]), float(self.centroid[1])],
+            "bbox": [int(v) for v in self.bbox],
+            "area": int(self.area),
+            "detector_score": None if self.detector_score is None else float(self.detector_score),
+            "validation_status": self.validation_status,
+            "seed_frames": [int(f) for f in self.seed_frames],
+            "provenance": _jsonable_features(self.provenance),
+            "summary_features": _jsonable_features(self.summary_features),
+            "temporal_features": _jsonable_features(self.temporal_features),
+        }
 
 
 @dataclass
