@@ -2,11 +2,15 @@
 
 Pages in a top nav:
 
-* **Pipeline** — scan a workspace, set params, run the pipeline.
-* **Review** — unified viewing + HITL corrections. Multi-session grid
-  canvas, slide-in metadata drawer, overlay toggle, Add ROI draw mode,
-  polygon / freehand / eraser, merge / split / edit / relabel, additive
-  corrections log. (The former /viewer path redirects here.)
+* **Pipeline** — scan a workspace, set motion-correction params, run the
+  pipeline (currently scoped to Foundation only — see
+  ``roigbiv/ui/pages/process.py``).
+
+The Review page (unified viewing + HITL corrections; ``roigbiv/ui/pages/
+review.py``) is currently unrouted while the UI is refocused on
+motion-correction optimization. Its code and the Flask ROI-editor routes are
+left in place (dormant, not deleted) for a future re-enable — just re-add it
+to ``PAGES`` and its ``/viewer`` redirect below.
 
 Registry browsing/maintenance lives in the ``roigbiv-registry`` CLI
 (``list``, ``show``, ``migrate``, ``backfill``, ...). The UI never needed
@@ -33,7 +37,7 @@ from dash import Input, Output, State, dcc, html
 
 from roigbiv.ui.components import errors as error_components
 from roigbiv.ui.logging import configure_ui_logging
-from roigbiv.ui.pages import process, review
+from roigbiv.ui.pages import process
 from roigbiv.ui.pages.review import (
     MAIN_COL_ID,
     RIGHT_SIDEBAR_COL_ID,
@@ -59,7 +63,6 @@ THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
     ("/pipeline", "Pipeline", process),
-    ("/review",   "Review",   review),
 )
 
 
@@ -192,10 +195,6 @@ def _wire_routes(app: dash.Dash) -> None:
     def _render(pathname: str):  # noqa: ANN001
         if not pathname or pathname == "/":
             return process.layout()
-        # Backward-compat: the old standalone Viewer has been folded into
-        # Review. Bookmarks to /viewer still land somewhere sensible.
-        if pathname.rstrip("/") == "/viewer":
-            return review.layout()
         # The Process page was renamed to Pipeline (/process → /pipeline);
         # registry browsing was retired. Route both stragglers to the page.
         if pathname.rstrip("/") in ("/process", "/registry"):
@@ -203,6 +202,8 @@ def _wire_routes(app: dash.Dash) -> None:
         for path, _, page in PAGES:
             if pathname.rstrip("/") == path.rstrip("/"):
                 return page.layout()
+        # Review (and its old /viewer alias) is currently unrouted while the
+        # UI is refocused on motion-correction — falls through here.
         return dbc.Alert(
             f"Unknown page: {pathname}. Navigate via the top bar.",
             color="warning",

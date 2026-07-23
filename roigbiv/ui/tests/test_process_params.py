@@ -1,8 +1,11 @@
-"""Guards for the Process page motion-correction backend selector.
+"""Guards for the Pipeline page's motion-correction-only params form.
 
-The CLI accepts three MC backends (rowwise-pcc, phasecorr, legacy); the UI
-selector must offer the same set so every CLI-supported backend is reachable
-from the web interface — and the default must stay unchanged.
+The Pipeline page is scoped to Foundation/motion-correction only (Stage 1-4,
+classification, and registry controls were removed; the page always runs a
+foundation-only dry run). The CLI accepts three MC backends (rowwise-pcc,
+phasecorr, legacy); the UI selector must offer the same set so every
+CLI-supported backend is reachable from the web interface — and the default
+must stay unchanged.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,25 +23,33 @@ PARAM_IDS = [
     "roigbiv-param-tau",
     "roigbiv-param-k",
     "roigbiv-param-mc-backend",
+    "roigbiv-param-force-cpu",
     "roigbiv-param-mc-strip-height",
-    "roigbiv-param-profile",
-    "roigbiv-param-model",
-    "roigbiv-param-channels",
-    "roigbiv-param-flow-threshold",
-    "roigbiv-param-cellprob-threshold",
-    "roigbiv-param-diameter",
-    "roigbiv-param-use-denoise",
-    "roigbiv-param-tile-norm-blocksize",
-    "roigbiv-param-min-area",
-    "roigbiv-param-max-area",
-    "roigbiv-param-min-solidity",
-    "roigbiv-param-max-eccentricity",
-    "roigbiv-param-scout",
-    "roigbiv-param-foundation-only",
-    "roigbiv-param-stage-2",
-    "roigbiv-param-stage-3",
-    "roigbiv-param-stage-4",
-    "roigbiv-param-resume",
+    "roigbiv-param-mc-max-displacement",
+    "roigbiv-param-mc-n-template-iters",
+    "roigbiv-param-mc-subpixel-upsample",
+    "roigbiv-param-mc-frame-batch",
+    "roigbiv-param-mc-smooth-sigma-rows",
+    "roigbiv-param-mc-smooth-sigma-time",
+    "roigbiv-param-mc-strip-confidence-weight",
+    "roigbiv-param-mc-prefilter",
+    "roigbiv-param-mc-prefilter-sigma-low",
+    "roigbiv-param-mc-prefilter-sigma-high",
+    "roigbiv-param-mc-sima-env",
+    "roigbiv-param-mc-granularity",
+    "roigbiv-param-mc-s2p-block-h",
+    "roigbiv-param-mc-s2p-block-w",
+    "roigbiv-param-mc-s2p-smooth-sigma",
+    "roigbiv-param-mc-s2p-smooth-sigma-time",
+    "roigbiv-param-mc-s2p-maxregshift",
+    "roigbiv-param-mc-s2p-nonrigid",
+    "roigbiv-param-mc-s2p-maxregshift-nr",
+    "roigbiv-param-mc-s2p-nimg-init",
+    "roigbiv-param-mc-s2p-two-step-registration",
+    "roigbiv-param-mc-s2p-one-photon-reg",
+    "roigbiv-param-mc-s2p-spatial-hp-reg",
+    "roigbiv-param-mc-s2p-pre-smooth",
+    "roigbiv-param-mc-s2p-spatial-taper",
     "roigbiv-param-slack-channel",
 ]
 
@@ -128,10 +139,9 @@ def test_every_param_has_a_tooltip_icon():
 
 def test_every_param_field_has_help_text():
     # _field_row / _switch_row hard-subscript HELP_TEXT[target_id]; a field added
-    # without a HELP_TEXT entry 500s the whole Process page on render (this is
-    # what KeyError: 'roigbiv-param-slack-channel' was). Auto-discover the field
-    # ids from the rendered form rather than trusting a hand-kept list — the list
-    # is exactly what drifted last time.
+    # without a HELP_TEXT entry 500s the whole Pipeline page on render. Auto-
+    # discover the field ids from the rendered form rather than trusting a
+    # hand-kept list — the list is exactly what drifted last time.
     field_ids = {
         cid for cid in _ids(_params_form())
         if isinstance(cid, str) and cid.startswith("roigbiv-param-")
@@ -150,82 +160,73 @@ def test_tooltips_target_their_icons():
     assert not missing, f"params without a Tooltip target: {missing}"
 
 
-def test_params_grouped_into_stage_cards():
-    # The flat form is now grouped under per-stage headers.
+def test_params_grouped_into_cards():
+    # The flat form is grouped under per-topic headers.
     titles = _h6_texts(_params_form())
-    for expected in ("Foundation", "Stage 1 · Cellpose detection", "Stage control"):
-        assert expected in titles, f"missing stage group header: {expected!r}"
+    for expected in ("Foundation", "rowwise-pcc", "legacy (SIMA)",
+                      "phasecorr (Suite2p)", "Notifications"):
+        assert expected in titles, f"missing group header: {expected!r}"
 
 
-def test_foundation_group_contains_calibration_params():
-    # k_background lives under Foundation (background SVD rank), not Stage 1.
-    from roigbiv.ui.pages.process import _stage_card  # noqa: F401 — sanity import
+def test_no_stage1_or_stage_control_params_remain():
+    # Stage 1-4 / classification / registry-override controls were removed —
+    # the page always runs a foundation-only dry run now.
+    ids = _ids(_params_form())
+    removed = (
+        "roigbiv-param-profile", "roigbiv-param-model",
+        "roigbiv-param-channels", "roigbiv-param-flow-threshold",
+        "roigbiv-param-cellprob-threshold", "roigbiv-param-diameter",
+        "roigbiv-param-use-denoise", "roigbiv-param-tile-norm-blocksize",
+        "roigbiv-param-min-area", "roigbiv-param-max-area",
+        "roigbiv-param-min-solidity", "roigbiv-param-max-eccentricity",
+        "roigbiv-param-scout", "roigbiv-param-foundation-only",
+        "roigbiv-param-stage-2", "roigbiv-param-stage-3",
+        "roigbiv-param-stage-4", "roigbiv-param-resume",
+        "roigbiv-param-override",
+    )
+    present = [pid for pid in removed if pid in ids]
+    assert not present, f"stage-1/stage-control ids should be gone: {present}"
+
+
+def test_foundation_group_contains_core_params():
     foundation = next(c for c in _walk(_params_form())
                       if type(c).__name__ == "Card"
                       and "Foundation" in _h6_texts(c))
     fids = _ids(foundation)
     for pid in ("roigbiv-param-fs", "roigbiv-param-tau", "roigbiv-param-k",
-                "roigbiv-param-mc-backend"):
+                "roigbiv-param-mc-backend", "roigbiv-param-force-cpu"):
         assert pid in fids, f"{pid} should be in the Foundation group"
-    # Cellpose params must NOT be in Foundation.
-    assert "roigbiv-param-flow-threshold" not in fids
 
 
-def test_stage1_group_contains_cellpose_params():
-    stage1 = next(c for c in _walk(_params_form())
-                  if type(c).__name__ == "Card"
-                  and any("Stage 1" in t for t in _h6_texts(c)))
-    sids = _ids(stage1)
-    assert "roigbiv-param-model" in sids
-    assert "roigbiv-param-flow-threshold" in sids
-    # diameter is the Cellpose soma-scale knob, set on the MC preview circle.
-    assert "roigbiv-param-diameter" in sids
-    assert "roigbiv-mc-suggest-btn" in sids
+def test_rowwise_group_contains_strip_regularization_knobs():
+    rowwise = next(c for c in _walk(_params_form())
+                   if type(c).__name__ == "Card"
+                   and "rowwise-pcc" in _h6_texts(c))
+    rids = _ids(rowwise)
+    for pid in ("roigbiv-param-mc-strip-height",
+                "roigbiv-param-mc-smooth-sigma-rows",
+                "roigbiv-param-mc-strip-confidence-weight",
+                "roigbiv-param-mc-prefilter"):
+        assert pid in rids
 
 
-def test_profile_select_offers_auto_and_concrete_profiles():
-    # The Profile dropdown offers 'auto' (recommended, first + default) plus the
-    # concrete profiles. 'auto' classifies the optics per-FOV and derives gates;
-    # concrete profiles pin the optics + expose the manual fields.
-    sel = _find_by_id(_params_form(), "roigbiv-param-profile")
-    values = _option_values(sel)
-    assert set(values) == {"auto", "grin", "prism", "generic"}
-    assert values[0] == "auto"            # recommended option listed first
-    assert sel.value == "auto"            # streamlined "upload → adapts" default
+def test_phasecorr_group_contains_tuned_s2p_knobs():
+    phasecorr = next(c for c in _walk(_params_form())
+                     if type(c).__name__ == "Card"
+                     and "phasecorr (Suite2p)" in _h6_texts(c))
+    pids = _ids(phasecorr)
+    for pid in ("roigbiv-param-mc-s2p-block-h", "roigbiv-param-mc-s2p-block-w",
+                "roigbiv-param-mc-s2p-one-photon-reg"):
+        assert pid in pids
 
 
-def test_profile_field_values_prism_applies_the_levers():
-    # The autofill resolver pulls every PRISM lever from the profile bundle,
-    # falling back to the grin/dataclass baseline for unset keys.
-    from roigbiv.ui.pages.process import _profile_field_values
-
-    v = _profile_field_values("prism")
-    assert v["channels"] == (0, 0)
-    assert v["cellpose_model"] == "cyto3"
-    assert v["use_denoise"] is False
-    assert v["diameter"] == 56
-    assert v["min_area"] == 900 and v["max_area"] == 9000
-    assert v["cellprob_threshold"] == 0.0
-    assert v["mc_strip_height"] == 48
-
-
-def test_profile_field_values_grin_is_dataclass_baseline():
-    from roigbiv.pipeline.types import PipelineConfig
-    from roigbiv.ui.pages.process import _PROFILE_AUTOFILL, _profile_field_values
-
-    base = PipelineConfig()
-    v = _profile_field_values("grin")
-    for key, _id in _PROFILE_AUTOFILL:
-        assert v[key] == getattr(base, key), f"grin {key} must match the dataclass default"
-
-
-def test_channels_str_round_trip():
-    from roigbiv.ui.pages.process import _channels_to_str, _parse_channels_value
-
-    assert _channels_to_str((0, 0)) == "0,0"
-    assert _parse_channels_value("0,0") == (0, 0)
-    assert _parse_channels_value("1,2") == (1, 2)
-    assert _parse_channels_value(None) == (1, 2)        # bad input → GRIN default
+def test_legacy_group_contains_sima_knobs():
+    legacy = next(c for c in _walk(_params_form())
+                 if type(c).__name__ == "Card"
+                 and "legacy (SIMA)" in _h6_texts(c))
+    lids = _ids(legacy)
+    assert "roigbiv-param-mc-sima-env" in lids
+    assert "roigbiv-param-mc-granularity" in lids
 
 
 def test_mc_fov_select_is_dbc_select(monkeypatch):
@@ -237,9 +238,6 @@ def test_mc_fov_select_is_dbc_select(monkeypatch):
 
     class _FakeState:
         workspace = None
-
-        def calibrated_diameter(self):
-            return None
 
     monkeypatch.setattr(proc, "get_app_state", lambda: _FakeState())
     sel = _find_by_id(proc._mc_preview_section(), "roigbiv-mc-fov-select")
@@ -259,9 +257,6 @@ def test_mc_preview_is_enlarged(monkeypatch):
     class _FakeState:
         workspace = None
 
-        def calibrated_diameter(self):
-            return None
-
     monkeypatch.setattr(proc, "get_app_state", lambda: _FakeState())
     graph = _find_by_id(proc._mc_preview_section(), "roigbiv-mc-preview")
     height = graph.style["height"]
@@ -269,25 +264,6 @@ def test_mc_preview_is_enlarged(monkeypatch):
     assert int(height[:-2]) >= 600, (
         f"MC preview height must stay enlarged (>=600px); got {height}"
     )
-
-
-def test_stage_control_reactivity():
-    # The form must mirror _on_run's early-stop precedence: scout / foundation-only
-    # force stage 2/3/4 + resume off+disabled; scout takes precedence over
-    # foundation-only. Tuple order:
-    #   (fo_disabled, s2_disabled, s2_value, s3_disabled, s3_value,
-    #    s4_disabled, s4_value, resume_disabled, resume_value)
-    from roigbiv.ui.pages.process import _stage_control_reactivity as react
-
-    neither = (False, False, True, False, True, False, True, False, False)
-    scout   = (True,  True,  False, True,  False, True,  False, True,  False)
-    found   = (False, True,  False, True,  False, True,  False, True,  False)
-
-    assert react(False, False) == neither
-    assert react(True, False) == scout
-    assert react(False, True) == found
-    assert react(True, True) == scout          # scout precedence over foundation-only
-    assert react(None, None) == neither        # None (unset switch) coerces to off
 
 
 def test_mc_preview_figure_input_branch(monkeypatch):
@@ -427,13 +403,7 @@ def test_app_state_selection_round_trip():
     assert st.selected_tifs == set()
 
 
-# ── Override switch + form persistence ───────────────────────────────────────
-
-def test_override_switch_present_with_help_text():
-    form = _params_form()
-    sw = _find_by_id(form, "roigbiv-param-override")
-    assert sw.value is False                       # opt-in: off by default
-    assert "roigbiv-param-override" in HELP_TEXT
+# ── Form persistence ──────────────────────────────────────────────────────
 
 
 def test_param_controls_persist_to_localstorage():
@@ -464,10 +434,7 @@ def test_launched_config_summary_renders_overrides():
         n_fovs=3, n_done=3, n_failed=0, logs=[], error=None,
         overrides={
             "fs": 7.5, "tau": 1.0,
-            "cellpose_model": "models/deployed/current_model",
-            "motion_correction_backend": "phasecorr", "channels": [0, 0],
-            "diameter": 12,
-            "enable_stage_2": True, "enable_stage_3": False, "enable_stage_4": True,
+            "motion_correction_backend": "phasecorr",
         },
     )
     card = _launched_config_summary(snap)
@@ -475,10 +442,7 @@ def test_launched_config_summary_renders_overrides():
     text = " ".join(
         c.children if isinstance(getattr(c, "children", None), str) else ""
         for c in _walk(card))
-    # Model is shown basename-only; the disabled stage is omitted from the list.
-    assert "current_model" in text
     assert "phasecorr" in text
-    assert "S2" in text and "S4" in text and "S3" not in text
 
 
 def test_launched_config_summary_none_before_run():

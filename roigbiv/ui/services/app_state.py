@@ -47,13 +47,6 @@ class AppState:
     # run. None means "all" (no scan yet / no explicit subset). Reset to the
     # full set on every scan so a fresh workspace starts all-selected.
     selected_tifs: Optional[set[str]] = None
-    # Stage-1 Cellpose diameter chosen on the motion-correction preview (drag the
-    # circle / "Suggest"). A single global scalar: PipelineConfig.diameter is one
-    # int applied to every FOV in the run. ``fov_stem`` is provenance for the
-    # readout only. ``None`` means "uncalibrated — use the form/cfg default".
-    # Survives a page reload (the form input reseeds from it) so a long
-    # foundation-only run can be calibrated, then continued, across a refresh.
-    calibration: Optional[dict] = None      # {"diameter_px": float, "fov_stem": str | None}
     _fov_cache: dict[str, _FOVCache] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _last_accessed: float = field(default_factory=time.monotonic)
@@ -72,35 +65,11 @@ class AppState:
                 calibration_path=workspace.calibration_path,
             )
             self._fov_cache.clear()
-            # A new scan starts uncalibrated — a diameter measured on the prior
-            # workspace's FOVs must not leak into the next run.
-            self.calibration = None
 
     def set_selected_tifs(self, values) -> None:
         """Store the user's TIF subset (an iterable of path strings)."""
         with self._lock:
             self.selected_tifs = {str(v) for v in (values or [])}
-
-    # ── Stage-1 diameter calibration ──────────────────────────────────────
-    def set_calibration(self, diameter_px: float, fov_stem: Optional[str] = None) -> None:
-        """Persist the diameter (px) chosen on the MC preview for this session."""
-        with self._lock:
-            self.calibration = {
-                "diameter_px": float(diameter_px),
-                "fov_stem": fov_stem,
-            }
-
-    def clear_calibration(self) -> None:
-        with self._lock:
-            self.calibration = None
-
-    def calibrated_diameter(self) -> Optional[int]:
-        """Rounded calibrated diameter (px), or ``None`` if uncalibrated."""
-        with self._lock:
-            cal = self.calibration
-        if not cal or cal.get("diameter_px") is None:
-            return None
-        return int(round(cal["diameter_px"]))
 
     def require_workspace(self) -> WorkspacePaths:
         if self.workspace is None:

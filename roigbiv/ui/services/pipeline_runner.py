@@ -117,6 +117,7 @@ class PipelineRunner:
         self._n_failed: int = 0
         self._error: Optional[str] = None
         self._results: list[FOVRunResult] = []
+        self._mc_metrics: dict[str, dict] = {}
         self._registry_config: Optional[RegistryConfig] = None
         self._slack_channel: Optional[str] = None
         self._current_stage: Optional[str] = None
@@ -236,6 +237,7 @@ class PipelineRunner:
         self._n_failed = 0
         self._error = None
         self._results = []
+        self._mc_metrics = {}
         self._current_stage = None
         self._overrides = None
         self._abort_event.clear()
@@ -265,8 +267,11 @@ class PipelineRunner:
                         self._logs.append(line)
                 results = []
 
+            mc_metrics = self._compute_mc_metrics(results)
+
             with self._lock:
                 self._results = results
+                self._mc_metrics = mc_metrics
                 # Awaiting-confirmation FOVs have no error but are not "done":
                 # foundation ran, detection is paused pending an optics decision.
                 self._n_done = sum(
@@ -306,29 +311,36 @@ class PipelineRunner:
         from roigbiv.pipeline._slack import SlackParams, send_slack
 
         model_name = Path(overrides.get("cellpose_model", "")).name
-        for r in results:
-            if r.error is not None or r.fov is None or r.png_path is not None:
-                continue
-            fov_stem = r.tif.stem.replace("_mc", "")
-            try:
-                r.png_path = _overlay.render_overlay(
-                    fov=r.fov, output_dir=r.output_dir,
-                    model_name=model_name, fov_stem=fov_stem,
-                )
-            except BaseException as exc:  # noqa: BLE001
-                self._log(f"Slack: overlay render failed for {fov_stem}: {exc}")
+        foundation_only = bool(overrides.get("foundation_only"))
+        if not foundation_only:
+            # ROI overlays only make sense once Stage 1 has run; a
+            # foundation-only dry run has no masks to draw.
+            for r in results:
+                if r.error is not None or r.fov is None or r.png_path is not None:
+                    continue
+                fov_stem = r.tif.stem.replace("_mc", "")
+                try:
+                    r.png_path = _overlay.render_overlay(
+                        fov=r.fov, output_dir=r.output_dir,
+                        model_name=model_name, fov_stem=fov_stem,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    self._log(f"Slack: overlay render failed for {fov_stem}: {exc}")
 
         summary = {
-            "model_name": model_name,
             "fs": overrides.get("fs", "?"),
             "tau": overrides.get("tau", "?"),
-            "flow_threshold": overrides.get("flow_threshold", "?"),
-            "stage_flags": {
+        }
+        if foundation_only:
+            summary["mode"] = "foundation-only"
+        else:
+            summary["model_name"] = model_name
+            summary["flow_threshold"] = overrides.get("flow_threshold", "?")
+            summary["stage_flags"] = {
                 2: overrides.get("enable_stage_2"),
                 3: overrides.get("enable_stage_3"),
                 4: overrides.get("enable_stage_4"),
-            },
-        }
+            }
         slack_results = [
             EmailFOVResult(
                 tif=r.tif, output_dir=r.output_dir, duration_s=r.duration_s,
@@ -360,7 +372,34 @@ class PipelineRunner:
                     self._current_stage = stage
 
     @staticmethod
-    def _summarize(r: FOVRunResult) -> dict:
+    def _compute_mc_metrics(results: list[FOVRunResult]) -> dict[str, dict]:
+        """MC quality metrics per FOV, computed once when the run finishes.
+
+        Reads each FOV's ``summary/mean_M.tif`` (already written by Foundation)
+        and scores it with :func:`roigbiv.pipeline.mc_metrics.compute_metrics`.
+        Keyed by ``str(r.tif)`` so :meth:`_summarize` can look it up per result.
+        Skips FOVs that errored or never reached Foundation (no mean_M yet);
+        a read/compute failure is swallowed to a per-FOV log-free skip rather
+        than failing the whole run — this is a UI convenience panel, not a
+        pipeline output.
+        """
+        from roigbiv.pipeline.loaders import _maybe_read_tif
+        from roigbiv.pipeline.mc_metrics import compute_metrics
+
+        out: dict[str, dict] = {}
+        for r in results:
+            if r.error is not None:
+                continue
+            mean_M = _maybe_read_tif(r.output_dir / "summary" / "mean_M.tif")
+            if mean_M is None:
+                continue
+            try:
+                out[str(r.tif)] = compute_metrics(mean_M)
+            except Exception:  # noqa: BLE001 — best-effort UI metric
+                continue
+        return out
+
+    def _summarize(self, r: FOVRunResult) -> dict:
         return {
             "stem": r.tif.stem.replace("_mc", ""),
             "tif": str(r.tif),
@@ -375,6 +414,7 @@ class PipelineRunner:
             "registry_fov_id": (
                 (r.registry or {}).get("fov_id") if r.registry else None
             ),
+            "mc_metrics": self._mc_metrics.get(str(r.tif)),
         }
 
 
