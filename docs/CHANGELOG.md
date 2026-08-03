@@ -4,6 +4,33 @@ All notable changes to roigbiv are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Live motion-correction view.** The Dash Pipeline page now shows the FOV
+  being corrected *while* registration runs: raw and corrected panes of the
+  same frame, an A/B blink that flips them in place, a difference pane, live
+  rigid-shift and phase-correlation-confidence traces, and running quality
+  metrics. Previously the only MC feedback was a mean projection and four
+  numbers computed after a FOV finished, 10–40 min into a run.
+
+  The pipeline side writes a sidecar to `{output_dir}/mc_preview/`
+  (`roigbiv/pipeline/mc_preview.py`) on every run — CLI, batch, and UI alike —
+  so a finished run leaves a scrubbable timeline for A/B-ing two backends on
+  the same FOV. `phasecorr` is fed by wrapping Suite2p's per-batch
+  `register_frames` (`mc_preview_s2p.py`), which also surfaces the
+  phase-correlation peak `cmax` — a registration-confidence signal the pipeline
+  did not previously expose; `rowwise-pcc` emits from its own batch loop;
+  `legacy`/SIMA reports that it has no in-process hook rather than showing an
+  empty card. The writer never raises and never touches the registered data:
+  output is byte-identical with the preview on or off, and a full disk or a
+  Suite2p API change degrades the view instead of failing the run.
+
+  New knobs: `--no-mc-preview` plus `mc_preview_{enabled,max_dim,
+  min_interval_s,max_records,metrics,diff}`. All are excluded from the resume
+  fingerprint. Served to the browser over `/api/mc-preview/{list,state,image}`
+  rather than Dash callbacks, so the ~2.5 Hz refresh costs no Python per tick.
+  See `docs/design/OVERVIEW.md` §3.1a.
+
 ### Changed
 
 - **Overlay PNG draws every ROI by default.** `roigbiv/overlay.py`
@@ -131,3 +158,33 @@ All notable changes to roigbiv are documented here.
 
 - `scripts/` directory: all local development scripts retained without modification
 - `configs/pipeline.yaml`: pipeline parameter configuration
+- **Single-frame TIF series discovery generalized.** `roigbiv.io.discover_tifs`
+  previously only recognised PrairieView/Bruker sessions, and only in
+  *immediate* subdirectories of the input root. Pointing `--input` at the
+  session directory itself yielded thousands of one-page "FOVs", each failing
+  `validate_tif`; any non-PrairieView numbering did the same. Discovery now
+  walks the whole tree (including the root itself), tries an ordered list of
+  conventions (`_SERIES_PATTERNS`: PrairieView first, then generic
+  `*_NNN.tif` numbering), and verifies a spread sample of frames really are
+  lone 2D images of matching shape and dtype before assembling. Directories
+  whose frame positions collide (interleaved channels) or that mix two
+  filename prefixes are refused rather than silently concatenated into a
+  scrambled stack, and chunked multi-frame files that merely *look* numbered
+  are left as independent inputs. Assembled stacks still cache under
+  `{root}/_stacks/`; nested sessions join their path components
+  (`mouse1_day1.tif`) instead of colliding on a shared leaf name.
+
+  Only the files that actually matched a series pattern are consumed, so a
+  genuine multi-frame stack sitting alongside the frames remains an input in
+  its own right. Symlinked acquisition trees are followed (with a realpath set
+  breaking cycles) — neither `os.walk` nor pathlib's `**` descends into them by
+  default, which would otherwise make a symlinked session invisible to both the
+  series scan and the flat scan.
+
+  Also fixes multi-cycle ordering: PrairieView restarts the frame index each
+  cycle, so sorting on the trailing number alone interleaved them. A two-cycle
+  session assembled as `c1f1, c2f1, c1f2, …`; ordering is now `(cycle, index)`.
+
+  `assemble_prairie_stack` is now a deprecated alias for
+  `assemble_frame_series`.
+

@@ -2,19 +2,21 @@
 ROI G. Biv — I/O utilities.
 
 Provides:
-  discover_tifs()          — recursively find TIF files; auto-assemble PrairieView series
-  assemble_prairie_stack() — stream PrairieView single-frame OME-TIFs into a multi-frame stack
+  discover_tifs()          — recursively find TIF files; auto-assemble frame series
+  assemble_frame_series()  — stream single-frame TIFs into a multi-frame stack
   extract_archive()        — unpack .tar.gz / .zip archives
   validate_tif()           — confirm a TIF is 3D multi-frame (frames × H × W)
   extract_projections()    — pull meanImg + Vcorr from Suite2p ops.npy
   download_model()         — fetch model checkpoint from URL with caching
 """
 import logging
+import os
 import re
 import sys
 import tarfile
 import warnings
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -30,69 +32,233 @@ MC_SOFTWARE_TAG = "roigbiv-mc"
 
 
 # ---------------------------------------------------------------------------
-# PrairieView / Bruker single-frame OME-TIFF support
+# Single-frame TIF series support (PrairieView / Bruker and generic)
 # ---------------------------------------------------------------------------
 
-_PRAIRIE_FRAME_PATTERN = re.compile(r'_Cycle\d+_Ch\d+_(\d+)\.ome\.tif$')
+TIF_SUFFIXES = (".tif", ".tiff")
+
+#: Directory names never descended into when hunting for frame series: the
+#: pipeline's own output trees, plus the assembled-stack cache itself.
+_SKIP_DIRS = frozenset({"output", "inference", "pipeline", "_stage", "_stacks"})
+
+#: How many files are opened to confirm a candidate directory really holds a
+#: one-frame-per-file series. Spread across the sequence rather than taken from
+#: the front — a truncated or dtype-shifted tail is a real failure mode that
+#: the first five frames would never reveal.
+_VERIFY_SAMPLE = 5
 
 
-def _detect_prairie_sessions(root: Path) -> list:
+@dataclass(frozen=True)
+class _SeriesPattern:
+    """One filename convention for a single-frame TIF series.
+
+    ``regex`` must expose an ``index`` group and may expose ``cycle`` (an outer
+    counter, ordered ahead of ``index``) and ``channel``. ``min_frames`` is the
+    per-channel count below which a match is not worth trusting — low for a
+    convention specific enough to be self-identifying, high for the generic
+    fallback where a false positive is plausible.
     """
-    Return immediate subdirectories of *root* that look like PrairieView sessions.
 
-    Detection heuristic: the directory contains ≥2 files whose names match
-    ``*_CycleNNNNN_ChN_NNNNNN.ome.tif``.
+    name: str
+    regex: "re.Pattern"
+    min_frames: int
+    require_common_prefix: bool = False
+
+
+_SERIES_PATTERNS = (
+    # PrairieView / Bruker: foo_Cycle00001_Ch2_000001.ome.tif. `cycle` matters —
+    # in a multi-cycle T-series the frame index restarts each cycle, so ordering
+    # on the trailing number alone interleaves the cycles.
+    _SeriesPattern(
+        name="PrairieView",
+        regex=re.compile(r"_Cycle(?P<cycle>\d+)_(?P<channel>Ch\d+)_(?P<index>\d+)"
+                         r"\.ome\.tiff?$", re.IGNORECASE),
+        min_frames=2,
+    ),
+    # Anything ending in a run of digits: ScanImage, Thorlabs, hand-rolled
+    # exports. Deliberately last and deliberately strict — see `min_frames` and
+    # `require_common_prefix`.
+    _SeriesPattern(
+        name="numbered",
+        regex=re.compile(r"(?:^|[_.\-])(?P<index>\d{3,})\.(?:ome\.)?tiff?$",
+                         re.IGNORECASE),
+        min_frames=8,
+        require_common_prefix=True,
+    ),
+)
+
+
+def _parse_series(files: list, pattern: _SeriesPattern) -> dict:
+    """Group *files* into ``{channel: [path, ...]}`` ordered by frame position.
+
+    Returns ``{}`` when *files* do not form a clean series under *pattern*. The
+    strict part is the duplicate-key check: two files claiming the same position
+    means the directory holds interleaved channels or two different movies, and
+    concatenating them would silently produce a scrambled stack. Refusing the
+    whole directory leaves the files to be reported individually, which is
+    wrong but visible.
     """
-    sessions = []
-    for subdir in sorted(root.iterdir()):
-        if not subdir.is_dir():
+    by_channel: dict = {}
+    prefixes: set = set()
+    for path in files:
+        m = pattern.regex.search(path.name)
+        if m is None:
             continue
-        sample = list(subdir.glob("*.ome.tif"))[:5]
-        if len(sample) >= 2 and all(_PRAIRIE_FRAME_PATTERN.search(f.name) for f in sample):
-            sessions.append(subdir)
-    return sessions
+        groups = m.groupdict()
+        order = tuple(int(groups[g]) for g in ("cycle", "index")
+                      if groups.get(g) is not None)
+        by_channel.setdefault(groups.get("channel") or "", []).append((order, path))
+        prefixes.add(path.name[:m.start()])
+
+    if pattern.require_common_prefix and len(prefixes) > 1:
+        return {}
+
+    series: dict = {}
+    for channel, items in by_channel.items():
+        if len(items) < pattern.min_frames:
+            continue
+        if len({order for order, _ in items}) != len(items):
+            return {}
+        series[channel] = [p for _, p in sorted(items, key=lambda it: it[0])]
+    return series
 
 
-def assemble_prairie_stack(session_dir, output_path, channel: str = None) -> Path:
+def _verify_frame_files(files: list) -> bool:
+    """Confirm a sample of *files* really are single-page frames of one movie.
+
+    Rejects a file that is unreadable, that is not a lone 2D frame (a chunked
+    multi-frame stack named like a frame — concatenating those is a different
+    operation), or whose shape/dtype differs from the rest of the sample.
+
+    The shape test reads ``series[0]``, not ``pages``: tifffile stores a small
+    3D array as a single page whose *page* shape is 3D, so a page count of one
+    does not imply a single frame.
     """
-    Assemble a PrairieView/Bruker single-frame OME-TIFF series into a multi-frame stack.
+    n = len(files)
+    positions = sorted({round(i * (n - 1) / (_VERIFY_SAMPLE - 1))
+                        for i in range(_VERIFY_SAMPLE)})
+    reference = None
+    for i in positions:
+        try:
+            with tifffile.TiffFile(str(files[i]), is_ome=False) as tif:
+                series = tif.series
+                if not series or len(series[0].shape) != 2:
+                    return False
+                signature = (tuple(series[0].shape), str(series[0].dtype))
+        except Exception:
+            return False
+        if reference is None:
+            reference = signature
+        elif signature != reference:
+            return False
+    return True
 
-    Each frame is a separate ``*_CycleNNNNN_ChN_NNNNNN.ome.tif`` file.  Frames
-    are sorted by their 6-digit suffix and streamed into a single BigTIFF stack
-    at *output_path*.  A ``.tmp.tif`` sidecar is used during writing so a
-    partial file is never mistaken for a complete stack on re-run.
+
+def _detect_series_dirs(root: Path) -> list:
+    """Walk *root* for directories holding a single-frame TIF series.
+
+    Inspects *root* itself as well as every subdirectory, so pointing
+    ``--input`` straight at a session directory behaves the same as pointing at
+    its parent — the alternative is thousands of one-page "FOVs", each of which
+    fails validation individually.
+
+    Symlinked directories are followed — labs routinely symlink acquisition
+    trees into a working directory — with a realpath set breaking loops and
+    repeat visits.
+
+    Returns ``[(directory, pattern, channel, series), ...]`` where ``series`` is
+    the full ``{channel: [path, ...]}`` mapping and ``channel`` is the one to
+    assemble.
+    """
+    found = []
+    seen: set = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith(".")]
+        directory = Path(dirpath)
+        files = [directory / f for f in filenames
+                 if f.lower().endswith(TIF_SUFFIXES)]
+        for pattern in _SERIES_PATTERNS:
+            series = _parse_series(files, pattern)
+            if not series:
+                continue
+            channel = max(series, key=lambda c: len(series[c]))
+            if not _verify_frame_files(series[channel]):
+                continue
+            found.append((directory, pattern, channel, series))
+            dirnames[:] = []  # frames are leaves; nothing below to recurse into
+            break
+    return found
+
+
+def _series_stem(root: Path, directory: Path) -> str:
+    """Flat, collision-free stack name for a series directory.
+
+    An immediate child keeps its bare name so stacks assembled by earlier
+    versions are still found in ``_stacks/``; anything deeper joins its path
+    components rather than colliding on a shared leaf name.
+    """
+    parts = directory.relative_to(root).parts
+    return "_".join(parts) if parts else root.name
+
+
+def assemble_frame_series(session_dir, output_path, channel: str = None) -> Path:
+    """
+    Assemble a single-frame TIF series into one multi-frame stack.
+
+    Recognises the conventions in :data:`_SERIES_PATTERNS` (PrairieView/Bruker
+    ``*_CycleNNNNN_ChN_NNNNNN.ome.tif`` first, then any ``*_NNN.tif``-style
+    numbering). Frames are ordered by their parsed position and streamed into a
+    single BigTIFF at *output_path*. A ``.tmp.tif`` sidecar is used during
+    writing so a partial file is never mistaken for a complete stack on re-run.
 
     Parameters
     ----------
-    session_dir  : path-like — PrairieView session directory
+    session_dir  : path-like — directory holding the per-frame TIFs
     output_path  : path-like — destination multi-frame TIF
-    channel      : str or None — e.g. ``"Ch2"``; None = auto-detect (most-frequent channel)
+    channel      : str or None — e.g. ``"Ch2"``; None = most-frequent channel
 
     Returns
     -------
     Path — output_path
+
+    Raises
+    ------
+    ValueError if no series is recognised, or if *channel* is absent from one.
     """
     session_dir = Path(session_dir)
+    files = [p for p in session_dir.iterdir()
+             if p.is_file() and p.name.lower().endswith(TIF_SUFFIXES)]
+
+    for pattern in _SERIES_PATTERNS:
+        series = _parse_series(files, pattern)
+        if not series:
+            continue
+        if channel is None:
+            picked = max(series, key=lambda c: len(series[c]))
+        elif channel in series:
+            picked = channel
+        else:
+            raise ValueError(f"No {channel} frames found in {session_dir}")
+        return _assemble_frames(series[picked], Path(output_path))
+
+    raise ValueError(f"No single-frame TIF series found in {session_dir}")
+
+
+def assemble_prairie_stack(session_dir, output_path, channel: str = None) -> Path:
+    """Deprecated alias for :func:`assemble_frame_series`, which handles the
+    PrairieView convention along with the rest."""
+    return assemble_frame_series(session_dir, output_path, channel=channel)
+
+
+def _assemble_frames(files: list, output_path: Path) -> Path:
+    """Stream an ordered list of single-frame TIFs into one BigTIFF stack."""
     output_path = Path(output_path)
-
-    if channel is None:
-        ch_counts: dict = {}
-        for f in session_dir.glob("*.ome.tif"):
-            m = re.search(r'_(Ch\d+)_', f.name)
-            if m:
-                ch_counts[m.group(1)] = ch_counts.get(m.group(1), 0) + 1
-        if not ch_counts:
-            raise ValueError(f"No PrairieView frames found in {session_dir}")
-        channel = max(ch_counts, key=ch_counts.get)
-
-    files = sorted(
-        (f for f in session_dir.glob(f"*_{channel}_*.ome.tif")
-         if _PRAIRIE_FRAME_PATTERN.search(f.name)),
-        key=lambda p: int(_PRAIRIE_FRAME_PATTERN.search(p.name).group(1)),
-    )
-    if not files:
-        raise ValueError(f"No {channel} frames found in {session_dir}")
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(".tmp.tif")
 
@@ -107,11 +273,12 @@ def assemble_prairie_stack(session_dir, output_path, channel: str = None) -> Pat
     # Bruker sometimes writes empty placeholder files mid-acquisition.
     valid_files = [f for f in files if f.stat().st_size > 0]
     n_skipped = n - len(valid_files)
+    session_name = files[0].parent.name
     if n_skipped:
-        print(f"  WARNING: skipping {n_skipped} empty frame file(s) in {session_dir.name}",
+        print(f"  WARNING: skipping {n_skipped} empty frame file(s) in {session_name}",
               flush=True)
     if not valid_files:
-        raise ValueError(f"All {n} frame files in {session_dir.name} are empty")
+        raise ValueError(f"All {n} frame files in {session_name} are empty")
     n_valid = len(valid_files)
 
     _saved_level = _tifffile_log.level
@@ -122,7 +289,7 @@ def assemble_prairie_stack(session_dir, output_path, channel: str = None) -> Pat
             warnings.simplefilter("ignore")
             first_frame = tifffile.imread(str(valid_files[0]), is_ome=False)
             size_est_gb = n_valid * first_frame.nbytes / 1e9
-            print(f"  Assembling {n_valid} {channel} frames (~{size_est_gb:.1f} GB)"
+            print(f"  Assembling {n_valid} frames (~{size_est_gb:.1f} GB)"
                   f" → {output_path.name}", flush=True)
             tw.write(first_frame, contiguous=True)
             written = 1
@@ -156,10 +323,11 @@ def discover_tifs(root) -> list:
     """
     Recursively find all TIF files under *root*.
 
-    PrairieView/Bruker sessions
-    ---------------------------
-    Sub-directories containing single-frame ``*.ome.tif`` files named with the
-    PrairieView ``*_CycleNNNNN_ChN_NNNNNN.ome.tif`` convention are auto-detected.
+    Single-frame series
+    -------------------
+    Directories holding one TIF per frame — *root* itself or any subdirectory —
+    are auto-detected (PrairieView/Bruker ``*_CycleNNNNN_ChN_NNNNNN.ome.tif``
+    first, then generic ``*_NNN.tif`` numbering; see :data:`_SERIES_PATTERNS`).
     Their frames are assembled (once, cached) into a single multi-frame stack
     under ``{root}/_stacks/{session_name}.tif``.  The individual per-frame files
     are excluded from the return value.
@@ -196,19 +364,23 @@ def discover_tifs(root) -> list:
                 except Exception as e:
                     print(f"  WARNING: could not extract {archive.name}: {e}")
 
-    # Detect and assemble PrairieView session directories
-    prairie_sessions = _detect_prairie_sessions(root)
-    prairie_frame_dirs = set(prairie_sessions)
+    # Detect and assemble single-frame TIF series. Only the files that actually
+    # matched a series pattern are consumed — a genuine multi-frame stack living
+    # alongside the frames stays an input in its own right.
+    series_dirs = _detect_series_dirs(root)
+    frame_files = {p for _, _, _, series in series_dirs
+                   for paths in series.values() for p in paths}
     assembled_stacks: list = []
-    if prairie_sessions:
-        stacks_dir = root / "_stacks"
-        for session_dir in prairie_sessions:
-            output_path = stacks_dir / f"{session_dir.name}.tif"
-            if not output_path.exists():
-                print(f"PrairieView session detected: {session_dir.name}")
-                assembled_stacks.append(assemble_prairie_stack(session_dir, output_path))
-            else:
-                assembled_stacks.append(output_path)
+    stacks_dir = root / "_stacks"
+    for directory, pattern, channel, series in series_dirs:
+        files = series[channel]
+        output_path = stacks_dir / f"{_series_stem(root, directory)}.tif"
+        if output_path.exists():
+            assembled_stacks.append(output_path)
+            continue
+        detail = f"{len(files)} frames" + (f", {channel}" if channel else "")
+        print(f"{pattern.name} series detected: {directory.name} ({detail})")
+        assembled_stacks.append(_assemble_frames(files, output_path))
 
     # Collect all TIF files
     tif_files: set = set()
@@ -225,7 +397,7 @@ def discover_tifs(root) -> list:
         and "pipeline" not in p.parts
         and "_stage" not in p.parts
         and "_stacks" not in p.parts
-        and not any(p.is_relative_to(d) for d in prairie_frame_dirs)
+        and p not in frame_files
     }
 
     # Add assembled stacks
