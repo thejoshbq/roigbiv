@@ -1850,6 +1850,12 @@ def main(argv: "list[str] | None" = None) -> int:
                         action=argparse.BooleanOptionalAction, default=None,
                         help=("phasecorr: rigid pass then non-rigid (default off). "
                               "Keeps the raw movie for the second pass."))
+    parser.add_argument("--mc-preview", dest="mc_preview_enabled",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help=("Write the live motion-correction preview sidecar to "
+                              "{output}/mc_preview/ (default on). Feeds the Dash "
+                              "UI's live view and leaves a scrubbable timeline for "
+                              "backend A/B. Pass --no-mc-preview to skip the writes."))
     # ── Denoising configuration ──────────────────────────────────
     parser.add_argument("--denoised-branch", dest="enable_denoised_branch",
                         action=argparse.BooleanOptionalAction, default=None,
@@ -2049,6 +2055,7 @@ def _run_single(
             "mc_s2p_one_photon_reg": args.mc_s2p_one_photon_reg,
             "mc_s2p_maxregshift_nr": args.mc_s2p_maxregshift_nr,
             "mc_s2p_two_step_registration": args.mc_s2p_two_step_registration,
+            "mc_preview_enabled": args.mc_preview_enabled,
         }.items()
         if v is not None
     }
@@ -2308,6 +2315,7 @@ def _run_workspace(
             "mc_s2p_one_photon_reg": args.mc_s2p_one_photon_reg,
             "mc_s2p_maxregshift_nr": args.mc_s2p_maxregshift_nr,
             "mc_s2p_two_step_registration": args.mc_s2p_two_step_registration,
+            "mc_preview_enabled": args.mc_preview_enabled,
         }.items()
         if v is not None
     }

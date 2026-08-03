@@ -152,6 +152,11 @@ _FINGERPRINT_EXCLUDE: frozenset = frozenset({
     # Changing these fields must not invalidate a resume.
     "enable_denoised_branch", "denoiser_backend", "denoiser_model_path",
     "denoised_branch_cache", "validate_denoised_against_raw",
+    # Live MC preview is a diagnostic sidecar: it never touches the registered
+    # data, so toggling it (or its cadence/size knobs) must not invalidate a
+    # resume.
+    "mc_preview_enabled", "mc_preview_max_dim", "mc_preview_min_interval_s",
+    "mc_preview_max_records", "mc_preview_metrics", "mc_preview_diff",
 })
 
 

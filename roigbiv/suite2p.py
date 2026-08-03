@@ -107,7 +107,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                     anatomical_only: int = 0, tau: float = 1.0,
                     do_registration: bool = False, cfg: dict = None,
                     spatial_scale: int = None,
-                    threshold_scaling: float = None) -> bool:
+                    threshold_scaling: float = None,
+                    preview=None) -> bool:
     """
     Run Suite2p on a single TIF file.
 
@@ -140,6 +141,9 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     tau             : float     — GCaMP decay time constant in seconds
     do_registration : bool      — False = skip (stacks are pre-corrected)
     cfg             : dict      — optional pipeline YAML config (for advanced params)
+    preview         : optional MCPreviewWriter fed by the registration loop for
+                      the UI's live view (see roigbiv.pipeline.mc_preview_s2p).
+                      Diagnostic only — Suite2p's behavior is unchanged.
 
     Returns
     -------
@@ -153,6 +157,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
             "Activate the project env first:  conda activate roigbiv"
         ) from e
     from roigbiv.io import validate_tif
+    from roigbiv.pipeline.mc_preview_s2p import suite2p_preview_hooks
 
     # Resolve to absolute: Suite2p joins tiff_list relative to data_path, so a
     # relative input/output path yields a doubled, nonexistent stage path.
@@ -162,6 +167,10 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
 
     stat_path = output_dir / stem / "suite2p" / "plane0" / "stat.npy"
     if stat_path.exists():
+        if preview is not None:
+            preview.set_phase(
+                "skipped_resume",
+                note="Suite2p outputs already present; registration not re-run")
         return False
 
     # Fail fast on 2D reference images before Suite2p's C extension segfaults
@@ -186,7 +195,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                          spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
         ops["tiff_list"] = [str(local_tif)]
-        run_s2p(ops=ops)
+        with suite2p_preview_hooks(preview):
+            run_s2p(ops=ops)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:

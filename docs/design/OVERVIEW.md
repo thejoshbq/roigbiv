@@ -173,6 +173,57 @@ Suite2p skips its own registration; Foundation still registers when the input la
 `_mc`. Motion traces (`xoff`/`yoff`) are persisted to `motion_trace.npz` and reused by
 Gate 4. Every backend exports `{stem}_mc.tif`.
 
+### 3.1a Live motion-correction preview (diagnostic sidecar)
+
+While registration runs, `roigbiv/pipeline/mc_preview.py::MCPreviewWriter` streams a
+downsampled **raw/corrected pair of the same frame** — plus a difference pane — into
+`{output_dir}/mc_preview/`, roughly 2.5× a second. The Dash Pipeline page renders it as
+a live view of the FOV being corrected; after the run the retained records are a
+scrubbable timeline, which is what makes an A/B of two backends on one FOV possible
+after the fact.
+
+```
+mc_preview/
+  state.json                       phase, seq, frame/total, decimated shift +
+                                   confidence trace, live quality metrics,
+                                   valid-crop rectangle, retained record list
+  raw_000000.png  corr_000000.png  same frame, before and after
+  diff_000000.png                  corrected − raw, symmetric window
+  shifts.npz                       full-resolution frame/y/x/cmax trace
+```
+
+How each backend feeds it:
+
+- **`phasecorr`** — `mc_preview_s2p.py::suite2p_preview_hooks` wraps Suite2p's
+  module-level `register_frames`, which the registration loop calls once per batch and
+  unpacks eight values from. That yields the raw input, the corrected output, the
+  per-frame rigid shifts, and the phase-correlation peak `cmax` (a confidence signal
+  available nowhere else in the pipeline's outputs). A thin `sys.stdout` line tap adds
+  the phases the wrapper cannot see — TIFF→binary conversion and the `nimg_init`-frame
+  reference build, a multi-second dead zone that would otherwise look like a stall. The
+  wrapper is installed only after its signature is feature-detected, so a Suite2p
+  upgrade degrades the preview (`phase="unsupported"`) rather than breaking
+  registration.
+- **`rowwise-pcc`** — emits directly from its own batch loop in `registration.py`.
+- **`legacy`** — no live view; the correction runs in a Python-3.8 subprocess with no
+  in-process hook, so the sidecar records `phase="unsupported"` with a note.
+
+**Invariants.** The writer never raises and never touches the registered data —
+registration output is byte-identical with the preview on or off. PNG filenames carry
+the sequence number and are never overwritten, and `state.json` is `os.replace`d last,
+so the `seq` a reader sees always names files already complete on disk (otherwise the
+UI's A/B blink would compare two different frames). The display window is frozen on the
+first frame so the blink cannot flicker on brightness. Quality metrics are computed on
+the *full-resolution* corrected frame, since `lap_var_smooth` and `banding_score` are
+scale-dependent and would otherwise contradict the post-run per-FOV table. Retained
+records are bounded by `mc_preview_max_records` via stride-doubling decimation, keeping
+the timeline uniform across the whole run at a fixed footprint. Disable with
+`--no-mc-preview` / `mc_preview_enabled=False`.
+
+Consumers: `roigbiv/ui/services/mc_preview.py` (reading helpers),
+`roigbiv/ui/routes/mc_preview.py` (`/api/mc-preview/{list,state,image}`), and the
+Pipeline page's live card.
+
 ### 3.2 Truncated-SVD low-rank / sparse (L+S) background split
 
 `compute_background_separation` (`foundation.py`):
@@ -660,6 +711,7 @@ traces/                             traces.npy (PRIMARY, neuropil-corrected), tr
 hitl/                               review_queue.json, merged_masks.tif, per-ROI evidence, GUI staging
 registry_match.json                 ROICaT match outcome
 svd_factors.npz, residual_S.meta.json   Foundation sidecars
+mc_preview/                         live motion-correction preview sidecar (§3.1a)
 ```
 
 Activity-type labels live in each ROI's `roi_metadata.json` entry (`activity_type`) and

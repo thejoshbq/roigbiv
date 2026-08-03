@@ -93,89 +93,96 @@ HELP_TEXT: dict[str, str] = {
     "roigbiv-param-mc-strip-height":
         "Height in rows of the horizontal strips the row-wise motion correction "
         "registers independently. Larger = steadier but coarser non-rigid "
-        "correction (default 32; the prism profile uses 48 for its 1024² FOVs).",
-    # Pipeline · Stage 1 Cellpose
-    "roigbiv-param-profile":
-        "Acquisition/lens profile. Selecting one autofills the Stage-1 and "
-        "Gate-1 fields for that optic: grin = the 512² GRIN baseline (pipeline "
-        "defaults); prism = dim, diffuse 1024² Prism FOVs (single-channel cyto3, "
-        "no denoise, ~56 px somata, relaxed area/shape gates); generic = a "
-        "conservative single-channel fallback. The fields stay editable — they, "
-        "not the dropdown, are what actually run.",
-    "roigbiv-param-channels":
-        "Cellpose input channels (cyto, nucleus). Single-channel (0,0) segments "
-        "the mean_M image alone — the dominant Prism fix. Cyto+vcorr (1,2) feeds "
-        "the correlation map as a nucleus channel (the GRIN default), which "
-        "suppresses detection on Prism's diffuse vcorr.",
-    "roigbiv-param-cellprob-threshold":
-        "Cellpose cell-probability threshold (−6…6). Lower admits dimmer, "
-        "lower-confidence masks; higher is stricter. GRIN default −2.0; the "
-        "prism profile uses 0.0.",
-    "roigbiv-param-use-denoise":
-        "Run Cellpose3 denoise_cyto3 before segmentation. Helps bright GRIN "
-        "FOVs but suppresses dim Prism signal — the prism profile turns it off.",
-    "roigbiv-param-tile-norm-blocksize":
-        "Block size (px) for Cellpose tile normalization; 0 disables it. Larger "
-        "blocks normalize over a wider area (default 128; prism uses 256 for its "
-        "1024² FOVs).",
-    "roigbiv-param-min-area":
-        "Gate 1 minimum ROI area in px². Masks smaller than this are rejected. "
-        "GRIN default 80 (512²); the prism profile raises it to 900 for ~56 px "
-        "somata.",
-    "roigbiv-param-max-area":
-        "Gate 1 maximum ROI area in px². Masks larger than this are rejected as "
-        "merged blobs. GRIN default 600 (512²); the prism profile raises it to "
-        "9000 (large somata; the peak-count check still flags genuine merges).",
-    "roigbiv-param-min-solidity":
-        "Gate 1 minimum solidity (filled-area fraction, 0–1). Rejects ragged / "
-        "non-convex masks. GRIN default 0.55; prism relaxes to 0.40 for cyto3's "
-        "ugly-but-valid masks.",
-    "roigbiv-param-max-eccentricity":
-        "Gate 1 maximum eccentricity (0–1). Rejects elongated fiber/axon shapes. "
-        "GRIN default 0.90; prism relaxes to 0.97.",
-    "roigbiv-param-model":
-        "Cellpose model checkpoint used for Stage 1 spatial detection. "
-        "Defaults to the deployed CP3 model; fine-tuned checkpoints appear "
-        "here once trained.",
-    "roigbiv-param-flow-threshold":
-        "Cellpose flow error tolerance (0–3). Lower is stricter — fewer, "
-        "cleaner masks; higher admits more candidate ROIs. Default 0.4.",
-    "roigbiv-param-diameter":
-        "Expected soma diameter in pixels for Stage 1 Cellpose detection "
-        "(default 12). Drag the reference circle on the motion-correction "
-        "preview to match a representative cell, or click Suggest to estimate "
-        "it from the image. Applies to every FOV in the run; setting it here "
-        "disables automatic per-FOV diameter estimation.",
-    # Pipeline · Stage control
-    "roigbiv-param-scout":
-        "Cellpose-only fast triage: runs Stage 1 + Gate 1 and stops. No "
-        "SVD/L+S, traces, QC, or registry — for quick FOV-clarity and model "
-        "checks, not analysis-grade output. Overrides the stage toggles.",
-    "roigbiv-param-foundation-only":
-        "Dry run: motion correction + SVD/L+S + summary images, then stop "
-        "before ROI detection so you can inspect the corrected FOV in Review. "
-        "Re-run with Resume to continue. Overrides the stage toggles.",
-    "roigbiv-param-stage-2":
-        "Stage 2 — Suite2p temporal detection. Catches burst-firing and "
-        "task-locked neurons that Cellpose misses on the spatial pass.",
-    "roigbiv-param-stage-3":
-        "Stage 3 — matched-filter template sweep on the residual. Recovers "
-        "sparse-firing neurons (≈1–15 events) below Cellpose/Suite2p "
-        "sensitivity.",
-    "roigbiv-param-stage-4":
-        "Stage 4 — tonic-neuron search via correlation contrast. Finds "
-        "sustained-firing cells (≈2–5 Hz) with little transient structure.",
-    "roigbiv-param-resume":
-        "Skip stages already completed when the config and input are "
-        "unchanged, reusing prior outputs. Ignored under scout / "
-        "foundation-only.",
-    "roigbiv-param-override":
-        "Replace this FOV's prior registry entry instead of accumulating "
-        "rows. Drops the previous run's session (and the FOV + cells if that "
-        "leaves it with no other sessions) before re-registering. Destructive: "
-        "the delete and the re-register are separate steps, so interrupting an "
-        "override re-run can leave the prior entry gone — just re-run to "
-        "rebuild it. Off by default — normal re-runs are non-destructive.",
+        "correction (default 32).",
+    "roigbiv-param-force-cpu":
+        "Force CPU for the SVD/L+S background separation and rowwise-pcc GPU "
+        "path, bypassing CUDA even when available. For debugging or GPU-"
+        "contended hosts; much slower.",
+    # Pipeline · Foundation · rowwise-pcc knobs
+    "roigbiv-param-mc-max-displacement":
+        "Pixel clamp on the estimated per-strip/frame shift. Shared by "
+        "rowwise-pcc and legacy (SIMA). Default 50px.",
+    "roigbiv-param-mc-n-template-iters":
+        "Number of template-refinement iterations for rowwise-pcc registration "
+        "(default 2). More iterations sharpen the reference template at extra "
+        "compute cost.",
+    "roigbiv-param-mc-subpixel-upsample":
+        "Parabolic sub-pixel refinement factor for rowwise-pcc shift estimation "
+        "(default 10). Higher gives finer sub-pixel precision.",
+    "roigbiv-param-mc-frame-batch":
+        "Frames processed per GPU batch for rowwise-pcc (default 256, auto-"
+        "capped by available VRAM).",
+    "roigbiv-param-mc-smooth-sigma-rows":
+        "Per-row displacement-field smoothing (strip regularization) for "
+        "rowwise-pcc. This — not the DoG prefilter — is what suppresses the "
+        "noise-driven per-row warps on dim/low-SNR FOVs (default 6.0).",
+    "roigbiv-param-mc-smooth-sigma-time":
+        "Temporal smoothing of the displacement field across a rowwise-pcc "
+        "frame batch (default 1.0).",
+    "roigbiv-param-mc-strip-confidence-weight":
+        "Median + confidence-weighted outlier rejection across strips in "
+        "rowwise-pcc registration. On by default — part of the strip "
+        "regularization that closes the quality gap vs. legacy SIMA.",
+    "roigbiv-param-mc-prefilter":
+        "DoG band-pass filter on rowwise-pcc's shift-estimation inputs. Off by "
+        "default — it only helps when a structured background dominates; on "
+        "white-noise-limited (shot-noise) frames it degrades the correlation "
+        "peak. A/B it per dataset.",
+    "roigbiv-param-mc-prefilter-sigma-low":
+        "DoG prefilter's small-blur sigma (shot-noise suppression). Only used "
+        "when the prefilter is enabled (default 1.0).",
+    "roigbiv-param-mc-prefilter-sigma-high":
+        "DoG prefilter's large-blur sigma (background high-pass). Only used "
+        "when the prefilter is enabled (default 8.0).",
+    # Pipeline · Foundation · legacy (SIMA) knobs
+    "roigbiv-param-mc-sima-env":
+        "Conda env hosting the legacy SIMA 1.3.2 sidecar (default "
+        "'sima-legacy'; build once with envs/build_sima_legacy.sh).",
+    "roigbiv-param-mc-granularity":
+        "SIMA HiddenMarkov2D correction granularity: 'row' (matches the "
+        "original notebook) or 'frame' (coarser, rigid-only).",
+    # Pipeline · Foundation · phasecorr (Suite2p) knobs
+    "roigbiv-param-mc-s2p-block-h":
+        "Non-rigid registration block height (px). Tuned default 64 — the "
+        "[64,64] + 1Preg combination reaches ~103% of legacy-SIMA sharpness on "
+        "dim Prism FOVs vs. 58% for the old [128,128]/no-1Preg default. Try "
+        "128 for bright, high-SNR 2P data.",
+    "roigbiv-param-mc-s2p-block-w":
+        "Non-rigid registration block width (px). See block height — tuned "
+        "default 64.",
+    "roigbiv-param-mc-s2p-smooth-sigma":
+        "Spatial Gaussian blur (px) applied to the reference image before "
+        "registration (default 1.15).",
+    "roigbiv-param-mc-s2p-smooth-sigma-time":
+        "Temporal smoothing applied before shift estimation (default 0.0 — "
+        "off).",
+    "roigbiv-param-mc-s2p-maxregshift":
+        "Rigid shift clamp as a fraction of the frame size (default 0.1).",
+    "roigbiv-param-mc-s2p-nonrigid":
+        "Enable piecewise (non-rigid, block-based) registration on top of the "
+        "rigid pass. On by default.",
+    "roigbiv-param-mc-s2p-maxregshift-nr":
+        "Max non-rigid per-block shift in pixels (default 5).",
+    "roigbiv-param-mc-s2p-nimg-init":
+        "Number of frames used to build the registration reference image "
+        "(default 300).",
+    "roigbiv-param-mc-s2p-two-step-registration":
+        "Rigid registration pass, then a second non-rigid pass on the result. "
+        "Needs the raw (unregistered) movie; off by default.",
+    "roigbiv-param-mc-s2p-one-photon-reg":
+        "1-photon-style high-pass filter before registration. Raises shift-"
+        "estimation SNR on dim/low-contrast (GRIN/Prism) frames — load-bearing "
+        "for legacy parity. On by default; turn off for bright, high-SNR 2P "
+        "data.",
+    "roigbiv-param-mc-s2p-spatial-hp-reg":
+        "Spatial high-pass window (px) for the 1-photon-style registration "
+        "prefilter (default 42).",
+    "roigbiv-param-mc-s2p-pre-smooth":
+        "Gaussian smoothing (px) applied before the high-pass prefilter "
+        "(default 0.0 — off).",
+    "roigbiv-param-mc-s2p-spatial-taper":
+        "Edge pixels tapered out of the registration computation (default "
+        "40.0).",
     # Pipeline · Notifications
     "roigbiv-param-slack-channel":
         "Posts a run summary and overlay PNGs to this Slack channel when the "
