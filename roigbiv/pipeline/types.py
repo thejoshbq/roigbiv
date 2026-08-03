@@ -292,6 +292,21 @@ class PipelineConfig:
     mc_s2p_pre_smooth: float = 0.0          # pre-high-pass Gaussian smoothing
     mc_s2p_spatial_taper: float = 40.0      # edge pixels tapered out of registration
 
+    # ── Live motion-correction preview (see pipeline/mc_preview.py) ───────
+    # Writes a downsampled raw/corrected frame pair per emit into
+    # {output_dir}/mc_preview/ while registration runs, so the Dash UI can show
+    # the FOV being corrected in real time and the finished run leaves a
+    # scrubbable timeline for backend A/B. Purely diagnostic: the writer never
+    # raises and never touches the registered data, so output is byte-identical
+    # with the preview on or off.
+    mc_preview_enabled: bool = True
+    mc_preview_max_dim: int = 512           # long-edge cap for preview PNGs
+    mc_preview_min_interval_s: float = 0.4  # live cadence throttle (wall clock)
+    mc_preview_max_records: int = 300       # retained records; halving decimation
+                                            # keeps the timeline uniform + bounded
+    mc_preview_metrics: bool = True         # run mc_metrics on each emitted frame
+    mc_preview_diff: bool = True            # also write the corrected − raw pane
+
     # ── Acquisition / lens profile (see pipeline/profiles.py) ─────────────
     # Records which profile bundle the CLI/UI resolver applied
     # (grin/prism/generic). "grin" = dataclass defaults (no-op). Serialized

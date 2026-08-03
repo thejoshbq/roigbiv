@@ -80,7 +80,12 @@ def run_motion_correction(
     corrected the motion differs. Returns the uniform
     ``(ops, data_bin_path, motion_x, motion_y)`` tuple, with motion traces coming
     from whichever backend did the correction.
+
+    Throughout, an :class:`~roigbiv.pipeline.mc_preview.MCPreviewWriter` streams
+    raw/corrected frame pairs to ``{output_dir}/mc_preview/`` for the UI's live
+    view. It is diagnostic-only and cannot change the registered output.
     """
+    from roigbiv.pipeline.mc_preview import writer_for
     from roigbiv.pipeline.registration import (
         run_rowwise_pcc_register, _write_mc_tif)
     from roigbiv.suite2p import run_suite2p_fov
@@ -96,6 +101,25 @@ def run_motion_correction(
             f"expected 'rowwise-pcc', 'phasecorr', or 'legacy'."
         )
 
+    with writer_for(cfg, output_dir, stem=stem, backend=backend) as preview:
+        return _run_motion_correction(
+            tif_path, cfg, output_dir, stem, backend, gpu_lock, preview,
+            run_rowwise_pcc_register, run_suite2p_fov, _write_mc_tif)
+
+
+def _run_motion_correction(
+    tif_path: Path,
+    cfg: PipelineConfig,
+    output_dir: Path,
+    stem: str,
+    backend: str,
+    gpu_lock,
+    preview,
+    run_rowwise_pcc_register,
+    run_suite2p_fov,
+    _write_mc_tif,
+) -> tuple[dict, Path, np.ndarray, np.ndarray]:
+    """Backend dispatch body of :func:`run_motion_correction` (preview-scoped)."""
     rowwise_motion: tuple | None = None
 
     if backend == "rowwise-pcc":
@@ -118,6 +142,7 @@ def run_motion_correction(
             frame_batch=getattr(cfg, "mc_frame_batch", 256),
             force_cpu=cfg.force_cpu,
             gpu_lock=gpu_lock,
+            preview=preview,
         )
         rowwise_motion = (motion_x, motion_y)
         # 2. Suite2p detection-only on the already-corrected movie.
@@ -125,6 +150,11 @@ def run_motion_correction(
         s2p_do_registration = False
     elif backend == "legacy":
         # Genuine SIMA HiddenMarkov2D in the sima-legacy sidecar env (subprocess).
+        # No live preview: the correction happens in a py3.8 child process with
+        # no in-process hook, so say so rather than showing an empty card.
+        preview.set_phase(
+            "unsupported",
+            note="legacy (SIMA) runs in a subprocess sidecar; no live preview")
         from roigbiv.pipeline.legacy_mc import run_sima_legacy_register
         mc_tif_path, motion_x, motion_y = run_sima_legacy_register(
             tif_path,
@@ -168,6 +198,9 @@ def run_motion_correction(
     }}
 
     # run_suite2p_fov wants output_dir as its root; it creates {output_dir}/{stem}/suite2p/...
+    # The preview is only handed over when Suite2p is the thing doing the
+    # correcting: under rowwise-pcc/legacy this call is detection-only and the
+    # preview has already been filled (or marked unsupported) by that backend.
     run_suite2p_fov(
         s2p_input,
         output_dir,
@@ -176,6 +209,7 @@ def run_motion_correction(
         tau=cfg.tau,
         do_registration=s2p_do_registration,
         cfg=s2p_reg_cfg,
+        preview=preview if backend == "phasecorr" else None,
     )
 
     ops_path = s2p_root / "suite2p" / "plane0" / "ops.npy"

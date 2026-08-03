@@ -338,7 +338,9 @@ def _rowwise_residual(reg, tmpl, strip_h, max_disp, smooth_rows, smooth_time,
 
 def _register_batch(frames, tmpl, strip_h, max_disp, smooth_rows, smooth_time,
                     torch, Fnn, *, prefilter=False, pf_lo=1.0, pf_hi=8.0,
-                    confidence_weight=False):
+                    confidence_weight=False, return_conf=False):
+    """Register one frame batch. With ``return_conf`` also yields the rigid PCC
+    peak per frame (registration confidence for the live preview trace)."""
     B, Ly, Lx = frames.shape
     base = _make_base_grid(B, Ly, Lx, frames.device, torch)
     # Rigid step: estimate the global shift on band-passed inputs, warp the raw.
@@ -348,13 +350,16 @@ def _register_batch(frames, tmpl, strip_h, max_disp, smooth_rows, smooth_time,
     else:
         est, tmpl_e = frames, tmpl
     tconj = torch.conj(torch.fft.rfft2(tmpl_e))
-    fy, fx = _pcc_shifts(est, tconj, Ly, Lx, max_disp, torch)
+    fy, fx, conf = _pcc_shifts(est, tconj, Ly, Lx, max_disp, torch,
+                               return_conf=True)
     reg_rigid = _warp(frames, _const_field(fx, fy, Ly, Lx, torch), base, Ly, Lx, torch, Fnn)
     resid = _rowwise_residual(reg_rigid, tmpl, strip_h, max_disp,
                               smooth_rows, smooth_time, torch, Fnn,
                               prefilter=prefilter, pf_lo=pf_lo, pf_hi=pf_hi,
                               confidence_weight=confidence_weight)
     reg = _warp(reg_rigid, resid, base, Ly, Lx, torch, Fnn)
+    if return_conf:
+        return reg, fy, fx, conf
     return reg, fy, fx
 
 
@@ -441,6 +446,7 @@ def run_rowwise_pcc_register(
     frame_batch: int = 256,
     force_cpu: bool = False,
     gpu_lock=None,
+    preview=None,
 ):
     """Pre-register one FOV and write the corrected movie as ``{stem}_mc.tif``.
 
@@ -453,6 +459,11 @@ def run_rowwise_pcc_register(
 
     ``fs`` is accepted for signature symmetry with the Suite2p path (the
     registered movie itself is frame-rate agnostic).
+
+    ``preview`` is an optional :class:`~roigbiv.pipeline.mc_preview.MCPreviewWriter`
+    fed one raw/corrected frame pair per batch (throttled by wall clock) so the
+    UI can render the correction as it happens. It is purely diagnostic and
+    never affects the registered output.
 
     Returns
     -------
@@ -491,31 +502,59 @@ def run_rowwise_pcc_register(
         with lock_cm, tifffile.TiffWriter(str(mc_tif_path), bigtiff=True) as tw:
             if not do_registration:
                 # Pre-corrected input (``*_mc`` convention): pass through, zero shifts.
+                if preview is not None:
+                    preview.set_total(T)
+                    preview.set_phase(
+                        "skipped_precorrected",
+                        note="input already motion-corrected; passed through")
                 for b0 in range(0, T, frame_batch):
                     b1 = min(b0 + frame_batch, T)
-                    _append_frames(
-                        tw, _to_u16(np.asarray(stack[b0:b1], dtype=np.float32)),
-                        software=MC_SOFTWARE_TAG if b0 == 0 else None)
+                    block = np.asarray(stack[b0:b1], dtype=np.float32)
+                    if preview is not None and preview.should_emit():
+                        # Nothing was corrected, so both panes show the same
+                        # frame — that identity is the diagnostic.
+                        mid = (b1 - b0) // 2
+                        preview.emit(block[mid], block[mid],
+                                     frame_index=b0 + mid, n_done=b1)
+                    _append_frames(tw, _to_u16(block),
+                                   software=MC_SOFTWARE_TAG if b0 == 0 else None)
             else:
+                if preview is not None:
+                    preview.set_total(T)
+                    preview.set_phase("building_reference")
                 tmpl = _build_template(stack, device, n_template_iters,
                                        max_displacement, torch, Fnn,
                                        prefilter=prefilter,
                                        pf_lo=prefilter_sigma_low,
                                        pf_hi=prefilter_sigma_high)
+                if preview is not None:
+                    preview.set_phase("registering")
                 batch = _vram_budget_batch(Ly, Lx, device, frame_batch, torch)
                 for b0 in range(0, T, batch):
                     b1 = min(b0 + batch, T)
                     frames = torch.as_tensor(
                         np.ascontiguousarray(stack[b0:b1]).astype(np.float32),
                         device=device)
-                    reg, fy, fx = _register_batch(
+                    reg, fy, fx, conf = _register_batch(
                         frames, tmpl, strip_height, max_displacement,
                         smooth_sigma_rows, smooth_sigma_time, torch, Fnn,
                         prefilter=prefilter, pf_lo=prefilter_sigma_low,
                         pf_hi=prefilter_sigma_high,
-                        confidence_weight=strip_confidence_weight)
+                        confidence_weight=strip_confidence_weight,
+                        return_conf=True)
                     motion_y[b0:b1] = fy.detach().cpu().numpy()
                     motion_x[b0:b1] = fx.detach().cpu().numpy()
+                    if preview is not None:
+                        preview.record_shifts(b0, motion_y[b0:b1],
+                                              motion_x[b0:b1],
+                                              conf.detach().cpu().numpy())
+                        if preview.should_emit():
+                            # Slice on the GPU before the host copy so the
+                            # transfer is one small frame, not the whole batch.
+                            mid = (b1 - b0) // 2
+                            preview.emit(frames[mid].detach().cpu().numpy(),
+                                         reg[mid].detach().cpu().numpy(),
+                                         frame_index=b0 + mid, n_done=b1)
                     _append_frames(tw, _to_u16(reg.detach().cpu().numpy()),
                                    software=MC_SOFTWARE_TAG if b0 == 0 else None)
     finally:

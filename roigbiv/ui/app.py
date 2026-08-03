@@ -124,6 +124,9 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     _wire_routes(app)
     from roigbiv.ui.routes.roi_editor import register_flask_routes
     register_flask_routes(app.server)
+    from roigbiv.ui.routes.mc_preview import (
+        register_flask_routes as register_mc_preview_routes)
+    register_mc_preview_routes(app.server)
     _wire_sidebar_toggles(app)
     _wire_theme_toggle(app)
     error_components.register_callbacks(app)

@@ -416,6 +416,82 @@ def _selected_run_paths(workspace, selected):
             if selected is None or str(t) in selected]
 
 
+def _live_pane(pane_id: str, title: str, subtitle: str,
+               overlay: bool = False) -> dbc.Col:
+    """One image pane of the live card, optionally with a valid-crop overlay."""
+    inner = [
+        html.Img(id=pane_id,
+                 style={"width": "100%", "display": "block",
+                        # Nearest-neighbour: the preview is already decimated,
+                        # and browser smoothing would hide the residual motion
+                        # this pane exists to reveal.
+                        "imageRendering": "pixelated",
+                        "background": "var(--bs-tertiary-bg)",
+                        "aspectRatio": "1 / 1"}),
+    ]
+    if overlay:
+        inner.append(html.Div(
+            id=f"{pane_id}-crop",
+            style={"display": "none", "position": "absolute",
+                   "border": "1px dashed var(--bs-warning)",
+                   "pointerEvents": "none"},
+        ))
+    return dbc.Col([
+        html.Div([
+            html.Span(title, id=f"{pane_id}-title", className="small fw-bold"),
+            html.Span(subtitle, className="small text-muted ms-2"),
+        ], className="mb-1"),
+        html.Div(inner, style={"position": "relative"}),
+    ], md=4)
+
+
+def _live_mc_section() -> html.Div:
+    """Live view of the FOV being motion-corrected, fed by the sidecar.
+
+    The images refresh far faster than the run-status tick, so the hot path is a
+    clientside ``fetch`` of ``/api/mc-preview/list`` that only rewrites the three
+    ``<img>`` sources; the browser pulls the PNGs from Flask out of band. Nothing
+    here runs Python per tick — the pipeline is a daemon thread of this same
+    process during a UI run, so the GIL is worth protecting.
+
+    The slower half (shift/confidence traces, quality metrics, valid-crop
+    rectangle, scrub range) rides the existing 1.5 s run-status interval and
+    reads ``state.json`` from disk directly.
+    """
+    return html.Div([
+        dcc.Interval(id="roigbiv-mc-live-tick", interval=450, disabled=True),
+        # Output sink for the clientside fetch loop, which writes the image
+        # sources with set_props rather than through callback return values.
+        dcc.Store(id="roigbiv-mc-live-sink"),
+        html.Div([
+            html.H5("Live motion correction", className="mb-0 me-3"),
+            dbc.Switch(id="roigbiv-mc-live-blink", label="Blink A/B",
+                       value=False, className="mb-0"),
+        ], className="d-flex align-items-center mt-3 mb-1"),
+        html.Div(id="roigbiv-mc-live-status",
+                 className="small text-muted mb-2",
+                 children="Waiting for a run…"),
+        dbc.Row([
+            _live_pane("roigbiv-mc-live-raw", "Raw", "before"),
+            _live_pane("roigbiv-mc-live-corr", "Corrected", "after",
+                       overlay=True),
+            _live_pane("roigbiv-mc-live-diff", "Difference", "corrected − raw"),
+        ], className="g-2"),
+        html.Div(id="roigbiv-mc-live-metrics", className="mt-2"),
+        dcc.Graph(id="roigbiv-mc-live-shifts",
+                  figure=_empty_shift_figure(),
+                  config={"displaylogo": False, "displayModeBar": False},
+                  style={"height": "220px"}),
+        html.Div([
+            html.Span("Scrub", className="small text-muted me-2"),
+            dcc.Slider(id="roigbiv-mc-live-scrub", min=0, max=0, step=None,
+                       value=0, marks=None, disabled=True,
+                       tooltip={"placement": "bottom"}),
+        ], id="roigbiv-mc-live-scrub-wrap", className="mt-1"),
+        html.Hr(),
+    ])
+
+
 def _mc_preview_section() -> html.Div:
     """Read-only motion-correction preview: mean projection per FOV.
 
@@ -485,6 +561,7 @@ def _right_column(snap: Optional["RunSnapshot"] = None) -> html.Div:
         html.Div(id="roigbiv-run-banner", children=_render_banner(snap)),
         html.Div(id="roigbiv-run-log",
                  children=log_stream(snap.logs if snap else [])),
+        _live_mc_section(),
         _mc_preview_section(),
         html.Hr(),
         html.H5("Per-FOV results", className="mb-2"),
@@ -684,6 +761,112 @@ def register_callbacks(app: dash.Dash) -> None:
             (not snap.active) or snap.stopping,
         )
 
+    # ── live motion-correction view ───────────────────────────────────────
+    # Hot path: no Python per tick. The browser polls the tiny /list endpoint
+    # and rewrites the three <img> sources itself; the PNGs come from Flask out
+    # of band. During a UI run the pipeline is a daemon thread of this process,
+    # so keeping the 450 ms loop off the callback machinery keeps it off the GIL.
+    app.clientside_callback(
+        """
+        function(n, blink) {
+            const D = window.dash_clientside;
+            if (!D || !D.set_props) { return D ? D.no_update : null; }
+            fetch('/api/mc-preview/list', {cache: 'no-store'})
+                .then(function(r) { return r.ok ? r.json() : []; })
+                .then(function(list) {
+                    if (!list || !list.length) { return; }
+                    const s = list[0];
+                    if (!s || s.seq === undefined || s.seq === null || s.seq < 0) {
+                        return;
+                    }
+                    const q = 'stem=' + encodeURIComponent(s.stem)
+                            + '&seq=' + s.seq;
+                    const url = function(k) {
+                        return '/api/mc-preview/image?' + q + '&kind=' + k;
+                    };
+                    // Blink mode alternates the middle pane between the raw and
+                    // corrected versions of the SAME frame. Flipping one set of
+                    // pixels in place is far more sensitive to residual motion
+                    // than comparing two panes side by side. Both frames are
+                    // already cached (immutable URLs), so the flip is instant.
+                    const mid = blink ? ((n % 2) ? 'raw' : 'corr') : 'corr';
+                    D.set_props('roigbiv-mc-live-raw', {src: url('raw')});
+                    D.set_props('roigbiv-mc-live-corr', {src: url(mid)});
+                    D.set_props('roigbiv-mc-live-corr-title', {children:
+                        blink ? ('A/B · ' + (mid === 'raw' ? 'raw' : 'corrected'))
+                              : 'Corrected'});
+                    if (s.has_diff) {
+                        D.set_props('roigbiv-mc-live-diff', {src: url('diff')});
+                    }
+                })
+                .catch(function() { /* transient: next tick retries */ });
+            return D.no_update;
+        }
+        """,
+        Output("roigbiv-mc-live-sink", "data"),
+        Input("roigbiv-mc-live-tick", "n_intervals"),
+        State("roigbiv-mc-live-blink", "value"),
+    )
+
+    @app.callback(
+        Output("roigbiv-mc-live-tick", "disabled"),
+        Output("roigbiv-mc-live-status", "children"),
+        Output("roigbiv-mc-live-shifts", "figure"),
+        Output("roigbiv-mc-live-metrics", "children"),
+        Output("roigbiv-mc-live-corr-crop", "style"),
+        Output("roigbiv-mc-live-scrub", "min"),
+        Output("roigbiv-mc-live-scrub", "max"),
+        Output("roigbiv-mc-live-scrub", "marks"),
+        Output("roigbiv-mc-live-scrub", "disabled"),
+        Input("roigbiv-process-tick", "n_intervals"),
+        State("roigbiv-theme", "data"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _on_live_tick(_n, theme):
+        # The slow half: traces, metrics, crop box and scrub range, all derived
+        # from state.json read straight off disk (no HTTP hop — this is the same
+        # process that wrote it). Rides the existing 1.5 s run-status interval
+        # because redrawing Plotly at the image cadence would be pure jank.
+        from roigbiv.ui.services.mc_preview import latest_state
+
+        state = latest_state(get_app_state().workspace)
+        records = (state or {}).get("records") or []
+        terminal = (state or {}).get("phase") in _TERMINAL_LIVE_PHASES
+        # Scrubbing is offered only once the run is over: while frames are
+        # still arriving the fast loop owns the image sources and would fight
+        # any slider position the user picked.
+        can_scrub = bool(terminal and len(records) > 1)
+        return (
+            not _live_tick_active(state),
+            _live_status_text(state),
+            _shift_figure(state, theme),
+            _render_live_metrics(state),
+            _crop_overlay_style(state),
+            min(records) if records else 0,
+            max(records) if records else 0,
+            {str(r): "" for r in records} if can_scrub else None,
+            not can_scrub,
+        )
+
+    @app.callback(
+        Output("roigbiv-mc-live-raw", "src", allow_duplicate=True),
+        Output("roigbiv-mc-live-corr", "src", allow_duplicate=True),
+        Output("roigbiv-mc-live-diff", "src", allow_duplicate=True),
+        Input("roigbiv-mc-live-scrub", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_scrub(seq):
+        # Only reachable once the run has finished (the slider is disabled
+        # during a run), so this cannot race the clientside fast loop.
+        from roigbiv.ui.services.mc_preview import latest_state
+
+        state = latest_state(get_app_state().workspace)
+        if state is None or seq is None:
+            return no_update, no_update, no_update
+        stem = state.get("stem", "")
+        base = f"/api/mc-preview/image?stem={stem}&seq={int(seq)}&kind="
+        return f"{base}raw", f"{base}corr", f"{base}diff"
+
     @app.callback(
         Output("roigbiv-run-banner", "children", allow_duplicate=True),
         Output("roigbiv-stop-btn", "disabled", allow_duplicate=True),
@@ -856,6 +1039,154 @@ def _format_timer(
 
 def _fmt_metric(v) -> str:
     return f"{v:.3f}" if isinstance(v, (int, float)) else "—"
+
+
+# ── live motion-correction rendering ───────────────────────────────────────
+
+_LIVE_PHASE_LABELS = {
+    "starting": "Starting…",
+    "converting": "Reading stack…",
+    "building_reference": "Building reference frame…",
+    "registering": "Registering",
+    "done": "Registration complete",
+    "skipped_precorrected": "Input already motion-corrected — nothing to correct",
+    "skipped_resume": "Already registered (resumed) — registration not re-run",
+    "unsupported": "No live preview for this backend",
+    "degraded": "Preview writes failed — live view unavailable",
+    "aborted": "Run aborted",
+}
+
+
+#: Phases after which no more frames will arrive — the fast image loop can stop
+#: and the scrubber can take over. Mirrors
+#: :data:`roigbiv.pipeline.mc_preview.TERMINAL_PHASES`.
+_TERMINAL_LIVE_PHASES = frozenset({
+    "done", "skipped_precorrected", "skipped_resume", "unsupported",
+    "degraded", "aborted",
+})
+
+
+def _live_tick_active(state: Optional[dict]) -> bool:
+    """Whether the fast image loop should keep polling.
+
+    Keeps running on a stale sidecar so a briefly-wedged run resumes painting
+    on its own, but stops once the phase says no further frames are coming.
+    """
+    if state is None:
+        return False
+    return (state.get("phase") or "starting") not in _TERMINAL_LIVE_PHASES
+
+
+def _empty_shift_figure(theme: Optional[str] = None):
+    import plotly.graph_objects as go
+
+    from roigbiv.ui.services import theme as theme_svc
+
+    fig = go.Figure()
+    fig.update_layout(
+        template=theme_svc.plotly_template(theme),
+        margin=dict(l=48, r=48, t=8, b=28),
+        showlegend=False,
+        xaxis=dict(title="frame"),
+        yaxis=dict(title="shift (px)"),
+    )
+    return fig
+
+
+def _shift_figure(state: Optional[dict], theme: Optional[str] = None):
+    """Rigid displacement and phase-correlation confidence vs frame.
+
+    ``cmax`` shares the x axis on a secondary y: a shift trace that looks
+    plausible while confidence collapses is the signature of the registration
+    locking onto noise, which neither trace shows alone.
+    """
+    import plotly.graph_objects as go
+
+    from roigbiv.ui.services import theme as theme_svc
+
+    shifts = (state or {}).get("shifts") or {}
+    frames = shifts.get("frame") or []
+    if not frames:
+        return _empty_shift_figure(theme)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=frames, y=shifts.get("x") or [], name="x shift",
+                             mode="lines", line=dict(width=1.4)))
+    fig.add_trace(go.Scatter(x=frames, y=shifts.get("y") or [], name="y shift",
+                             mode="lines", line=dict(width=1.4)))
+    cmax = [c for c in (shifts.get("cmax") or []) if c is not None]
+    if cmax:
+        fig.add_trace(go.Scatter(
+            x=frames, y=shifts.get("cmax") or [], name="confidence",
+            mode="lines", yaxis="y2",
+            line=dict(width=1.0, dash="dot",
+                      color=theme_svc.axis_muted_color(theme))))
+    fig.update_layout(
+        template=theme_svc.plotly_template(theme),
+        margin=dict(l=48, r=48, t=8, b=28),
+        showlegend=True,
+        legend=dict(orientation="h", y=1.18, x=0, font=dict(size=10)),
+        xaxis=dict(title="frame"),
+        yaxis=dict(title="shift (px)"),
+        yaxis2=dict(title="cmax", overlaying="y", side="right",
+                    showgrid=False),
+    )
+    return fig
+
+
+def _render_live_metrics(state: Optional[dict]) -> html.Div:
+    """Quality metrics for the frame currently on screen.
+
+    Same four numbers, same formatter, as the post-run per-FOV table — they are
+    computed on the full-resolution corrected frame precisely so the live and
+    final readouts are comparable.
+    """
+    m = (state or {}).get("live_metrics") or {}
+    if not m:
+        return html.Div()
+    pairs = [("Sharpness", "lap_var_smooth"), ("Banding", "banding_score"),
+             ("Anisotropy", "grad_anisotropy_xy"), ("Contrast", "contrast_rms")]
+    return html.Div(
+        [html.Span([html.Span(f"{label} ", className="text-muted"),
+                    html.Span(_fmt_metric(m.get(key)), className="fw-bold")],
+                   className="me-3 small")
+         for label, key in pairs])
+
+
+def _crop_overlay_style(state: Optional[dict]) -> dict:
+    """Inset box marking the region unaffected by the ``np.roll`` edge wrap.
+
+    Suite2p shifts frames with ``np.roll``, so pixels pushed past one edge
+    reappear on the opposite one. Without this outline that wrapped strip reads
+    as a registration artifact rather than an expected consequence.
+    """
+    crop = (state or {}).get("valid_crop_frac")
+    if not crop or len(crop) != 4:
+        return {"display": "none"}
+    x0, y0, x1, y1 = crop
+    return {
+        "display": "block", "position": "absolute", "pointerEvents": "none",
+        "border": "1px dashed var(--bs-warning)",
+        "left": f"{x0 * 100:.3f}%", "top": f"{y0 * 100:.3f}%",
+        "width": f"{(x1 - x0) * 100:.3f}%", "height": f"{(y1 - y0) * 100:.3f}%",
+    }
+
+
+def _live_status_text(state: Optional[dict]) -> str:
+    if state is None:
+        return "Waiting for a run…"
+    phase = state.get("phase") or "starting"
+    label = _LIVE_PHASE_LABELS.get(phase, phase)
+    parts = [f"{state.get('stem', '?')} · {state.get('backend', '?')}", label]
+    n_total = state.get("n_total") or 0
+    if phase == "registering" and n_total:
+        parts.append(f"frame {state.get('n_done', 0)} / {n_total}")
+    if (state.get("pass_index") or 0) > 0:
+        parts.append(f"pass {int(state['pass_index']) + 1}")
+    if state.get("stale") and phase not in ("done", "skipped_precorrected",
+                                            "skipped_resume", "unsupported"):
+        parts.append("(no recent update)")
+    return " · ".join(parts)
 
 
 def _render_results(summaries: list[dict]) -> html.Div:
