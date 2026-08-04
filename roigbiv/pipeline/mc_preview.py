@@ -133,7 +133,7 @@ class MCPreviewWriter:
         min_interval_s: float = 0.4,
         max_records: int = 300,
         metrics: bool = True,
-        diff: bool = True,
+        avg: bool = True,
     ) -> None:
         self.dir = preview_dir(output_dir)
         self.stem = stem
@@ -143,7 +143,7 @@ class MCPreviewWriter:
         self.min_interval_s = float(min_interval_s)
         self.max_records = max(1, int(max_records))
         self.want_metrics = bool(metrics)
-        self.want_diff = bool(diff)
+        self.want_avg = bool(avg)
 
         self._seq = -1
         self._records: list[int] = []
@@ -156,7 +156,11 @@ class MCPreviewWriter:
         self._last_metrics_t = -1e9
         self._failures = 0
         self._norm: tuple[float, float] | None = None
-        self._diff_scale: float | None = None
+        # Running mean of every raw frame previewed so far this run (the same
+        # throttled ~2.5 Hz stream that feeds the raw/corrected panes, not
+        # every frame in the registration batch loop).
+        self._avg_mean: np.ndarray | None = None
+        self._avg_n: int = 0
 
         self._phase = "starting"
         self._note: str | None = None
@@ -299,7 +303,7 @@ class MCPreviewWriter:
         return (time.monotonic() - self._last_emit_t) >= self.min_interval_s
 
     def emit(self, raw, corrected, *, frame_index: int, n_done: int) -> None:
-        """Write one raw/corrected (and optionally difference) record.
+        """Write one raw/corrected (and optionally running-average) record.
 
         ``raw`` and ``corrected`` must be the *same* frame index — the UI's A/B
         blink is meaningless otherwise. Callers holding a view into a buffer the
@@ -359,15 +363,16 @@ class MCPreviewWriter:
         seq = self._seq + 1
         self._write_bytes(f"raw_{seq:06d}.png", encode_png(raw_ds, lo, hi))
         self._write_bytes(f"corr_{seq:06d}.png", encode_png(corr_ds, lo, hi))
-        if self.want_diff:
-            d = corr_ds - raw_ds
-            if self._diff_scale is None:
-                s = float(np.percentile(np.abs(d), 99.0))
-                self._diff_scale = s if s > 0 else 1.0
-            s = self._diff_scale
-            # Symmetric window: mid-grey is "unchanged", so the eye reads where
-            # the warp actually moved pixels rather than absolute brightness.
-            self._write_bytes(f"diff_{seq:06d}.png", encode_png(d, -s, s))
+        if self.want_avg:
+            if self._avg_mean is None:
+                self._avg_mean = raw_ds.astype(np.float32).copy()
+            else:
+                self._avg_n += 1
+                # Incremental mean: reuses the same frozen (lo, hi) window as
+                # the raw/corrected panes, so brightness reads consistently
+                # across all three rather than needing its own stretch.
+                self._avg_mean += (raw_ds - self._avg_mean) / (self._avg_n + 1)
+            self._write_bytes(f"avg_{seq:06d}.png", encode_png(self._avg_mean, lo, hi))
 
         self._seq = seq
         superseded, self._transient = self._transient, None
@@ -403,7 +408,7 @@ class MCPreviewWriter:
                     self._retire(seq)
 
     def _retire(self, seq: int) -> None:
-        for kind in ("raw", "corr", "diff"):
+        for kind in ("raw", "corr", "avg"):
             try:
                 (self.dir / f"{kind}_{seq:06d}.png").unlink()
             except OSError:
@@ -461,7 +466,7 @@ class MCPreviewWriter:
             "preview_shape": (list(self._preview_shape)
                               if self._preview_shape else None),
             "norm": list(self._norm) if self._norm else None,
-            "has_diff": bool(self.want_diff),
+            "has_avg": bool(self.want_avg),
             "valid_crop_frac": self._valid_crop_frac(),
             "live_metrics": self._metrics,
             "shifts": {
@@ -509,5 +514,5 @@ def writer_for(cfg, output_dir, *, stem: str, backend: str) -> MCPreviewWriter:
         min_interval_s=getattr(cfg, "mc_preview_min_interval_s", 0.4),
         max_records=getattr(cfg, "mc_preview_max_records", 300),
         metrics=getattr(cfg, "mc_preview_metrics", True),
-        diff=getattr(cfg, "mc_preview_diff", True),
+        avg=getattr(cfg, "mc_preview_avg", True),
     )

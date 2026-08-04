@@ -475,7 +475,7 @@ def _live_mc_section() -> html.Div:
             _live_pane("roigbiv-mc-live-raw", "Raw", "before"),
             _live_pane("roigbiv-mc-live-corr", "Corrected", "after",
                        overlay=True),
-            _live_pane("roigbiv-mc-live-diff", "Difference", "corrected − raw"),
+            _live_pane("roigbiv-mc-live-avg", "Raw average", "cumulative mean"),
         ], className="g-2"),
         html.Div(id="roigbiv-mc-live-metrics", className="mt-2"),
         dcc.Graph(id="roigbiv-mc-live-shifts",
@@ -795,8 +795,8 @@ def register_callbacks(app: dash.Dash) -> None:
                     D.set_props('roigbiv-mc-live-corr-title', {children:
                         blink ? ('A/B · ' + (mid === 'raw' ? 'raw' : 'corrected'))
                               : 'Corrected'});
-                    if (s.has_diff) {
-                        D.set_props('roigbiv-mc-live-diff', {src: url('diff')});
+                    if (s.has_avg) {
+                        D.set_props('roigbiv-mc-live-avg', {src: url('avg')});
                     }
                 })
                 .catch(function() { /* transient: next tick retries */ });
@@ -851,7 +851,7 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-mc-live-raw", "src", allow_duplicate=True),
         Output("roigbiv-mc-live-corr", "src", allow_duplicate=True),
-        Output("roigbiv-mc-live-diff", "src", allow_duplicate=True),
+        Output("roigbiv-mc-live-avg", "src", allow_duplicate=True),
         Input("roigbiv-mc-live-scrub", "value"),
         prevent_initial_call=True,
     )
@@ -865,7 +865,7 @@ def register_callbacks(app: dash.Dash) -> None:
             return no_update, no_update, no_update
         stem = state.get("stem", "")
         base = f"/api/mc-preview/image?stem={stem}&seq={int(seq)}&kind="
-        return f"{base}raw", f"{base}corr", f"{base}diff"
+        return f"{base}raw", f"{base}corr", f"{base}avg"
 
     @app.callback(
         Output("roigbiv-run-banner", "children", allow_duplicate=True),

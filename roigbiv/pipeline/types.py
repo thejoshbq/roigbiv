@@ -34,6 +34,15 @@ class ROI:
 
     Populated incrementally: spatial features at gate time, trace fields
     during/after source subtraction, activity_type during classification.
+
+    ``mask`` vs. spatial features: for accept/flag ROIs, ``mask`` is replaced
+    post-gate by ``roi_stamp.py::canonicalize`` with a fixed-radius disk
+    centered on the ROI's own centroid (see ``PipelineConfig.roi_stamp_radius``
+    and docs/adr/0003-centroid-canonical-roi-stamps.md) — that's what
+    subtraction/traces/HITL/registry actually consume. ``area``/``solidity``/
+    ``eccentricity`` are NOT recomputed at that point; they remain the gate-time
+    record of the real detector-native geometry the accept/flag/reject decision
+    was based on. The two diverge by design once canonicalization runs.
     """
     mask: np.ndarray                        # (H, W) bool
     label_id: int                           # unique across all stages on this FOV
@@ -41,7 +50,8 @@ class ROI:
     confidence: str                         # "high" | "moderate" | "requires_review"
     gate_outcome: str                       # "accept" | "flag" | "reject"
 
-    # Spatial features (spec §13.1)
+    # Spatial features (spec §13.1) — gate-time detector geometry; see class
+    # docstring for why these can diverge from the persisted `mask` shape.
     area: int = 0
     solidity: float = 0.0
     eccentricity: float = 0.0
@@ -496,7 +506,7 @@ class PipelineConfig:
     mc_preview_max_records: int = 300       # retained records; halving decimation
                                             # keeps the timeline uniform + bounded
     mc_preview_metrics: bool = True         # run mc_metrics on each emitted frame
-    mc_preview_diff: bool = True            # also write the corrected − raw pane
+    mc_preview_avg: bool = True             # also write the raw running-average pane
 
     # ── Acquisition / lens profile (see pipeline/profiles.py) ─────────────
     # Records which profile bundle the CLI/UI resolver applied
@@ -671,6 +681,20 @@ class PipelineConfig:
     stage3_chunk_budget_bytes: int = 1_073_741_824   # 1 GB cap on the per-chunk float32 working set
     stage3_sigma_window_frames: int = 500   # sliding MAD window for per-pixel noise
     stage3_max_events: int = 2_000_000      # hard cap — if exceeded, raise threshold adaptively
+
+    # ── Canonical ROI stamp (see roigbiv/pipeline/roi_stamp.py) ────────────
+    # Every accepted/flagged ROI's detector-native boundary (irregular Cellpose
+    # /Suite2p mask, or regionprops-derived Stage 4 blob) is replaced post-gate
+    # with a fixed-radius disk centered on its own centroid — one canonical
+    # shape across all 4 stages, so cross-session identity (ROICaT footprint
+    # matching) stops depending on session-to-session segmentation shape noise.
+    # Gates 1/2/4 still evaluate real detector geometry before this runs; only
+    # what subtraction/traces/HITL/registry consume afterward changes. Decoupled
+    # from stage3's spatial_pool_radius (a detection-time pooling parameter) —
+    # this is the output-representation radius. Distinct field so the two can
+    # diverge; same default and same auto-scale formula for continuity.
+    # See docs/adr/0003-centroid-canonical-roi-stamps.md.
+    roi_stamp_radius: int = 8               # px — canonical disk radius
 
     # ── Gate 3 (Waveform validation) ──────────────────────────────────────
     gate3_min_waveform_r2: float = 0.6

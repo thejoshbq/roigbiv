@@ -54,7 +54,7 @@ def test_emit_writes_a_complete_record(tmp_path):
     assert st["n_done"] == 64
     assert st["n_total"] == 500
     assert st["shape"] == [64, 64]
-    for kind in ("raw", "corr", "diff"):
+    for kind in ("raw", "corr", "avg"):
         assert (preview_dir(tmp_path) / f"{kind}_000000.png").exists()
 
 
@@ -64,16 +64,35 @@ def test_state_seq_always_names_files_on_disk(tmp_path):
     for i in range(40):
         w.emit(_frame(seed=i), _frame(seed=i + 100), frame_index=i, n_done=i)
         st = _state(tmp_path)
-        for kind in ("raw", "corr", "diff"):
+        for kind in ("raw", "corr", "avg"):
             p = preview_dir(tmp_path) / f"{kind}_{st['seq']:06d}.png"
             assert p.exists() and p.stat().st_size > 0, (i, kind)
 
 
-def test_no_diff_pane_when_disabled(tmp_path):
-    w = _writer(tmp_path, diff=False)
+def test_no_avg_pane_when_disabled(tmp_path):
+    w = _writer(tmp_path, avg=False)
     w.emit(_frame(), _frame(seed=1), frame_index=0, n_done=1)
-    assert not (preview_dir(tmp_path) / "diff_000000.png").exists()
-    assert _state(tmp_path)["has_diff"] is False
+    assert not (preview_dir(tmp_path) / "avg_000000.png").exists()
+    assert _state(tmp_path)["has_avg"] is False
+
+
+def test_avg_pane_tracks_running_mean_of_raw_frames(tmp_path):
+    """The pane must hold the running mean of previewed raw frames through the
+    same frozen display window as the raw/corrected panes, not an independent
+    stretch (encode_png with self._norm, not a per-frame percentile)."""
+    w = _writer(tmp_path)
+    raws = [_frame(seed=i, level=400.0 + 50.0 * i) for i in range(4)]
+    corrs = [_frame(seed=i + 50) for i in range(4)]
+
+    running_mean = None
+    for i, (raw, corr) in enumerate(zip(raws, corrs)):
+        w.emit(raw, corr, frame_index=i, n_done=i + 1)
+        running_mean = (raw.copy() if running_mean is None
+                         else running_mean + (raw - running_mean) / (i + 1))
+        lo, hi = _state(tmp_path)["norm"]
+        expected = encode_png(running_mean, lo, hi)
+        actual = (preview_dir(tmp_path) / f"avg_{i:06d}.png").read_bytes()
+        assert actual == expected, f"avg pane at seq={i} is not the running mean"
 
 
 def test_preview_is_downsampled_to_max_dim(tmp_path):
@@ -321,7 +340,7 @@ def test_rowwise_pcc_feeds_the_preview(tmp_path):
     z = np.load(preview_dir(out_dir) / "shifts.npz")
     assert z["frame"].shape == (len(frames),)
     assert np.isfinite(z["cmax"]).all()
-    for kind in ("raw", "corr", "diff"):
+    for kind in ("raw", "corr", "avg"):
         assert (preview_dir(out_dir) / f"{kind}_{st['seq']:06d}.png").exists()
 
 

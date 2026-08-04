@@ -156,7 +156,7 @@ def test_state_route_rejects_traversal(client, stem):
     assert client.get(f"/api/mc-preview/state?stem={stem}").status_code == 400
 
 
-@pytest.mark.parametrize("kind", ["raw", "corr", "corrected", "diff"])
+@pytest.mark.parametrize("kind", ["raw", "corr", "corrected", "avg"])
 def test_image_route_serves_png(client, workspace, kind):
     w = _sidecar(workspace.output_root, "fovA")
     resp = client.get(f"/api/mc-preview/image?stem=fovA&seq={w._seq}&kind={kind}")
@@ -212,7 +212,7 @@ def test_live_card_renders_above_the_existing_preview():
 
     ids = _ids(_live_mc_section())
     for expected in ("roigbiv-mc-live-tick", "roigbiv-mc-live-raw",
-                     "roigbiv-mc-live-corr", "roigbiv-mc-live-diff",
+                     "roigbiv-mc-live-corr", "roigbiv-mc-live-avg",
                      "roigbiv-mc-live-blink", "roigbiv-mc-live-shifts",
                      "roigbiv-mc-live-status", "roigbiv-mc-live-metrics",
                      "roigbiv-mc-live-corr-crop", "roigbiv-mc-live-scrub"):

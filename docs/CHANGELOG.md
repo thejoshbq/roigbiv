@@ -6,12 +6,32 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- **Canonical fixed-radius ROI stamps.** Every accepted/flagged ROI, from all four
+  detection stages, now has its detector-native boundary (irregular Cellpose/Suite2p mask,
+  or a regionprops-derived Stage-4 blob) replaced post-gate with a fixed-radius disk
+  centered on its own centroid (`roigbiv/pipeline/roi_stamp.py`, new
+  `PipelineConfig.roi_stamp_radius`, default 8 px, auto-scaled per FOV like
+  `spatial_pool_radius`). Gates 1/2/4 are unchanged — they still validate real detector
+  geometry before this runs; `area`/`solidity`/`eccentricity` remain that gate-time record.
+  Motivation: session-to-session segmentation shape variance was leaking into the
+  registry's ROICaT cross-session matching embeddings as a confound; one canonical shape
+  per ROI removes that confound without touching the registry/subtraction/trace code
+  itself (all three already consumed `roi.mask` generically). A new crowding guard
+  (`resolve_crowding`) demotes the weaker of any two heavily-overlapping stamps
+  `accept → flag`, mirroring Gate 1's existing merge-peak convention. See
+  `docs/adr/0003-centroid-canonical-roi-stamps.md` and `docs/design/OVERVIEW.md` §9 for the
+  full rationale and named tradeoffs (subtraction/trace precision vs. real footprints).
+
 - **Live motion-correction view.** The Dash Pipeline page now shows the FOV
   being corrected *while* registration runs: raw and corrected panes of the
-  same frame, an A/B blink that flips them in place, a difference pane, live
-  rigid-shift and phase-correlation-confidence traces, and running quality
-  metrics. Previously the only MC feedback was a mean projection and four
-  numbers computed after a FOV finished, 10–40 min into a run.
+  same frame, an A/B blink that flips them in place, a raw running-average
+  pane (a cumulative mean of previewed raw frames, showing drift the
+  uncorrected movie has accumulated so far — an earlier `corrected − raw`
+  difference pane was tried first and dropped for not carrying an actionable
+  signal), live rigid-shift and phase-correlation-confidence traces, and
+  running quality metrics. Previously the only MC feedback was a mean
+  projection and four numbers computed after a FOV finished, 10–40 min into a
+  run.
 
   The pipeline side writes a sidecar to `{output_dir}/mc_preview/`
   (`roigbiv/pipeline/mc_preview.py`) on every run — CLI, batch, and UI alike —

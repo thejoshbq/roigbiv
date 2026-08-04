@@ -28,12 +28,12 @@ from roigbiv.ui.services.mc_preview import (
     read_state,
 )
 
-_KINDS = {"raw": "raw", "corr": "corr", "corrected": "corr", "diff": "diff"}
+_KINDS = {"raw": "raw", "corr": "corr", "corrected": "corr", "avg": "avg"}
 
 # Keys exposed by /list — the fast poll only needs enough to build image URLs
 # and a status line, so the traces and metrics in state.json stay out of it.
 _LIST_KEYS = ("stem", "backend", "phase", "seq", "n_done", "n_total",
-              "pass_index", "updated_at", "stale", "has_diff")
+              "pass_index", "updated_at", "stale", "has_avg")
 
 
 def _session_preview_dir(stem: str):
@@ -75,7 +75,7 @@ def register_flask_routes(server: Flask) -> None:
             return str(exc), 400
         kind = _KINDS.get(request.args.get("kind", "corr"))
         if kind is None:
-            return "kind must be raw, corr, or diff", 400
+            return "kind must be raw, corr, or avg", 400
         try:
             seq = int(request.args.get("seq", "-1"))
         except ValueError:

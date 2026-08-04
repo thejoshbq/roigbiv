@@ -74,6 +74,7 @@ def test_derive_grin_scale_conservative():
     assert 30 <= d["min_area"] <= 90       # near tuned GRIN 80, conservative
     assert d["tile_norm_blocksize"] == 128
     assert d["spatial_pool_radius"] == 6
+    assert d["roi_stamp_radius"] == 6       # tracks spatial_pool_radius's formula
 
 
 def test_derive_min_area_has_hard_floor():
@@ -94,6 +95,7 @@ def test_derive_prism_scale_in_validated_band():
     assert 5000 <= d["max_area"] <= 9000
     assert d["tile_norm_blocksize"] == 256
     assert d["gate1_merge_peak_min_separation"] == 28
+    assert d["roi_stamp_radius"] == 28       # tracks spatial_pool_radius's formula
 
 
 # ── measure_soma_scale (synthetic) ───────────────────────────────────────────

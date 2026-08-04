@@ -39,6 +39,7 @@ from roigbiv.pipeline.profiles import (
     list_profiles,
     merged_overrides,
 )
+from roigbiv.pipeline.roi_stamp import canonicalize, resolve_crowding
 from roigbiv.pipeline.types import (
     DEFAULT_PIPELINE_MODE,
     FOVData,
@@ -626,6 +627,19 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
                               fov.dog_map, cfg, starting_label_id=1)
         stage_timings["gate1_s"] = time.time() - t_start
 
+        # Canonicalize: replace each accept/flag ROI's raw Cellpose boundary
+        # with a fixed-radius disk at its own centroid (roi_stamp.py). Gate 1
+        # already ran on the real geometry above; only what subtraction/
+        # traces/HITL/registry consume from here on changes. Reject-outcome
+        # ROIs keep their real mask (audit trail only, never subtracted).
+        for r in rois:
+            if r.gate_outcome in ("accept", "flag"):
+                canonicalize(r, cfg.roi_stamp_radius, fov.mean_M.shape)
+        # Two originally-distinct (non-overlapping) Cellpose instances can end
+        # up with crowded canonical stamps if their centroids are close — guard
+        # before counting outcomes below, since crowding can demote accept->flag.
+        resolve_crowding(rois, cfg.roi_stamp_radius)
+
         n_accept = sum(1 for r in rois if r.gate_outcome == "accept")
         n_flag = sum(1 for r in rois if r.gate_outcome == "flag")
         n_reject = sum(1 for r in rois if r.gate_outcome == "reject")
@@ -766,6 +780,23 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
                             and r.gate_outcome in ("accept", "flag")]
         stage2_rois = evaluate_gate2(stage2_candidates, stage1_for_gate2, cfg)
         stage_timings["stage2_detect_s"] = time.time() - t_start
+
+        # Canonicalize: gate 2 already validated real Suite2p footprint
+        # geometry above; from here on, accept/flag ROIs persist as a
+        # fixed-radius disk at their own centroid (roi_stamp.py).
+        for r in stage2_rois:
+            if r.gate_outcome in ("accept", "flag"):
+                canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])
+        # Cross-stage crowding guard, evaluated against the cumulative pool
+        # (already-persisted Stage 1 stamps + these new Stage 2 stamps) before
+        # counting/reporting outcomes below, since crowding can demote
+        # accept->flag and the report should reflect the true final outcome.
+        # fov.rois isn't extended yet, so pass the union explicitly; objects
+        # are mutated in place either way.
+        resolve_crowding(
+            fov.rois + [r for r in stage2_rois if r.gate_outcome != "reject"],
+            cfg.roi_stamp_radius,
+        )
 
         n2_det = len(stage2_rois)
         n2_acc = sum(1 for r in stage2_rois if r.gate_outcome == "accept")
@@ -917,6 +948,22 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         )
         stage_timings["stage3_detect_s"] = time.time() - t_start
 
+        # Canonicalize: Stage 3 candidates are already a disk keyed on
+        # spatial_pool_radius (its own trace-extraction pooling radius, an
+        # independent detection-time parameter); re-center at roi_stamp_radius
+        # so the persisted stamp matches Stages 1/2/4 exactly. Gate 3 already
+        # ran above (on the spatial_pool_radius disk); this only changes what
+        # subtraction/traces/HITL/registry consume from here on.
+        for r in stage3_rois:
+            if r.gate_outcome in ("accept", "flag"):
+                canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])
+        # Cross-stage crowding guard, evaluated before counting/reporting so
+        # the report reflects the true final outcome (see Stage 2 above).
+        resolve_crowding(
+            fov.rois + [r for r in stage3_rois if r.gate_outcome != "reject"],
+            cfg.roi_stamp_radius,
+        )
+
         n3_det = len(stage3_rois)
         n3_acc = sum(1 for r in stage3_rois if r.gate_outcome == "accept")
         n3_flag = sum(1 for r in stage3_rois if r.gate_outcome == "flag")
@@ -1053,6 +1100,20 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
             fov.mean_M, fov.motion_x, fov.motion_y, cfg,
         )
         stage_timings["stage4_detect_s"] = time.time() - t_start
+
+        # Canonicalize: Gate 4 already validated real connected-component
+        # geometry above; Stage 4 is terminal (no subtraction follows), but
+        # traces/HITL/registry still consume this mask, so persist the same
+        # fixed-radius disk as the other three stages.
+        for r in stage4_rois:
+            if r.gate_outcome in ("accept", "flag"):
+                canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])
+        # Cross-stage crowding guard, evaluated before counting/reporting so
+        # the report reflects the true final outcome (see Stage 2 above).
+        resolve_crowding(
+            fov.rois + [r for r in stage4_rois if r.gate_outcome != "reject"],
+            cfg.roi_stamp_radius,
+        )
 
         n4_det = len(stage4_rois)
         n4_flag = sum(1 for r in stage4_rois if r.gate_outcome == "flag")

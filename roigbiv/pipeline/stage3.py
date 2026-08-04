@@ -48,6 +48,7 @@ import numpy as np
 
 from roigbiv.pipeline.stage2 import extract_traces_from_residual
 from roigbiv.pipeline.device import cuda_compute_capable
+from roigbiv.pipeline.roi_stamp import disk_mask as _disk_mask
 from roigbiv.pipeline.types import FOVData, PipelineConfig, ROI
 
 
@@ -63,12 +64,6 @@ def _pad_templates(template_bank: list[tuple[str, np.ndarray]]) -> np.ndarray:
     for k, (_, wf) in enumerate(template_bank):
         out[k, : len(wf)] = wf
     return out
-
-
-def _disk_mask(cy: float, cx: float, radius: int, H: int, W: int) -> np.ndarray:
-    """Filled circular disk, clipped to image bounds."""
-    ys, xs = np.ogrid[:H, :W]
-    return ((ys - cy) ** 2 + (xs - cx) ** 2) <= radius ** 2
 
 
 def _resolve_rows_per_chunk(cfg: PipelineConfig, T: int, W: int, n_fft: int) -> int:

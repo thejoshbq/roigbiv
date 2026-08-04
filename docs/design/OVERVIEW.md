@@ -176,9 +176,9 @@ Gate 4. Every backend exports `{stem}_mc.tif`.
 ### 3.1a Live motion-correction preview (diagnostic sidecar)
 
 While registration runs, `roigbiv/pipeline/mc_preview.py::MCPreviewWriter` streams a
-downsampled **raw/corrected pair of the same frame** — plus a difference pane — into
-`{output_dir}/mc_preview/`, roughly 2.5× a second. The Dash Pipeline page renders it as
-a live view of the FOV being corrected; after the run the retained records are a
+downsampled **raw/corrected pair of the same frame** — plus a raw running-average pane —
+into `{output_dir}/mc_preview/`, roughly 2.5× a second. The Dash Pipeline page renders it
+as a live view of the FOV being corrected; after the run the retained records are a
 scrubbable timeline, which is what makes an A/B of two backends on one FOV possible
 after the fact.
 
@@ -188,9 +188,20 @@ mc_preview/
                                    confidence trace, live quality metrics,
                                    valid-crop rectangle, retained record list
   raw_000000.png  corr_000000.png  same frame, before and after
-  diff_000000.png                  corrected − raw, symmetric window
+  avg_000000.png                   running mean of raw frames previewed so far
   shifts.npz                       full-resolution frame/y/x/cmax trace
 ```
+
+The third pane replaced an earlier `corrected − raw` difference pane, which turned out
+not to carry an actionable signal for lab members watching a run. The raw running
+average instead accumulates every previewed raw frame (an incremental mean, updated each
+emit) through the same frozen display window as the raw/corrected panes — no separate
+normalization — so it visually reveals how much the *uncorrected* movie drifts over the
+course of the run, which a single-frame diff could not show. It is built from the same
+throttled ~2.5 Hz stream the writer already sees, not every frame in the registration
+batch loop, so it is a representative sample of the movie for visual QC rather than a
+literal full-stack mean (distinct from `foundation.py`'s `mean_M`, which is a true
+full-resolution mean computed once over the whole registered movie).
 
 How each backend feeds it:
 
@@ -563,6 +574,31 @@ human-readable `gate_reasons`. `to_serializable()` defines the JSON schema writt
 > **Stale comment note.** `iscell_prob`/`event_count`/`corr_contrast` are annotated
 > "future" in `types.py:48-50`, but the current Stages 2–4 **do** populate them.
 
+### Canonical ROI stamps
+
+**`mask` is not the detector's raw boundary.** Immediately after each stage's gate runs
+(`roi_stamp.py::canonicalize`, wired in `run.py` right before that stage's source
+subtraction — see ADR-0003), every `accept`/`flag` ROI's mask is replaced with a
+fixed-radius disk (`cfg.roi_stamp_radius`, default 8 px, auto-scaled per FOV like
+`spatial_pool_radius`) centered on the ROI's own centroid. Gates 1/2/4 still validate real
+detector-native geometry (irregular Cellpose/Suite2p masks, regionprops-derived Stage-4
+blobs) **before** this runs — `area`/`solidity`/`eccentricity` are the gate-time record of
+that real geometry and are *not* recomputed from the stamp. Stage 3 already built a disk
+pre-gate keyed on `spatial_pool_radius` (its own trace-extraction pooling radius); it gets
+re-centered at `roi_stamp_radius` post-gate like the other three stages. `reject`-outcome
+ROIs keep their real mask (audit trail only — never subtracted).
+
+`roi_stamp.py::resolve_crowding` runs after canonicalization (cumulative across stages, so
+a later stage's stamp is checked against earlier stages' already-persisted ones): two
+centroids closer than one stamp radius apart demote the weaker ROI `accept → flag` — the
+same accept-safe convention Gate 1's own merge-peak check already uses — so the pair
+surfaces for HITL review; ridge regularization in the subtraction solver, not the flag
+itself, is what keeps that solve numerically stable.
+
+Rationale: one canonical shape per ROI, independent of source stage or session, is what
+makes the ROICaT cross-session matcher's footprint embeddings (§10) comparable day to day
+instead of carrying segmentation-noise shape variance as a confound.
+
 ### Human-in-the-loop package
 
 `roigbiv/pipeline/hitl.py`. `build_review_queue` builds a **4-tier priority queue**
@@ -766,6 +802,11 @@ For the exhaustive per-threshold rationale with method-level citations, see
 | `auto_scale` | True | derive numeric gates from measured soma scale when profile ∈ {grin, prism, generic} |
 | `assume_optics` | False | suppress optics-confirmation pause (headless) |
 
+### Canonical ROI stamp (all 4 stages)
+| Param | Default | Meaning |
+|---|---|---|
+| `roi_stamp_radius` | 8 | post-gate disk radius (px), auto-scaled like `spatial_pool_radius` |
+
 ### Stage 1 / Gate 1
 | Param | Default | Meaning |
 |---|---|---|
@@ -868,9 +909,9 @@ For the exhaustive per-threshold rationale with method-level citations, see
 ### Where each source of truth lives
 | Intent | Source of truth |
 |---|---|
-| Architecture decisions (direction, deprecations) | `docs/adr/` — [ADR-0001: non-destructive candidate union](../adr/0001-non-destructive-candidate-union.md), [ADR-0002: cascade deprecation criteria](../adr/0002-cascade-default-deprecation-criteria.md) |
-| Pipeline behavior, gate logic, ROI schema | `docs/roi-pipeline-specification.md` (design intent) |
-| Algorithm methods, per-threshold citations | `docs/publication/algorithms_v2.md` (as-built, authoritative) |
+| Architecture decisions (direction, deprecations) | `docs/adr/` — [ADR-0001: non-destructive candidate union](../adr/0001-non-destructive-candidate-union.md), [ADR-0002: cascade deprecation criteria](../adr/0002-cascade-default-deprecation-criteria.md), [ADR-0003: canonical ROI stamps](../adr/0003-centroid-canonical-roi-stamps.md) |
+| Pipeline behavior, gate logic, ROI schema | **this document** (§4–§9) — `docs/roi-pipeline-specification.md` does not exist in this repo (see Stale statements below) |
+| Algorithm methods, per-threshold citations | **this document** (§13) — `docs/publication/algorithms_v2.md` does not exist in this repo (see Stale statements below) |
 | Runtime defaults | `roigbiv/pipeline/types.py::PipelineConfig` (**canonical**) |
 | Tunable-parameter documentation | `configs/pipeline.yaml` (**documentary only** — not loaded at runtime) |
 | Version history | `docs/CHANGELOG.md` |
@@ -891,4 +932,13 @@ For the exhaustive per-threshold rationale with method-level citations, see
 - **`iscell_prob` / `event_count` / `corr_contrast` "future" comments** (`types.py:48-50`)
   — these fields **are** populated by Stages 2–4.
 - **`configs/pipeline.yaml`** — where it disagrees with `types.py` (e.g. `flow_threshold`,
-  `use_denoise`, `consensus:` tiers), the YAML is stale/documentary and the code wins.
+  `use_denoise`, `consensus:` tiers), the YAML is stale/documentary and the code wins. It
+  also predates the sequential 4-stage pipeline entirely — it has no `gate1`–`gate4`,
+  `stage3`, or `stage4` sections, so newer `PipelineConfig` fields (e.g.
+  `roi_stamp_radius`, ADR-0003) have no natural home there; this document and `types.py`
+  are authoritative for them instead.
+- **`docs/roi-pipeline-specification.md` / `docs/publication/algorithms_v2.md`** — CLAUDE.md
+  and this document's own §14 table above have historically pointed to these as
+  authoritative; **neither file exists in this repo.** This document (`OVERVIEW.md`) and
+  `docs/adr/` are the current sources of truth for pipeline behavior and architecture
+  decisions.

@@ -62,6 +62,10 @@ SCALE_DERIVED_FIELDS = frozenset({
     "diameter", "min_area", "max_area", "gate1_merge_peak_min_separation",
     "spatial_pool_radius", "cluster_distance", "stage4_min_area",
     "stage4_max_area", "tile_norm_blocksize",
+    # Canonical ROI stamp radius (roi_stamp.py) — same formula as
+    # spatial_pool_radius, kept as a distinct field so output-representation
+    # size can diverge from stage3's trace-extraction pooling radius.
+    "roi_stamp_radius",
     # 13 spatial-radius / area parameters added for full FOV-scale coverage
     "corr_neighbor_radius_inner", "corr_neighbor_radius_outer",
     "gate2_spatial_radius", "gate4_spatial_radius",
@@ -344,6 +348,7 @@ def derive_scale_params(scale: SomaScale) -> dict:
         "max_area":                        max_area,
         "gate1_merge_peak_min_separation": int(round(r)),
         "spatial_pool_radius":             max(4, int(round(r))),
+        "roi_stamp_radius":                max(4, int(round(r))),
         "cluster_distance":                max(6, int(round(d * 0.6))),
         "stage4_min_area":                 int(round(0.6 * min_area)),
         "stage4_max_area":                 int(round(0.6 * max_area)),
