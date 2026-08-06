@@ -210,6 +210,7 @@ def _run_motion_correction(
         do_registration=s2p_do_registration,
         cfg=s2p_reg_cfg,
         preview=preview if backend == "phasecorr" else None,
+        resume=cfg.resume,
     )
 
     ops_path = s2p_root / "suite2p" / "plane0" / "ops.npy"
