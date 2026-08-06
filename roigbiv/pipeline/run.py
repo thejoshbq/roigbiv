@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import time
+import warnings
 from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
@@ -435,9 +436,15 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
     _peek_pages: int | None = None
     try:
         import tifffile as _tf
-        with _tf.TiffFile(str(tif_path)) as _peek:
-            _shape = _peek.pages[0].shape
-            _peek_pages = len(_peek.pages)
+        with warnings.catch_warnings():
+            # Prairie View acquisitions write a malformed UIC2tag (Z-distance
+            # calibration with a 0/0 denominator); tifffile warns on every
+            # tag-parsing read. Cosmetic — see roigbiv.io's frame-assembly
+            # path for the same suppression against the same tag.
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            with _tf.TiffFile(str(tif_path)) as _peek:
+                _shape = _peek.pages[0].shape
+                _peek_pages = len(_peek.pages)
         _peek_shape = _shape
         _max_dim = max(_shape[-2], _shape[-1])
         if _max_dim > 768 and cfg.diameter < 25 and not cfg.diameter_auto:

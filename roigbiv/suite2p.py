@@ -19,6 +19,7 @@ toggled per-dataset without changing any other code.
 import os
 import shutil
 import time
+import warnings
 from pathlib import Path
 
 
@@ -108,7 +109,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                     do_registration: bool = False, cfg: dict = None,
                     spatial_scale: int = None,
                     threshold_scaling: float = None,
-                    preview=None) -> bool:
+                    preview=None, resume: bool = True) -> bool:
     """
     Run Suite2p on a single TIF file.
 
@@ -124,8 +125,13 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
 
     Resumability
     ------------
-    If ``output_dir/{stem}/suite2p/plane0/stat.npy`` already exists, the FOV
-    is skipped and the function returns ``False``.
+    If ``resume`` is True and ``output_dir/{stem}/suite2p/plane0/stat.npy``
+    already exists, the FOV is skipped and the function returns ``False``.
+    Callers driven by the sequential pipeline's own ``--resume`` flag (see
+    ``roigbiv.pipeline.foundation``) pass ``resume=cfg.resume`` so a plain run
+    always re-registers instead of silently reusing a stale prior result;
+    standalone/batch callers default to ``True`` to preserve their documented
+    resumability (e.g. resuming a Colab batch after a disconnect).
 
     Disk management
     ---------------
@@ -144,6 +150,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     preview         : optional MCPreviewWriter fed by the registration loop for
                       the UI's live view (see roigbiv.pipeline.mc_preview_s2p).
                       Diagnostic only — Suite2p's behavior is unchanged.
+    resume          : bool      — whether an existing stat.npy short-circuits
+                      this call (see Resumability above).
 
     Returns
     -------
@@ -166,7 +174,7 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
     stem = tif_path.stem.replace("_mc", "")
 
     stat_path = output_dir / stem / "suite2p" / "plane0" / "stat.npy"
-    if stat_path.exists():
+    if resume and stat_path.exists():
         if preview is not None:
             preview.set_phase(
                 "skipped_resume",
@@ -195,7 +203,12 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                          spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
         ops["tiff_list"] = [str(local_tif)]
-        with suite2p_preview_hooks(preview):
+        with suite2p_preview_hooks(preview), warnings.catch_warnings():
+            # Prairie View acquisitions write a malformed UIC2tag (Z-distance
+            # calibration with a 0/0 denominator); tifffile's tag parser warns
+            # on every internal read Suite2p does. Cosmetic — see roigbiv.io's
+            # frame-assembly path for the same suppression against the same tag.
+            warnings.simplefilter("ignore", category=RuntimeWarning)
             run_s2p(ops=ops)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
