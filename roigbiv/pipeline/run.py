@@ -1792,6 +1792,22 @@ def main(argv: "list[str] | None" = None) -> int:
                               "registry). A later --resume run (without this flag) "
                               "continues from Stage 1. Incompatible with --scout, "
                               "--resume, and --no-stage-N toggles."))
+    # Standalone centroid discovery (Suite2p) — independent of the stage
+    # cascade and of Foundation's SVD/L+S. See roigbiv/pipeline/centroids.py.
+    parser.add_argument("--centroids", dest="run_centroids",
+                        action="store_true", default=False,
+                        help=("Run standalone Suite2p centroid discovery. "
+                              "Composes with --foundation-only: pass alone "
+                              "for CENTROIDS-ONLY (requires an already "
+                              "motion-corrected stack on disk — a pre-"
+                              "corrected input, or a prior run's "
+                              "{stem}_mc.tif; directory --input only, since "
+                              "it skips motion correction entirely), or with "
+                              "--foundation-only for MC + centroids together "
+                              "(reuses Foundation's own Suite2p pass — no "
+                              "duplicate compute). Writes centroids.json per "
+                              "FOV; independent of Stage 2's cascade-internal "
+                              "Suite2p reuse."))
     parser.add_argument("--auto-scale", dest="auto_scale",
                         action=argparse.BooleanOptionalAction, default=True,
                         help=("Optics auto-scale: after foundation, measure the "
@@ -2057,6 +2073,13 @@ def main(argv: "list[str] | None" = None) -> int:
     if input_path.is_dir():
         return _run_workspace(args, input_path, stage_overrides)
     if input_path.is_file():
+        if args.run_centroids and not args.foundation_only:
+            print("ERROR: --centroids without --foundation-only (centroids-"
+                  "only mode) requires a directory --input (workspace mode) "
+                  "so it can resolve a prior run's {stem}_mc.tif; pass a "
+                  "directory, or add --foundation-only to run both together.",
+                  file=sys.stderr)
+            return 2
         return _run_single(args, input_path, stage_overrides)
     print(f"ERROR: --input is neither a file nor a directory: {input_path}",
           file=sys.stderr)
@@ -2187,6 +2210,7 @@ def _run_single(
         "scout_vcorr_stride": args.scout_vcorr_stride,
         "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
         "foundation_only": args.foundation_only,
+        "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
@@ -2256,6 +2280,22 @@ def _run_single(
         # Pipeline-crash exit (1) dominates any notifier-delivery code.
         return 1
     duration = time.perf_counter() - t0
+
+    if cfg.foundation_only and cfg.run_centroids:  # "both" mode
+        from roigbiv.pipeline.centroids import run_centroid_discovery
+
+        mc_tif = fov.output_dir / f"{fov_stem}_mc.tif"
+        if mc_tif.exists():
+            try:
+                result = run_centroid_discovery(mc_tif, fov.output_dir, cfg)
+                print(f"Centroid discovery OK — {result.count} centroids "
+                      f"({result.output_path})", flush=True)
+            except BaseException as exc:  # noqa: BLE001
+                print(f"WARN: centroid discovery failed for {fov_stem}: {exc}",
+                      file=sys.stderr)
+        else:
+            print(f"WARN: centroid discovery skipped — {mc_tif.name} not found",
+                  file=sys.stderr)
 
     report = None
     if args.registry:
@@ -2445,6 +2485,7 @@ def _run_workspace(
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         "foundation_only": args.foundation_only,
+        "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only

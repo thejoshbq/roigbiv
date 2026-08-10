@@ -140,6 +140,47 @@ def test_foundation_only_rejects_bad_combos():
           "(scout / resume / stage-toggle combos rejected)")
 
 
+def test_centroids_only_rejects_single_file_input():
+    """--centroids without --foundation-only requires a directory --input
+    (workspace mode) so centroids-only can resolve a prior {stem}_mc.tif —
+    see roigbiv/pipeline/workspace.py::_run_centroids_only."""
+    from roigbiv.pipeline import run as run_mod
+
+    with tempfile.TemporaryDirectory() as td:
+        tif = Path(td) / "fov.tif"
+        tifffile.imwrite(str(tif), np.zeros((4, 16, 16), np.uint16))
+
+        code = run_mod.main(["--input", str(tif), "--fs", "7.5", "--centroids"])
+        assert code == 2, (
+            "expected exit 2 for --centroids without --foundation-only on a "
+            f"single-file --input, got {code}")
+    print("  [PASS] test_centroids_only_rejects_single_file_input "
+          "(single-file --input + --centroids alone is rejected)")
+
+
+def test_centroids_with_foundation_only_reaches_run_single():
+    """--centroids + --foundation-only ('both' mode) is a valid combo even for
+    a single-file --input — it must dispatch to _run_single, not be rejected."""
+    from unittest.mock import patch
+
+    from roigbiv.pipeline import run as run_mod
+
+    with tempfile.TemporaryDirectory() as td:
+        tif = Path(td) / "fov.tif"
+        tifffile.imwrite(str(tif), np.zeros((4, 16, 16), np.uint16))
+
+        with patch.object(run_mod, "_run_single", return_value=0) as mock_single:
+            code = run_mod.main([
+                "--input", str(tif), "--fs", "7.5",
+                "--centroids", "--foundation-only",
+            ])
+        assert mock_single.call_count == 1, (
+            "expected --centroids --foundation-only to reach _run_single")
+        assert code == 0
+    print("  [PASS] test_centroids_with_foundation_only_reaches_run_single "
+          "('both' mode on a single file is accepted, not rejected)")
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -148,6 +189,8 @@ if __name__ == "__main__":
         test_foundation_only_loader_guard,
         test_foundation_only_fingerprint_stable,
         test_foundation_only_rejects_bad_combos,
+        test_centroids_only_rejects_single_file_input,
+        test_centroids_with_foundation_only_reaches_run_single,
     ]
     failed = []
     for test in tests:

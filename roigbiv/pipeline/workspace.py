@@ -187,6 +187,8 @@ class FOVRunResult:
     # foundation outputs are on disk; a --resume run with a confirmed profile
     # continues from Stage 1). Carries the confirmation payload for the UI.
     awaiting_confirmation: Optional[dict] = None
+    # Set when cfg.run_centroids ran (standalone or after foundation_only).
+    centroid_count: Optional[int] = None
 
 
 def run_with_workspace(
@@ -259,7 +261,17 @@ def run_with_workspace(
 
     _ensure_registry_schema(log, cfg)
 
-    parallel = n_workers > 1 and len(tifs_to_run) > 1
+    # Centroid-discovery-only runs skip Foundation/run_pipeline entirely (see
+    # _process_one) and are lightweight (Suite2p detection-only, no GPU
+    # registration) — the parallel batch path exists to fan out the expensive
+    # Foundation/Cellpose GPU work, so it's not worth wiring a second job shape
+    # through roigbiv.pipeline.batch for this case. Always sequential.
+    centroids_only = (bool(cfg_overrides.get("run_centroids"))
+                      and not bool(cfg_overrides.get("foundation_only")))
+    parallel = n_workers > 1 and len(tifs_to_run) > 1 and not centroids_only
+    if centroids_only and n_workers > 1:
+        log("Centroid-discovery-only runs execute sequentially "
+            "(lightweight; --n-workers applies to Foundation/Cellpose GPU work).")
     if parallel:
         log(f"Parallel:  n_workers={n_workers} (capped at 2)")
         results = _run_parallel(workspace, tifs_to_run, cfg_overrides, log,
@@ -396,6 +408,10 @@ def _run_parallel(
             f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
             f"reject={counts.get('reject', 0)}")
 
+        centroid_count = None
+        if getattr(cfg, "run_centroids", False):  # "both" mode only — see run_with_workspace
+            centroid_count = _run_centroids_after_foundation(tif, out_dir, cfg, log)
+
         stem = tif.stem.replace("_mc", "")
         registry: Optional[dict] = None
         if (skip_registry or getattr(cfg, "scout_mode", False)
@@ -422,6 +438,7 @@ def _run_parallel(
             tif=tif, output_dir=out_dir,
             duration_s=duration, fov=fov,
             registry=registry, roi_counts=counts,
+            centroid_count=centroid_count,
         )
 
     return [r for r in results if r is not None]
@@ -473,6 +490,12 @@ def _process_one(
     if not skip_registry:
         cfg_overrides = _apply_registry_memory(tif, cfg_overrides, registry_cfg, log)
     cfg = _build_config(out_dir, cfg_overrides)
+
+    if cfg.run_centroids and not cfg.foundation_only:
+        # Centroids-only: skip run_pipeline (and Foundation's SVD/L+S) entirely
+        # — see PipelineConfig.run_centroids.
+        return _run_centroids_only(tif, out_dir, cfg, log)
+
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif, cfg, abort_event=abort_event)
@@ -513,6 +536,10 @@ def _process_one(
         f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
         f"reject={counts.get('reject', 0)}")
 
+    centroid_count = None
+    if cfg.run_centroids:  # foundation_only is True here ("both" mode)
+        centroid_count = _run_centroids_after_foundation(tif, out_dir, cfg, log)
+
     registry: Optional[dict] = None
     if (skip_registry or getattr(cfg, "scout_mode", False)
             or getattr(cfg, "foundation_only", False)):
@@ -543,7 +570,77 @@ def _process_one(
         tif=tif, output_dir=out_dir,
         duration_s=duration, fov=fov,
         registry=registry, roi_counts=counts,
+        centroid_count=centroid_count,
     )
+
+
+def _run_centroids_only(
+    tif: Path, out_dir: Path, cfg: PipelineConfig, log: LogCallback,
+) -> FOVRunResult:
+    """Standalone centroid discovery: skips Foundation/run_pipeline entirely.
+
+    Requires an already motion-corrected stack — either ``tif`` itself (a
+    pre-corrected input) or a ``{stem}_mc.tif`` a prior Foundation run already
+    wrote to ``out_dir``. Fails fast (per-FOV) if neither exists, rather than
+    silently running motion correction first.
+    """
+    from roigbiv.io import detect_motion_corrected
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    t0 = time.perf_counter()
+    pre_corrected, _signal = detect_motion_corrected(tif)
+    if pre_corrected:
+        mc_tif = tif
+    else:
+        stem = tif.stem.replace("_mc", "")
+        candidate = out_dir / f"{stem}_mc.tif"
+        mc_tif = candidate if candidate.exists() else None
+
+    if mc_tif is None:
+        msg = ("no motion-corrected stack found for this FOV — run motion "
+              "correction first, or choose 'Both'")
+        log(f"  {msg}")
+        return FOVRunResult(tif=tif, output_dir=out_dir,
+                            duration_s=time.perf_counter() - t0, error=msg)
+
+    try:
+        result = run_centroid_discovery(mc_tif, out_dir, cfg)
+    except Exception as exc:  # noqa: BLE001
+        return FOVRunResult(tif=tif, output_dir=out_dir,
+                            duration_s=time.perf_counter() - t0,
+                            error=f"{type(exc).__name__}: {exc}")
+
+    duration = time.perf_counter() - t0
+    log(f"  centroid discovery OK ({duration:.1f}s) — {result.count} centroids")
+    return FOVRunResult(tif=tif, output_dir=out_dir, duration_s=duration,
+                        centroid_count=result.count)
+
+
+def _run_centroids_after_foundation(
+    tif: Path, out_dir: Path, cfg: PipelineConfig, log: LogCallback,
+) -> Optional[int]:
+    """Centroid discovery chained after a foundation_only run ("both" mode).
+
+    Resumes off the ``stat.npy``/``iscell.npy`` Foundation's own
+    ``run_suite2p_fov`` call just wrote — see ``centroids.py`` module docstring.
+    Failure is logged and swallowed (never fails the FOV): the motion-corrected
+    output is still valid even if this best-effort annotation step errors.
+    """
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    stem = tif.stem.replace("_mc", "")
+    mc_tif = out_dir / f"{stem}_mc.tif"
+    if not mc_tif.exists():
+        log(f"  centroid discovery skipped — {mc_tif.name} not found")
+        return None
+    try:
+        result = run_centroid_discovery(mc_tif, out_dir, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARNING: centroid discovery failed — "
+            f"{type(exc).__name__}: {exc}")
+        return None
+    log(f"  centroid discovery OK — {result.count} centroids")
+    return result.count
 
 
 def _write_traces_bundle(

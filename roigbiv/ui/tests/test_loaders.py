@@ -11,6 +11,7 @@ from roigbiv.pipeline.types import ROI
 from roigbiv.ui.services.loaders import (
     _gcid_by_label_from_registry,
     list_motion_corrected_fovs,
+    load_centroids,
     mc_input_mean,
     render_roi,
 )
@@ -139,3 +140,44 @@ def test_gcid_by_label_map_extracts_entries() -> None:
     }
     out = _gcid_by_label_from_registry(registry)
     assert out == {1: "g1", 3: "g3"}
+
+
+# ── load_centroids: centroids.json → ROIRender round-trip ───────────────────
+
+
+def test_load_centroids_missing_file_returns_empty(tmp_path: Path) -> None:
+    assert load_centroids(tmp_path, (32, 32)) == []
+
+
+def test_load_centroids_round_trip(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "centroids.json").write_text(json.dumps({
+        "stem": "fovA", "source": "suite2p",
+        "centroids": [
+            {"label_id": 0, "y": 10.0, "x": 12.0, "npix": 30, "cellpose_prob": 0.87},
+            {"label_id": 1, "y": 20.0, "x": 5.0, "npix": 18, "cellpose_prob": 0.10},
+        ],
+    }))
+
+    rois = load_centroids(tmp_path, (32, 32), radius=4)
+    assert len(rois) == 2
+
+    r0 = rois[0]
+    assert r0.label_id == 0
+    assert r0.source_stage == 2       # palette slot only, not a detector claim
+    assert r0.gate_outcome == "accept"
+    assert r0.centroid_yx == (10.0, 12.0)
+    assert r0.area == 30
+    assert r0.features["cellpose_prob"] == 0.87
+    assert r0.contours, "expected a non-empty disk contour around the centroid"
+
+    r1 = rois[1]
+    assert r1.features["cellpose_prob"] == 0.10, (
+        "low-probability candidates are still returned unfiltered — the UI "
+        "toggle controls the whole layer, not per-candidate filtering")
+
+
+def test_load_centroids_corrupt_json_returns_empty(tmp_path: Path) -> None:
+    (tmp_path / "centroids.json").write_text("not valid json {")
+    assert load_centroids(tmp_path, (32, 32)) == []

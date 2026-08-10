@@ -24,4 +24,14 @@ dependencies:
     - streamlit
     - ipywidgets
     - "napari[all]>=0.4.19"
+    # roifile: ImageJ RoiSet.zip reader. Already used by
+    # scripts/process_external_data.py and scripts/centroid_bakeoff/ but was
+    # never declared here (pre-existing gap, fixed as part of the latter).
+    - roifile
+    # opencv-python-headless: scripts/centroid_bakeoff/'s OpenCV detector arm.
+    # NOTE: pyproject.toml's core deps list "opencv-python" (GUI build), while
+    # cellpose transitively pulls in "opencv-python-headless" — both currently
+    # coexist in this env and both provide the `cv2` import. Not resolved here;
+    # see pyproject.toml's dependencies comment.
+    - opencv-python-headless
     - -e .

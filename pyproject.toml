@@ -24,10 +24,16 @@ dependencies = [
     "pyyaml",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    "roifile",
 ]
 # suite2p and cellpose are NOT listed here — they must be installed with specific
 # ordering in the notebook (suite2p first, then cellpose<4.0.0 --upgrade) to
 # avoid dependency pin conflicts.
+# NOTE (open question, not resolved here): "opencv-python" (GUI build) is
+# declared above, but cellpose transitively installs "opencv-python-headless" —
+# both provide the `cv2` import and currently coexist in the roigbiv env. A
+# repo-wide call on which variant to standardize on is out of scope for the
+# change that added this comment (scripts/centroid_bakeoff/).
 
 [project.optional-dependencies]
 # `ui` is the primary frontend — a Dash + Plotly web app with native ROI

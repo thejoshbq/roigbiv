@@ -408,6 +408,24 @@ class PipelineConfig:
     # Resumable: a later --resume run (without the flag) continues from Stage 1.
     foundation_only: bool = False
 
+    # ── Standalone centroid discovery (Suite2p) ───────────────────────────
+    # Independent of the stage cascade (see roigbiv/pipeline/centroids.py) and
+    # of Foundation's SVD/L+S. When True and foundation_only is also True, runs
+    # after Foundation on the {stem}_mc.tif it just wrote ("both together").
+    # When True and foundation_only is False, skips Foundation/run_pipeline
+    # entirely and requires an already motion-corrected stack on disk
+    # ("centroids only") — orchestrated in roigbiv/pipeline/workspace.py, not
+    # run_pipeline, since it must be able to bypass Foundation.
+    run_centroids: bool = False
+
+    # Opt-in guard restricting centroid candidates to the imaged tissue (Otsu on
+    # the smoothed mean image). Off by default: centroid discovery detects with
+    # Cellpose on the anatomical mean, which does not have the background-
+    # inversion problem that made this necessary under Suite2p's activity
+    # substrate. See roigbiv/pipeline/centroids.py::_tissue_mask.
+    centroid_tissue_mask: bool = False
+    centroid_tissue_mask_sigma: float = 8.0
+
     # ── Pipeline mode (top-level architecture switch) ──────────────────────
     # "cascade_legacy":  sequential subtractive detection (default) — each
     #                    stage detects on the residual after prior stages

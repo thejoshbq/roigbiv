@@ -27,6 +27,8 @@ import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.io import validate_tif
+from roigbiv.pipeline.calibration import load_calibration, write_calibration
+from roigbiv.pipeline.centroids import clear_centroid_output
 from roigbiv.pipeline.loaders import _maybe_read_tif
 from roigbiv.pipeline.workspace import WorkspacePaths, resolve_workspace
 from roigbiv.ui.components.figure import build_roi_figure
@@ -86,6 +88,23 @@ def _left_column(workspace: Optional[WorkspacePaths],
         html.Hr(className="roigbiv-h-line"),
         html.H5("Motion-correction parameters", className="mb-2"),
         _params_form(),
+        html.H5("Run mode", className="mb-2 mt-3"),
+        dbc.RadioItems(
+            id="roigbiv-run-mode",
+            options=[
+                {"label": "Motion correction only", "value": "mc"},
+                {"label": "Centroid discovery only", "value": "centroids"},
+                {"label": "Both", "value": "both"},
+            ],
+            value="mc",
+            persistence=True, persistence_type="local",
+        ),
+        html.Div(
+            "Centroid discovery only requires an already motion-corrected "
+            "stack on disk (a pre-corrected input, or a prior run's output) "
+            "— it does not run motion correction first.",
+            className="small text-muted mt-1",
+        ),
         dbc.Button("Run pipeline", id="roigbiv-run-btn",
                    color="primary", className="mt-3 w-100", n_clicks=0,
                    disabled=workspace is None or run_active),
@@ -299,32 +318,65 @@ def _persist_param_controls(tree) -> None:
 
 
 def _mc_mean_and_title(value: Optional[str]):
-    """Resolve a self-describing dropdown ``value`` to ``(mean, title)``.
+    """Resolve a self-describing dropdown ``value`` to ``(mean, title, output_dir)``.
 
     The value is self-describing (see :func:`list_motion_corrected_fovs`):
 
     * ``summary:{output_dir}`` — a processed FOV; read its precomputed
-      ``summary/mean_M.tif``.
+      ``summary/mean_M.tif``. ``output_dir`` is returned (centroids, if any,
+      live at ``output_dir/centroids.json``).
     * ``input:{tif_path}`` — a pre-corrected input not yet run; compute a sampled
-      temporal mean on demand (:func:`mc_input_mean`).
+      temporal mean on demand (:func:`mc_input_mean`). No output_dir — a
+      not-yet-run input has no centroids.json either.
 
-    ``None`` / unparseable returns ``(None, None)``.
+    ``None`` / unparseable returns ``(None, None, None)``.
     """
     if value and ":" in value:
         kind, payload = value.split(":", 1)
         if kind == "summary":
             return (_maybe_read_tif(Path(payload) / "summary" / "mean_M.tif"),
-                    Path(payload).name)
+                    Path(payload).name, Path(payload))
         if kind == "input":
             return (mc_input_mean(Path(payload)),
-                    f"{Path(payload).stem.replace('_mc', '')} (input)")
-    return None, None
+                    f"{Path(payload).stem.replace('_mc', '')} (input)", None)
+    return None, None, None
 
 
-def _mc_preview_figure(value: Optional[str]):
-    """Render the read-only MC preview for a dropdown ``value``."""
-    mean, title = _mc_mean_and_title(value)
-    return build_roi_figure(mean, [], show_overlay=False, title=title)
+def _mc_preview_figure(value: Optional[str], show_centroids: bool = False,
+                       calibration_diameter_px: Optional[float] = None):
+    """Render the read-only MC preview for a dropdown ``value``.
+
+    ``show_centroids`` overlays discovered centroids (from a prior centroid-
+    discovery run) on top of the mean projection — see
+    :func:`roigbiv.ui.services.loaders.load_centroids`. No-op for FOVs with no
+    ``centroids.json`` yet (an "input" entry, or a "summary" FOV that hasn't
+    had centroid discovery run against it).
+
+    ``calibration_diameter_px``, if given, draws a dashed reference circle of
+    that diameter centered on the image — pan/zoom to line a real neuron up
+    against it while typing a value into the calibration field.
+    """
+    mean, title, output_dir = _mc_mean_and_title(value)
+    rois = []
+    if show_centroids and output_dir is not None and mean is not None:
+        from roigbiv.ui.services.loaders import load_centroids
+        rois = load_centroids(output_dir, mean.shape)
+    fig = build_roi_figure(mean, rois, show_overlay=show_centroids, title=title)
+    if calibration_diameter_px and mean is not None:
+        _add_calibration_circle(fig, mean.shape, calibration_diameter_px)
+    return fig
+
+
+def _add_calibration_circle(fig, shape: tuple[int, int], diameter_px: float) -> None:
+    H, W = shape
+    cy, cx = H / 2.0, W / 2.0
+    r = diameter_px / 2.0
+    fig.add_shape(
+        type="circle",
+        x0=cx - r, x1=cx + r, y0=cy - r, y1=cy + r,
+        line=dict(color="#FFD400", width=2, dash="dot"),
+        fillcolor="rgba(0,0,0,0)",
+    )
 
 
 def _mc_options_and_value(workspace, current: Optional[str] = None):
@@ -492,6 +544,56 @@ def _live_mc_section() -> html.Div:
     ])
 
 
+def _resolve_calibration_dir(value: Optional[str]) -> Optional[Path]:
+    """FOV output dir for calibration.json, from an MC dropdown ``value``.
+
+    Unlike :func:`_mc_mean_and_title`, this resolves a directory even for a
+    not-yet-processed ``input:`` FOV (mirrors how
+    :func:`roigbiv.pipeline.workspace._run_centroids_only` resolves its own
+    ``out_dir`` — calibration is meant to work ahead of the first run, same as
+    centroids-only mode itself).
+    """
+    workspace = get_app_state().workspace
+    if not value or ":" not in value or workspace is None:
+        return None
+    kind, payload = value.split(":", 1)
+    stem = (Path(payload).name if kind == "summary"
+            else Path(payload).stem.replace("_mc", ""))
+    return workspace.output_root / stem
+
+
+DEFAULT_CALIBRATION_DIAMETER_PX = 12  # PipelineConfig.diameter's default (types.py)
+# Suite2p's own stock default (1.0) can fail to detect anything once a forced
+# spatial_scale undershoots the true cell size (Suite2p caps at 48px) — 0.5
+# (the GRIN-lens value documented, but never wired, in configs/pipeline.yaml)
+# is a more promising starting point for a first calibration attempt.
+DEFAULT_CALIBRATION_CELLPROB_THRESHOLD = -2.0  # PipelineConfig.cellprob_threshold
+
+# Model choices offered per-FOV. "" = leave cfg.cellpose_model alone (the
+# deployed checkpoint). Stock cyto3 is offered because the deployed checkpoint
+# is fine-tuned on cranial-window FOVs and does not transfer to every
+# preparation — on the reference prism FOV it found 2 somata where cyto3 found 9.
+CALIBRATION_MODEL_OPTIONS = [
+    {"label": "Deployed checkpoint (default)", "value": ""},
+    {"label": "cyto3 (stock)", "value": "cyto3"},
+    {"label": "cyto2 (stock)", "value": "cyto2"},
+    {"label": "nuclei (stock)", "value": "nuclei"},
+]
+
+
+def _calibration_readout_text(calib, out_dir: Path) -> str:
+    if calib is None:
+        return ("Not calibrated — enter a cell diameter (px) below; the dashed "
+                 "circle on the preview updates as you type.")
+    text = (f"Calibrated: {calib.diameter_px:.1f}px diameter, "
+            f"cellprob_threshold={calib.cellprob_threshold:g}, "
+            f"model={calib.cellpose_model or 'deployed'}")
+    if (out_dir / "centroids.json").exists():
+        text += (" — this FOV already has centroid output; it will be recomputed "
+                 "on the next run because the saved settings changed.")
+    return text
+
+
 def _mc_preview_section() -> html.Div:
     """Read-only motion-correction preview: mean projection per FOV.
 
@@ -505,13 +607,45 @@ def _mc_preview_section() -> html.Div:
     # Persist the previewed FOV per workspace; False = no persistence when no
     # workspace is resolved yet (a constant key would leak across workspaces).
     mc_key = str(state.workspace.input_root) if state.workspace else False
+    out_dir = _resolve_calibration_dir(value)
+    calib = load_calibration(out_dir) if out_dir is not None else None
+    diameter = calib.diameter_px if calib else DEFAULT_CALIBRATION_DIAMETER_PX
+    cellprob = (calib.cellprob_threshold if calib
+                else DEFAULT_CALIBRATION_CELLPROB_THRESHOLD)
+    model = (calib.cellpose_model or "") if calib else ""
+    readout = _calibration_readout_text(calib, out_dir) if out_dir is not None else ""
     return html.Div([
         html.H5("Motion-correction preview", className="mb-2 mt-3"),
-        dbc.Select(id="roigbiv-mc-fov-select", options=options, value=value,
-                   className="mb-2",
-                   persistence=mc_key, persistence_type="local"),
+        html.Div([
+            dbc.Select(id="roigbiv-mc-fov-select", options=options, value=value,
+                       className="mb-2 me-3", style={"flex": "1"},
+                       persistence=mc_key, persistence_type="local"),
+            dbc.Switch(id="roigbiv-mc-centroids-toggle", label="Show centroids",
+                       value=False, className="mb-2"),
+        ], className="d-flex align-items-center"),
+        html.Div([
+            html.Span("Calibrate cell diameter (px):", className="small me-2"),
+            dbc.Input(id="roigbiv-mc-calibration-diameter", type="number",
+                      min=1, step=0.5, value=diameter,
+                      style={"width": "100px"}, className="me-2"),
+            html.Span("cellprob:", className="small me-2"),
+            dbc.Input(id="roigbiv-mc-calibration-threshold", type="number",
+                      min=-6, max=6, step=0.5, value=cellprob,
+                      style={"width": "90px"}, className="me-2"),
+            html.Span("model:", className="small me-2"),
+            dbc.Select(id="roigbiv-mc-calibration-model",
+                       options=CALIBRATION_MODEL_OPTIONS, value=model,
+                       style={"width": "210px"}, className="me-2"),
+            dbc.Button("Save calibration", id="roigbiv-mc-calibration-save",
+                       size="sm", color="secondary", className="me-2"),
+            dbc.Button("Save & clear existing output",
+                       id="roigbiv-mc-calibration-save-clear",
+                       size="sm", color="outline-warning"),
+        ], className="d-flex align-items-center mb-1"),
+        html.Div(readout, id="roigbiv-mc-calibration-readout",
+                 className="small text-muted mb-1"),
         dcc.Graph(id="roigbiv-mc-preview",
-                  figure=_mc_preview_figure(value),
+                  figure=_mc_preview_figure(value, False, diameter),
                   config={"displaylogo": False, "scrollZoom": True},
                   style={"height": "720px"}),
     ])
@@ -653,6 +787,7 @@ def register_callbacks(app: dash.Dash) -> None:
         State("roigbiv-param-mc-s2p-pre-smooth", "value"),
         State("roigbiv-param-mc-s2p-spatial-taper", "value"),
         State("roigbiv-param-slack-channel", "value"),
+        State("roigbiv-run-mode", "value"),
         prevent_initial_call=True,
     )
     def _on_run(_n: int, fs, tau, k, mc_backend, force_cpu,
@@ -665,7 +800,8 @@ def register_callbacks(app: dash.Dash) -> None:
                 mc_s2p_maxregshift, mc_s2p_nonrigid, mc_s2p_maxregshift_nr,
                 mc_s2p_nimg_init, mc_s2p_two_step_registration,
                 mc_s2p_one_photon_reg, mc_s2p_spatial_hp_reg,
-                mc_s2p_pre_smooth, mc_s2p_spatial_taper, slack_channel):
+                mc_s2p_pre_smooth, mc_s2p_spatial_taper, slack_channel,
+                run_mode):
         state = get_app_state()
         if state.workspace is None:
             return True, dbc.Alert("Scan a workspace first.", color="warning")
@@ -680,7 +816,8 @@ def register_callbacks(app: dash.Dash) -> None:
             "k_background": int(k or 30),
             "motion_correction_backend": mc_backend or "phasecorr",
             "force_cpu": bool(force_cpu),
-            "foundation_only": True,
+            "foundation_only": (run_mode or "mc") in ("mc", "both"),
+            "run_centroids": (run_mode or "mc") in ("centroids", "both"),
             "mc_strip_height": int(mc_strip_height) if mc_strip_height is not None else 32,
             "mc_max_displacement": int(mc_max_displacement) if mc_max_displacement is not None else 50,
             "mc_n_template_iters": int(mc_n_template_iters) if mc_n_template_iters is not None else 2,
@@ -933,10 +1070,64 @@ def register_callbacks(app: dash.Dash) -> None:
     @app.callback(
         Output("roigbiv-mc-preview", "figure"),
         Input("roigbiv-mc-fov-select", "value"),
+        Input("roigbiv-mc-centroids-toggle", "value"),
+        Input("roigbiv-mc-calibration-diameter", "value"),
         prevent_initial_call=True,
     )
-    def _render_mc_preview(value):
-        return _mc_preview_figure(value)
+    def _render_mc_preview(value, show_centroids, diameter):
+        return _mc_preview_figure(value, bool(show_centroids), diameter)
+
+    @app.callback(
+        Output("roigbiv-mc-calibration-diameter", "value"),
+        Output("roigbiv-mc-calibration-threshold", "value"),
+        Output("roigbiv-mc-calibration-model", "value"),
+        Output("roigbiv-mc-calibration-readout", "children"),
+        Input("roigbiv-mc-fov-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _seed_calibration(value):
+        # Refresh the calibration fields + readout for the newly selected FOV's
+        # own saved calibration (or the default reference values if none yet).
+        out_dir = _resolve_calibration_dir(value)
+        if out_dir is None:
+            return (DEFAULT_CALIBRATION_DIAMETER_PX,
+                    DEFAULT_CALIBRATION_CELLPROB_THRESHOLD, "", "")
+        calib = load_calibration(out_dir)
+        diameter = calib.diameter_px if calib else DEFAULT_CALIBRATION_DIAMETER_PX
+        cellprob = (calib.cellprob_threshold if calib
+                    else DEFAULT_CALIBRATION_CELLPROB_THRESHOLD)
+        model = (calib.cellpose_model or "") if calib else ""
+        return (diameter, cellprob, model,
+                _calibration_readout_text(calib, out_dir))
+
+    @app.callback(
+        Output("roigbiv-mc-calibration-readout", "children", allow_duplicate=True),
+        Input("roigbiv-mc-calibration-save", "n_clicks"),
+        Input("roigbiv-mc-calibration-save-clear", "n_clicks"),
+        State("roigbiv-mc-fov-select", "value"),
+        State("roigbiv-mc-calibration-diameter", "value"),
+        State("roigbiv-mc-calibration-threshold", "value"),
+        State("roigbiv-mc-calibration-model", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_save_calibration(_n_save, _n_save_clear, value, diameter,
+                             cellprob_threshold, cellpose_model):
+        out_dir = _resolve_calibration_dir(value)
+        if out_dir is None:
+            return "Select a processed or pre-corrected FOV first."
+        if not diameter or diameter <= 0:
+            return "Enter a cell diameter (px) before saving."
+        if cellprob_threshold is None:
+            return "Enter a cellprob threshold before saving."
+        calib = write_calibration(out_dir, diameter, cellprob_threshold,
+                                  cellpose_model or None)
+        if dash.ctx.triggered_id == "roigbiv-mc-calibration-save-clear":
+            clear_centroid_output(out_dir, out_dir.name)
+            return (f"Calibrated: {calib.diameter_px:.1f}px diameter, "
+                    f"cellprob_threshold={calib.cellprob_threshold:g}, "
+                    f"model={calib.cellpose_model or 'deployed'}. Cleared this "
+                    "FOV's prior centroid output — the next run will recompute.")
+        return _calibration_readout_text(calib, out_dir)
 
 
 # ── rendering helpers ──────────────────────────────────────────────────────
@@ -1197,6 +1388,7 @@ def _render_results(summaries: list[dict]) -> html.Div:
         status = "FAILED" if s.get("error") else "OK"
         duration = f"{s.get('duration_s', 0):.1f}s"
         m = s.get("mc_metrics") or {}
+        centroid_count = s.get("centroid_count")
         rows.append(html.Tr([
             html.Td(status,
                     className=("text-danger fw-bold" if s.get("error")
@@ -1207,12 +1399,13 @@ def _render_results(summaries: list[dict]) -> html.Div:
             html.Td(_fmt_metric(m.get("banding_score"))),
             html.Td(_fmt_metric(m.get("grad_anisotropy_xy"))),
             html.Td(_fmt_metric(m.get("contrast_rms"))),
+            html.Td("—" if centroid_count is None else str(centroid_count)),
         ]))
     return dbc.Table(
         [html.Thead(html.Tr([
             html.Th(""), html.Th("FOV"), html.Th("Duration"),
             html.Th("Sharpness"), html.Th("Banding"),
-            html.Th("Anisotropy"), html.Th("Contrast"),
+            html.Th("Anisotropy"), html.Th("Contrast"), html.Th("Centroids"),
         ])), html.Tbody(rows)],
         size="sm", striped=True, borderless=False,
         className="mb-0",
