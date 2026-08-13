@@ -307,6 +307,138 @@ def test_mc_preview_figure_summary_branch(monkeypatch):
     assert str(seen["path"]).endswith("session01/summary/mean_M.tif")
 
 
+def test_mc_preview_figure_centroids_toggle(monkeypatch):
+    # show_centroids=True on a "summary:" value loads centroids.json via the
+    # output_dir and overlays them; False (the default) never calls the loader.
+    import numpy as np
+
+    import roigbiv.ui.pages.process as proc
+    import roigbiv.ui.services.loaders as loaders_mod
+    from roigbiv.ui.services.loaders import ROIRender
+
+    monkeypatch.setattr(proc, "_maybe_read_tif",
+                        lambda _p: np.zeros((8, 8), dtype=np.float32))
+
+    calls = {"n": 0}
+
+    def _fake_load_centroids(output_dir, shape, *a, **k):
+        calls["n"] += 1
+        return [ROIRender(label_id=0, source_stage=2, gate_outcome="accept",
+                          activity_type=None, area=10,
+                          centroid_yx=(4.0, 4.0), contours=[([1.0], [1.0])])]
+
+    monkeypatch.setattr(loaders_mod, "load_centroids", _fake_load_centroids)
+
+    fig_off = proc._mc_preview_figure("summary:/ws/output/session01", False)
+    assert calls["n"] == 0, "centroids must not be loaded when the toggle is off"
+    assert len(fig_off.data) == 1, "heatmap only — no scatter overlay traces"
+
+    fig_on = proc._mc_preview_figure("summary:/ws/output/session01", True)
+    assert calls["n"] == 1
+    assert len(fig_on.data) == 2, "heatmap + one scatter trace for the centroid"
+
+
+def test_resolve_calibration_dir_summary_value(monkeypatch):
+    import roigbiv.ui.pages.process as proc
+
+    class _FakeState:
+        workspace = SimpleNamespace(output_root=Path("/ws/output"))
+
+    monkeypatch.setattr(proc, "get_app_state", lambda: _FakeState())
+    out_dir = proc._resolve_calibration_dir("summary:/ws/output/session01")
+    assert out_dir == Path("/ws/output/session01")
+
+
+def test_resolve_calibration_dir_input_value_strips_mc_suffix(monkeypatch):
+    import roigbiv.ui.pages.process as proc
+
+    class _FakeState:
+        workspace = SimpleNamespace(output_root=Path("/ws/output"))
+
+    monkeypatch.setattr(proc, "get_app_state", lambda: _FakeState())
+    out_dir = proc._resolve_calibration_dir("input:/ws/session01_mc.tif")
+    assert out_dir == Path("/ws/output/session01")
+
+
+def test_resolve_calibration_dir_no_workspace_returns_none(monkeypatch):
+    import roigbiv.ui.pages.process as proc
+
+    class _FakeState:
+        workspace = None
+
+    monkeypatch.setattr(proc, "get_app_state", lambda: _FakeState())
+    assert proc._resolve_calibration_dir("summary:/ws/output/session01") is None
+    assert proc._resolve_calibration_dir(None) is None
+
+
+def test_calibration_readout_text_uncalibrated(tmp_path):
+    from roigbiv.ui.pages.process import _calibration_readout_text
+
+    text = _calibration_readout_text(None, tmp_path)
+    assert "Not calibrated" in text
+
+
+def test_calibration_readout_text_calibrated_warns_on_existing_centroids(tmp_path):
+    from roigbiv.pipeline.calibration import write_calibration
+    from roigbiv.ui.pages.process import _calibration_readout_text
+
+    calib = write_calibration(tmp_path, 45.0, cellprob_threshold=-1.0,
+                              cellpose_model="cyto3")
+    text = _calibration_readout_text(calib, tmp_path)
+    assert "45.0px diameter" in text
+    assert "cellprob_threshold=-1" in text
+    assert "model=cyto3" in text
+    assert "already has centroid output" not in text
+
+    (tmp_path / "centroids.json").write_text("{}")
+    text = _calibration_readout_text(calib, tmp_path)
+    assert "already has centroid output" in text
+
+
+def test_calibration_readout_names_the_deployed_model_when_unset(tmp_path):
+    """An unset model override reads as "deployed", not as an empty string."""
+    from roigbiv.pipeline.calibration import write_calibration
+    from roigbiv.ui.pages.process import _calibration_readout_text
+
+    calib = write_calibration(tmp_path, 40.0)
+    assert "model=deployed" in _calibration_readout_text(calib, tmp_path)
+
+
+def test_mc_preview_figure_draws_calibration_circle(monkeypatch):
+    # A calibration_diameter_px argument adds one extra shape to the figure
+    # layout (the dashed reference circle), centered on the image.
+    import numpy as np
+
+    import roigbiv.ui.pages.process as proc
+
+    monkeypatch.setattr(proc, "_maybe_read_tif",
+                        lambda _p: np.zeros((32, 32), dtype=np.float32))
+
+    fig_no_calib = proc._mc_preview_figure("summary:/ws/output/session01")
+    assert not fig_no_calib.layout.shapes
+
+    fig_calib = proc._mc_preview_figure("summary:/ws/output/session01",
+                                        calibration_diameter_px=12.0)
+    assert len(fig_calib.layout.shapes) == 1
+    shape = fig_calib.layout.shapes[0]
+    assert shape.type == "circle"
+    assert shape.x1 - shape.x0 == pytest.approx(12.0)
+    assert shape.y1 - shape.y0 == pytest.approx(12.0)
+    # centered on the 32x32 image
+    assert (shape.x0 + shape.x1) / 2 == pytest.approx(16.0)
+    assert (shape.y0 + shape.y1) / 2 == pytest.approx(16.0)
+
+
+def test_mc_preview_figure_no_circle_without_mean(monkeypatch):
+    # An "input:" value with no computable mean must not error on shape-adding.
+    import roigbiv.ui.pages.process as proc
+
+    monkeypatch.setattr(proc, "mc_input_mean", lambda _p: None)
+    fig = proc._mc_preview_figure("input:/data/session01_mc.tif",
+                                  calibration_diameter_px=12.0)
+    assert not fig.layout.shapes
+
+
 def test_mc_options_and_value_keeps_current(monkeypatch):
     # The shared option-builder keeps the current selection if it still exists,
     # else defaults to the first FOV.

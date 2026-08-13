@@ -152,6 +152,14 @@ class AdapterConfig:
     # real-sized FOVs with hundreds of ROIs). Pass a float to bypass the
     # inference — useful for very small inputs where crossover detection fails.
     d_cutoff: Optional[float] = None
+    # Exponents ROICaT applies to the three similarity channels before mixing
+    # them into one conjunctive distance. ROICaT's own defaults; exposed so
+    # scripts/registry_diagnose can measure what each channel contributes on
+    # canonical-disk ROIs, where NN and SWT may carry no signal by
+    # construction (see roigbiv/pipeline/centroid_masks.py).
+    power_SF: float = 1.0
+    power_NN: float = 0.5
+    power_SWT: float = 0.5
     roinet_cache_dir: Optional[Path] = None
     roinet_batch_size: int = 8
     verbose: bool = False
@@ -286,7 +294,10 @@ def footprints_from_merged_masks(
 
 
 def cluster_sessions(
-    sessions: List[SessionInput], config: Optional[AdapterConfig] = None
+    sessions: List[SessionInput],
+    config: Optional[AdapterConfig] = None,
+    *,
+    trace: Optional[dict] = None,
 ) -> ClusterResult:
     """Run ROICaT's tracking pipeline on a list of sessions.
 
@@ -298,6 +309,13 @@ def cluster_sessions(
     For ``len(sessions) >= 2`` the pipeline is:
     Aligner (geometric) → ROI_Blurrer → ROInet → SWT → ROI_graph → Clusterer
     (``fit_sequentialHungarian`` per ROICaT's guidance for ≤ 8 sessions).
+
+    Pass ``trace`` (an empty dict) to have each stage object stashed into it
+    under the keys ``data``, ``aligner``, ``blurrer``, ``roinet``, ``swt``,
+    ``sim`` and ``clusterer``. Only ``scripts/registry_diagnose`` uses this:
+    a "why did these sessions not match?" answer lives in the intermediate
+    similarity matrices, and the alternative — a second copy of this stage
+    sequence in the diagnostic — would drift from what actually runs.
     """
     cfg = config or AdapterConfig()
     if not sessions:
@@ -347,8 +365,10 @@ def cluster_sessions(
     from roicat.data_importing import Data_roicat
 
     verbose = bool(cfg.verbose)
+    stash = trace if trace is not None else {}
 
     data = Data_roicat(verbose=verbose)
+    stash["data"] = data
     data.set_FOVHeightWidth(FOV_height=target_h, FOV_width=target_w)
     data.set_FOV_images(FOV_images=per_session_fov_images)
     data.set_spatialFootprints(
@@ -368,6 +388,7 @@ def cluster_sessions(
         device=cfg.device,
         verbose=verbose,
     )
+    stash["aligner"] = aligner
     augmented = aligner.augment_FOV_images(
         FOV_images=data.FOV_images,
         spatialFootprints=data.spatialFootprints,
@@ -408,6 +429,7 @@ def cluster_sessions(
         plot_kernel=False,
         verbose=verbose,
     )
+    stash["blurrer"] = blurrer
     blurrer.blur_ROIs(spatialFootprints=list(aligner.ROIs_aligned))
 
     # ROInet embedding.
@@ -432,6 +454,7 @@ def cluster_sessions(
         persistentWorkers_dataloader=False,
         prefetchFactor_dataloader=None,
     )
+    stash["roinet"] = roinet
     roinet.generate_latents()
 
     # Scattering wavelet transform.
@@ -440,6 +463,7 @@ def cluster_sessions(
         device=cfg.device,
         verbose=verbose,
     )
+    stash["swt"] = swt_ob
     swt_ob.transform(ROI_images=roinet.ROI_images_rs, batch_size=100)
 
     # Similarity graph.
@@ -452,6 +476,7 @@ def cluster_sessions(
         algorithm_nearestNeigbors_spatialFootprints="brute",
         verbose=verbose,
     )
+    stash["sim"] = sim
     sim.compute_similarity_blockwise(
         spatialFootprints=blurrer.ROIs_blurred,
         features_NN=roinet.latents,
@@ -486,10 +511,11 @@ def cluster_sessions(
         s_sesh=sim.s_sesh,
         verbose=verbose,
     )
+    stash["clusterer"] = clusterer
     manual_mixing = dict(
-        power_SF=1.0,
-        power_NN=0.5,
-        power_SWT=0.5,
+        power_SF=float(cfg.power_SF),
+        power_NN=float(cfg.power_NN),
+        power_SWT=float(cfg.power_SWT),
         p_norm=-1.0,
         sig_SF_kwargs=None,
         sig_NN_kwargs={"mu": 0.5, "b": 1.0},
@@ -501,12 +527,29 @@ def cluster_sessions(
         # crossover-inference branch (when d_cutoff kwarg is None). Set it
         # directly so a user-provided cutoff is honoured.
         clusterer.d_cutoff = float(cfg.d_cutoff)
-    clusterer.make_pruned_similarity_graphs(
-        kwargs_makeConjunctiveDistanceMatrix=manual_mixing,
-        stringency=1.0,
-        convert_to_probability=False,
-        d_cutoff=cfg.d_cutoff,
-    )
+    try:
+        clusterer.make_pruned_similarity_graphs(
+            kwargs_makeConjunctiveDistanceMatrix=manual_mixing,
+            stringency=1.0,
+            convert_to_probability=False,
+            d_cutoff=cfg.d_cutoff,
+        )
+    except (TypeError, ValueError) as exc:
+        if cfg.d_cutoff is not None:
+            raise
+        # ROICaT infers d_cutoff from the crossover of the same-cell and
+        # different-cell distance distributions. That needs enough ROIs to
+        # populate both; on a small FOV it finds no crossover, leaves
+        # ``d_cutoff`` as None, and then dereferences it. The resulting
+        # TypeError / zero-size nanmin says nothing about the real cause, and
+        # the caller turns any exception here into a silent "new FOV".
+        raise RuntimeError(
+            f"ROICaT could not infer a distance cutoff for {total_rois} ROIs "
+            f"across {n_sessions} sessions ({type(exc).__name__}: {exc}). This "
+            "is a small-FOV limitation of the crossover inference, not a "
+            "property of these fields of view. Set ROIGBIV_ROICAT_D_CUTOFF to "
+            "bypass it (0.7 clustered the reference prism FOV cleanly)."
+        ) from exc
     labels = clusterer.fit_sequentialHungarian(
         d_conj=clusterer.dConj_pruned,
         session_bool=data.session_bool,

@@ -5,6 +5,9 @@ Pages in a top nav:
 * **Pipeline** — scan a workspace, set motion-correction params, run the
   pipeline (currently scoped to Foundation only — see
   ``roigbiv/ui/pages/process.py``).
+* **Track** — confirm the chronological order of a scanned workspace's
+  sessions, then register them as one cross-session timeline and review the
+  per-cell anomalies (``roigbiv/ui/pages/track.py``).
 
 The Review page (unified viewing + HITL corrections; ``roigbiv/ui/pages/
 review.py``) is currently unrouted while the UI is refocused on
@@ -37,7 +40,7 @@ from dash import Input, Output, State, dcc, html
 
 from roigbiv.ui.components import errors as error_components
 from roigbiv.ui.logging import configure_ui_logging
-from roigbiv.ui.pages import process
+from roigbiv.ui.pages import cells, process, track
 from roigbiv.ui.pages.review import (
     MAIN_COL_ID,
     RIGHT_SIDEBAR_COL_ID,
@@ -63,6 +66,8 @@ THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
     ("/pipeline", "Pipeline", process),
+    ("/track", "Track", track),
+    ("/cells", "Cells", cells),
 )
 
 
@@ -127,6 +132,9 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     from roigbiv.ui.routes.mc_preview import (
         register_flask_routes as register_mc_preview_routes)
     register_mc_preview_routes(app.server)
+    from roigbiv.ui.routes.cells_api import (
+        register_flask_routes as register_cells_api_routes)
+    register_cells_api_routes(app.server)
     _wire_sidebar_toggles(app)
     _wire_theme_toggle(app)
     error_components.register_callbacks(app)

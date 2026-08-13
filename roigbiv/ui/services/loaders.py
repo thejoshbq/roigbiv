@@ -49,6 +49,10 @@ class ROIRender:
     global_cell_id: Optional[str] = None
     is_user: bool = False
     features: dict = field(default_factory=dict)
+    # Cross-session outcome for this ROI in this session — "matched", "new", or
+    # "lost". Only the /cells page populates it; every other loader leaves it
+    # None, which the "status" color mode renders as untracked gray.
+    match_status: Optional[str] = None
 
 
 @dataclass
@@ -272,6 +276,61 @@ def _is_precorrected_input(tif: Path) -> bool:
         return False
 
 
+# ── Centroid-discovery overlay (Suite2p) ────────────────────────────────────
+
+_DEFAULT_CENTROID_RADIUS = 8  # px — matches PipelineConfig.roi_stamp_radius default
+
+
+def load_centroids(
+    output_dir: Path,
+    shape: tuple[int, int],
+    radius: int = _DEFAULT_CENTROID_RADIUS,
+) -> list["ROIRender"]:
+    """Load ``output_dir/centroids.json`` (written by
+    :func:`roigbiv.pipeline.centroids.run_centroid_discovery`) as
+    :class:`ROIRender` objects, ready for :func:`build_roi_figure`.
+
+    Each centroid is rendered as a fixed-radius disk (``radius``, default
+    matching ``PipelineConfig.roi_stamp_radius``) — the same canonical-stamp
+    convention pipeline ROIs use (ADR-0003) — rather than the detector's own
+    footprint. ``source_stage=2`` is only a palette slot (these render in the
+    standalone MC preview, not alongside cascade ROIs), not a claim about which
+    detector found them; ``gate_outcome="accept"`` since this step has no gate
+    to flag/reject against. Returns ``[]`` if no ``centroids.json`` exists yet.
+    """
+    from skimage.measure import find_contours
+
+    from roigbiv.pipeline.roi_stamp import disk_mask
+
+    path = Path(output_dir) / "centroids.json"
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return []
+
+    H, W = int(shape[0]), int(shape[1])
+    out: list[ROIRender] = []
+    for c in payload.get("centroids", []):
+        mask = disk_mask(float(c["y"]), float(c["x"]), radius, H, W)
+        contours: list[tuple[list[float], list[float]]] = []
+        if mask.any():
+            for ring in find_contours(mask.astype(float), 0.5):
+                contours.append((ring[:, 0].tolist(), ring[:, 1].tolist()))
+        out.append(ROIRender(
+            label_id=int(c["label_id"]),
+            source_stage=2,
+            gate_outcome="accept",
+            activity_type=None,
+            area=int(c.get("npix", 0)),
+            centroid_yx=(float(c["y"]), float(c["x"])),
+            contours=contours,
+            features={"cellpose_prob": float(c.get("cellpose_prob", 0.0))},
+        ))
+    return out
+
+
 # ── Motion-correction input mean projection (on-demand, cached) ─────────────
 
 _MC_PREVIEW_FRAMES = 64  # evenly-sampled frames for the input-stack temporal mean
@@ -364,13 +423,16 @@ def load_cross_session_bundle(fov_id: str, cfg=None) -> CrossSessionBundle:
     store.ensure_schema()
 
     fov = store.get_fov(fov_id)
-    _all_rows = sorted(
-        store.list_sessions(fov_id), key=lambda s: s.session_date or date.min,
-    )
+    # ``list_sessions`` already returns the timeline order: the human-confirmed
+    # ``sequence_index`` first (nulls last), then session_date. Do not re-sort
+    # by date — sessions recorded on one day are orderable only by hand, and
+    # that ordering is what makes "arrived late" / "dropped out" mean anything.
+    _all_rows = store.list_sessions(fov_id)
     # Deduplicate by output_dir, keeping the row with the highest created_at.
     # Multiple rows can exist when the pipeline or backfill registers the same
     # output_dir more than once; treat the newest as authoritative (consistent
-    # with store.get_session_by_output_dir).
+    # with store.get_session_by_output_dir). Assigning to an existing key keeps
+    # the dict's original insertion position, so timeline order survives.
     _best: dict[str, object] = {}
     for _row in _all_rows:
         _ex = _best.get(_row.output_dir)
@@ -379,7 +441,7 @@ def load_cross_session_bundle(fov_id: str, cfg=None) -> CrossSessionBundle:
             and (_ex.created_at is None or _row.created_at > _ex.created_at)
         ):
             _best[_row.output_dir] = _row
-    sessions_rows = sorted(_best.values(), key=lambda s: s.session_date or date.min)
+    sessions_rows = list(_best.values())
 
     session_refs: list[SessionRef] = []
     bundles: dict[str, FOVBundle] = {}

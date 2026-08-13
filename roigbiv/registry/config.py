@@ -42,11 +42,31 @@ ROIGBIV_ROICAT_ROI_MIXING
     (ROICaT's own default; tested 0.9 on the T1 three-session dataset and
     it regressed alignment inlier rate — mean projection has richer spatial
     features than footprint density for phase correlation).
+ROIGBIV_ROICAT_D_CUTOFF
+    Conjunctive-distance cutoff for ``Clusterer.make_pruned_similarity_graphs``.
+    Unset (default) lets ROICaT infer it from the same/diff distribution
+    crossover — correct on real-sized FOVs with hundreds of ROIs. That
+    inference needs a populated distribution and returns ``None`` on small
+    inputs, which ROICaT 1.5.5 then dereferences unconditionally
+    (``TypeError: unsupported operand type(s) for -: 'NoneType' and 'float'``,
+    or a zero-size ``nanmin``). Set a float to bypass it. Measured on the
+    three-session prism FOV (29 ROIs total): unset crashes every comparison;
+    0.7 clusters cleanly.
 ROIGBIV_CALIBRATION_PATH
     JSON calibration file. Default: <cwd>/inference/registry_calibration.json
     (falls back to hand-priors when absent).
 ROIGBIV_FOV_ACCEPT_THRESHOLD
-    Posterior cutoff for auto-match. Default: 0.9.
+    Posterior cutoff for auto-match. Default: 0.8.
+
+    Was 0.9 through the v3 bring-up, which was set before any measurement.
+    Lowered after the three-session prism FOV produced well-separated,
+    correct matches at 0.826 and 0.872 — both of which 0.9 sent to review,
+    and a review writes no session row, so the timeline never accumulated
+    and the *following* session then had nothing to match against either.
+
+    This is calibrated on one FOV with three sessions. It trades a higher
+    false-merge risk for a working timeline on sparse prism data; raise it
+    for dense FOVs where the posterior has more ROIs to work with.
 ROIGBIV_FOV_REVIEW_THRESHOLD
     Posterior cutoff for review. Default: 0.5.
 """
@@ -78,6 +98,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float_or_none(name: str) -> Optional[float]:
+    """Parse an optional float env var. Empty / unset both mean "not set"."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return float(raw)
+
+
 def _auto_device() -> str:
     """CUDA if available, else CPU. Deferred torch import."""
     try:
@@ -103,8 +131,11 @@ class RegistryConfig:
     roicat_nonrigid: bool = False
     roicat_hungarian_thresh: float = 0.6
     roicat_roi_mixing: float = 0.5
+    # None = let ROICaT infer the cutoff; see ROIGBIV_ROICAT_D_CUTOFF above for
+    # why that inference cannot work on a small FOV.
+    roicat_d_cutoff: Optional[float] = None
     calibration_path: Path = field(default_factory=_default_calibration_path)
-    fov_accept_threshold: float = 0.9
+    fov_accept_threshold: float = 0.8
     fov_review_threshold: float = 0.5
 
     @classmethod
@@ -147,9 +178,10 @@ class RegistryConfig:
             roicat_roi_mixing=float(
                 os.environ.get("ROIGBIV_ROICAT_ROI_MIXING", "0.5")
             ),
+            roicat_d_cutoff=_env_float_or_none("ROIGBIV_ROICAT_D_CUTOFF"),
             calibration_path=calibration_path,
             fov_accept_threshold=float(
-                os.environ.get("ROIGBIV_FOV_ACCEPT_THRESHOLD", "0.9")
+                os.environ.get("ROIGBIV_FOV_ACCEPT_THRESHOLD", "0.8")
             ),
             fov_review_threshold=float(
                 os.environ.get("ROIGBIV_FOV_REVIEW_THRESHOLD", "0.5")
@@ -195,6 +227,7 @@ def build_adapter_config(cfg: Optional[RegistryConfig] = None):
         alignment_method=cfg.roicat_alignment,
         sequential_hungarian_thresh_cost=cfg.roicat_hungarian_thresh,
         roi_mixing_factor=cfg.roicat_roi_mixing,
+        d_cutoff=cfg.roicat_d_cutoff,
         roinet_cache_dir=cfg.roinet_cache,
     )
 

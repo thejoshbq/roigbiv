@@ -1792,6 +1792,33 @@ def main(argv: "list[str] | None" = None) -> int:
                               "registry). A later --resume run (without this flag) "
                               "continues from Stage 1. Incompatible with --scout, "
                               "--resume, and --no-stage-N toggles."))
+    # Standalone centroid discovery (anatomical Cellpose) — independent of the
+    # stage cascade and of Foundation's SVD/L+S. See roigbiv/pipeline/centroids.py.
+    parser.add_argument("--centroids", dest="run_centroids",
+                        action="store_true", default=False,
+                        help=("Run standalone Cellpose centroid discovery on "
+                              "the anatomical mean image. Composes with "
+                              "--foundation-only: pass alone for "
+                              "CENTROIDS-ONLY (requires an already "
+                              "motion-corrected stack on disk — a pre-"
+                              "corrected input, or a prior run's "
+                              "{stem}_mc.tif; directory --input only, since "
+                              "it skips motion correction entirely), or with "
+                              "--foundation-only for MC + centroids together. "
+                              "Writes centroids.json per FOV, plus a Suite2p "
+                              "activity cross-check where Foundation ran."))
+    # Cross-session tracking over an already-centroid-marked workspace.
+    parser.add_argument("--track", dest="run_tracking",
+                        action="store_true", default=False,
+                        help=("Register a workspace's centroid-marked FOVs as "
+                              "one cross-session timeline: stamp each FOV's "
+                              "centroids into merged_masks.tif, then register "
+                              "the sessions in the order set in "
+                              "session_order.json (proposed from filename "
+                              "dates, confirmed on the UI's Track page). "
+                              "Reports per-cell anomalies when done. Requires "
+                              "a directory --input and a prior --centroids "
+                              "run; does no detection itself."))
     parser.add_argument("--auto-scale", dest="auto_scale",
                         action=argparse.BooleanOptionalAction, default=True,
                         help=("Optics auto-scale: after foundation, measure the "
@@ -2008,6 +2035,23 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.email_to and not args.no_email and not args.smtp_user:
         parser.error("--smtp-user is required when --email-to is set")
 
+    if args.run_tracking:
+        # --track is a registration pass over existing centroids.json files; it
+        # runs no detection, so a detection mode alongside it is a contradiction
+        # rather than a composition.
+        conflicting = [
+            flag for flag, on in (
+                ("--centroids", args.run_centroids),
+                ("--foundation-only", args.foundation_only),
+                ("--scout", args.scout_mode),
+            ) if on
+        ]
+        if conflicting:
+            parser.error(
+                f"--track cannot be combined with {', '.join(conflicting)} — it "
+                "registers FOVs that already have centroids.json. Run detection "
+                "first, then --track as a second pass.")
+
     if args.scout_mode:
         if any(v is False for v in (args.enable_stage_2, args.enable_stage_3,
                                     args.enable_stage_4)) or any(
@@ -2055,8 +2099,23 @@ def main(argv: "list[str] | None" = None) -> int:
     }
 
     if input_path.is_dir():
+        if args.run_tracking:
+            return _run_tracking_cli(args, input_path)
         return _run_workspace(args, input_path, stage_overrides)
     if input_path.is_file():
+        if args.run_tracking:
+            print("ERROR: --track needs a directory --input — cross-session "
+                  "tracking compares a workspace's FOVs against each other, "
+                  "so a single file has nothing to track against.",
+                  file=sys.stderr)
+            return 2
+        if args.run_centroids and not args.foundation_only:
+            print("ERROR: --centroids without --foundation-only (centroids-"
+                  "only mode) requires a directory --input (workspace mode) "
+                  "so it can resolve a prior run's {stem}_mc.tif; pass a "
+                  "directory, or add --foundation-only to run both together.",
+                  file=sys.stderr)
+            return 2
         return _run_single(args, input_path, stage_overrides)
     print(f"ERROR: --input is neither a file nor a directory: {input_path}",
           file=sys.stderr)
@@ -2187,6 +2246,7 @@ def _run_single(
         "scout_vcorr_stride": args.scout_vcorr_stride,
         "scout_vcorr_neighbors": args.scout_vcorr_neighbors,
         "foundation_only": args.foundation_only,
+        "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
@@ -2257,6 +2317,22 @@ def _run_single(
         return 1
     duration = time.perf_counter() - t0
 
+    if cfg.foundation_only and cfg.run_centroids:  # "both" mode
+        from roigbiv.pipeline.centroids import run_centroid_discovery
+
+        mc_tif = fov.output_dir / f"{fov_stem}_mc.tif"
+        if mc_tif.exists():
+            try:
+                result = run_centroid_discovery(mc_tif, fov.output_dir, cfg)
+                print(f"Centroid discovery OK — {result.count} centroids "
+                      f"({result.output_path})", flush=True)
+            except BaseException as exc:  # noqa: BLE001
+                print(f"WARN: centroid discovery failed for {fov_stem}: {exc}",
+                      file=sys.stderr)
+        else:
+            print(f"WARN: centroid discovery skipped — {mc_tif.name} not found",
+                  file=sys.stderr)
+
     report = None
     if args.registry:
         from roigbiv.pipeline.optics import resolved_config_payload
@@ -2320,6 +2396,43 @@ def _run_single(
         print("--no-slack set; skipping Slack dispatch.", flush=True)
     # Email (3) takes precedence over Slack (4) when both fail.
     return 3 if email_failed else (4 if slack_failed else 0)
+
+
+def _run_tracking_cli(args: argparse.Namespace, input_path: Path) -> int:
+    """``--track``: register a centroid-marked workspace as one timeline."""
+    import sys
+
+    from roigbiv.pipeline.workspace import resolve_workspace, run_tracking
+
+    try:
+        workspace = resolve_workspace(input_path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    results = run_tracking(
+        workspace,
+        {"fs": args.fs},
+        log_cb=lambda msg: print(msg, flush=True),
+    )
+    if not results:
+        print("Nothing to track — no FOVs discovered in this workspace.",
+              file=sys.stderr)
+        return 2
+
+    skipped = [r for r in results if r.skipped]
+    failed = [r for r in results if r.error]
+    if skipped:
+        print(f"\n{len(skipped)} session(s) skipped:", file=sys.stderr)
+        for r in skipped:
+            print(f"  {r.stem}: {r.skipped}", file=sys.stderr)
+    if failed:
+        print(f"\n{len(failed)} session(s) failed:", file=sys.stderr)
+        for r in failed:
+            print(f"  {r.stem}: {r.error}", file=sys.stderr)
+        return 1
+    # Nothing registered at all is a failure, not a quiet success.
+    return 0 if any(r.registry for r in results) else 1
 
 
 def _run_workspace(
@@ -2445,6 +2558,7 @@ def _run_workspace(
         "resume": args.resume,
         "force_cpu": args.force_cpu,
         "foundation_only": args.foundation_only,
+        "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only

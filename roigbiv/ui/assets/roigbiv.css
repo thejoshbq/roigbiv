@@ -442,3 +442,201 @@ hr {
     border-radius: var(--roigbiv-radius);
 }
 .nav-pills .nav-link:hover { color: var(--roigbiv-accent); }
+
+/* ── Track page: drag-to-reorder session list ──────────────────────────── */
+.roigbiv-track-row {
+    cursor: grab;
+    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--roigbiv-radius);
+    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+}
+.roigbiv-track-row:hover { border-color: var(--roigbiv-accent); }
+.roigbiv-track-row:active { cursor: grabbing; }
+.roigbiv-track-dragging { opacity: 0.4; border-style: dashed; }
+.roigbiv-track-handle {
+    color: var(--roigbiv-text-secondary);
+    font-size: 1.1rem;
+    line-height: 1;
+}
+.roigbiv-track-seq {
+    font-family: var(--roigbiv-font-mono);
+    color: var(--roigbiv-accent);
+    min-width: 2.5rem;
+}
+
+/* ── Cells page: contact sheet + per-cell filmstrip ────────────────────── */
+.roigbiv-cells-swatch {
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 2px;
+    margin-right: 0.35rem;
+    vertical-align: -1px;
+}
+/* The sheet is a grid of panels at the projection's own aspect ratio, wrapping
+   to whatever the window fits. It used to be one flex row of panels pinned to
+   viewport height: at four sessions each panel was ~340px wide and ~700px
+   tall, and since the figure preserves the image's 1:1 aspect, half of every
+   panel was empty letterbox. Height now follows width (see
+   .roigbiv-cells-panel-view's inline aspect-ratio, set from the served frame
+   size) so there is nothing left to letterbox.
+   --roigbiv-cells-chrome is the navbar + toolbar + caption above them. */
+:root { --roigbiv-cells-chrome: 15rem; }
+
+.roigbiv-cells-sheet {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+    gap: 0.5rem;
+    align-items: start;
+}
+.roigbiv-cells-panel {
+    min-width: 0;   /* grid items default to min-content — this lets them shrink */
+}
+/* One panel promoted to focus: it takes two tracks each way and the rest stay
+   beside it as context. Only applied where there is room for two columns —
+   below that the grid is single-column and the span is already implicit. */
+@media (min-width: 62em) {
+    .roigbiv-cells-panel-focus {
+        grid-column: span 2;
+        grid-row: span 2;
+    }
+}
+.roigbiv-cells-panel-head {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0.15rem 0.1rem;
+    border-radius: var(--roigbiv-radius);
+}
+.roigbiv-cells-panel-head:hover { background: rgba(0, 229, 255, 0.08); }
+.roigbiv-cells-panel-focus > .roigbiv-cells-panel-head {
+    box-shadow: inset 2px 0 0 var(--roigbiv-accent);
+}
+.roigbiv-cells-panel-view {
+    width: 100%;
+    aspect-ratio: 1 / 1;   /* replaced inline with the frame's true ratio */
+    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--roigbiv-radius);
+    overflow: hidden;
+}
+
+/* ── Cells page: the ROI overlay drawn over each OpenSeadragon viewer ──── */
+/* The holder is inert so a click on bare background reaches the viewer, where
+   OpenSeadragon tells a click from a pan for us; only the shapes take input. */
+.roigbiv-cells-overlay-holder {
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+.roigbiv-cells-overlay {
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+}
+.roigbiv-roi {
+    pointer-events: auto;
+    cursor: pointer;
+}
+.roigbiv-roi path {
+    /* Stroke width is in screen pixels, not image pixels: an outline has to
+       stay legible at 1x and not swell into a blob at 40x. */
+    vector-effect: non-scaling-stroke;
+    stroke-width: 2px;
+    transition: stroke-width 80ms linear;
+}
+.roigbiv-roi:hover path { stroke-width: 3.5px; }
+.roigbiv-roi.is-selected path { stroke-width: 4px; }
+.roigbiv-roi.is-dragging { cursor: grabbing; }
+.roigbiv-roi.is-dragging path { stroke-width: 4px; stroke-dasharray: 4 3; }
+/* A cell drawn where it last was, in a session that never detected it — a
+   solid outline would claim a detection that does not exist. */
+.roigbiv-roi.is-ghost path {
+    stroke-dasharray: 3 3;
+    pointer-events: stroke;
+}
+.roigbiv-roi.is-ghost { cursor: default; }
+/* Editing makes a ghost a target — ctrl-click confirms its cell is really in
+   this session. `all` rather than `stroke` because the shape has no fill and a
+   dashed 2px ring is a poor thing to ask anyone to hit repeatedly. The cost is
+   that click-empty-space-to-add no longer reaches *inside* a ghost outline. */
+.roigbiv-cells-panel-editing .roigbiv-roi.is-ghost { cursor: pointer; }
+.roigbiv-cells-panel-editing .roigbiv-roi.is-ghost path { pointer-events: all; }
+.roigbiv-cells-badge {
+    font-family: var(--roigbiv-font-mono);
+    font-size: 11px;
+    text-anchor: middle;
+    dominant-baseline: middle;
+    pointer-events: none;
+    paint-order: stroke;
+    stroke: rgba(0, 0, 0, 0.75);
+    stroke-width: 2.5px;
+    vector-effect: non-scaling-stroke;
+}
+.roigbiv-roi.is-selected .roigbiv-cells-badge { font-size: 15px; }
+.roigbiv-roi.hide-badge .roigbiv-cells-badge { display: none; }
+/* Edit mode is a mode for *writes*, so it has to be visible without reading
+   the toolbar — the whole sheet picks up a crosshair. */
+.roigbiv-cells-panel-editing .roigbiv-cells-panel-view { cursor: crosshair; }
+
+/* ── Cells page: sheet / rail split ────────────────────────────────────── */
+/* Flex, not a Bootstrap row: collapsed, the edge tab has to sit beside a
+   full-width sheet, and a col-md-12 would push it onto a second row. One
+   `is-collapsed` class on the wrapper drives all three children. */
+.roigbiv-cells-body {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+}
+.roigbiv-cells-sheet-col {
+    flex: 1 1 auto;
+    /* Flex items are min-width:auto by default. Without this the sheet's grid
+       refuses to shrink below its content and squeezes the rail instead. */
+    min-width: 0;
+}
+/* 18rem against col-md-3's 25% (480px at 1920) for three short columns — the
+   sheet gains most of a panel's width before anything is even collapsed. */
+.roigbiv-cells-rail-col { flex: 0 0 18rem; }
+.roigbiv-cells-body.is-collapsed .roigbiv-cells-rail-col { display: none; }
+
+.roigbiv-cells-rail-tab {
+    display: none;
+    flex: 0 0 auto;
+    writing-mode: vertical-rl;
+    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--roigbiv-radius);
+    padding: 0.35rem 0;
+}
+.roigbiv-cells-rail-tab:hover { background: rgba(0, 229, 255, 0.08); }
+.roigbiv-cells-body.is-collapsed .roigbiv-cells-rail-tab { display: block; }
+
+/* Same breakpoint the focused panel uses — below it the sheet is one column
+   wide and a side rail has nothing left to sit beside. */
+@media (max-width: 62em) {
+    .roigbiv-cells-body { flex-direction: column; }
+    .roigbiv-cells-rail-col { flex: 1 1 auto; width: 100%; }
+    .roigbiv-cells-rail-tab { writing-mode: horizontal-tb; }
+}
+
+.roigbiv-cells-list {
+    height: calc(100vh - var(--roigbiv-cells-chrome));
+    min-height: 22rem;
+    overflow-y: auto;
+}
+.roigbiv-cells-drawer {
+    height: auto !important;
+    max-height: 60vh;
+}
+.roigbiv-cells-row { cursor: pointer; }
+.roigbiv-cells-row:hover { background: rgba(0, 229, 255, 0.06); }
+.roigbiv-cells-row-active {
+    background: rgba(0, 229, 255, 0.12);
+    box-shadow: inset 2px 0 0 var(--roigbiv-accent);
+}
+/* The border carries the cell's cross-session status, so it is set inline
+   per card and must not be overridden here. */
+.roigbiv-cell-crop {
+    border-width: 2px;
+    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+}

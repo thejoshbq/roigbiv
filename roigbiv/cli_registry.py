@@ -54,6 +54,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     track.add_argument("global_cell_id")
 
+    anom = sub.add_parser(
+        "anomalies",
+        help="Report cells that arrive late, drop out, or blink across a FOV.",
+    )
+    anom.add_argument("fov_id")
+    anom.add_argument("--kind", choices=("late_arrival", "dropout", "intermittent"),
+                      help="Show only one anomaly class.")
+
     bf = sub.add_parser(
         "backfill",
         help="Walk a root directory and register each FOV.",
@@ -82,6 +90,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cmd_match(args.output_dir)
     if args.cmd == "track":
         return _cmd_track(args.global_cell_id)
+    if args.cmd == "anomalies":
+        return _cmd_anomalies(args.fov_id, args.kind)
     if args.cmd == "backfill":
         return _cmd_backfill(args.root, args.dry_run)
     if args.cmd == "dedupe":
@@ -185,6 +195,44 @@ def _cmd_track(global_cell_id: str) -> int:
         )
         print(f"  {date_s}  local_label_id={o.local_label_id}  "
               f"score={o.match_score}{cluster_str}  {out_dir}")
+    return 0
+
+
+def _cmd_anomalies(fov_id: str, kind: Optional[str] = None) -> int:
+    from roigbiv.registry.anomalies import cell_timeline
+
+    store = build_store()
+    store.ensure_schema()
+    if store.get_fov(fov_id) is None:
+        print(f"fov_id {fov_id!r} not found", file=sys.stderr)
+        return 1
+
+    report = cell_timeline(store, fov_id)
+    if not report.sessions:
+        print("(no sessions registered for this FOV)")
+        return 0
+
+    counts = report.counts
+    print(f"FOV {fov_id}")
+    print(f"  sessions: {counts['n_sessions']}  cells: {counts['n_cells']}  "
+          f"seen in every session: {counts['n_complete']}")
+    if not report.ordering_is_confirmed:
+        print("  note: timeline order is not human-confirmed — 'late'/'dropout' "
+              "follow the filename dates. Set the order on the Track page.")
+
+    print("  timeline:")
+    for slot in report.sessions:
+        date_s = slot.session_date.isoformat() if slot.session_date else "-"
+        print(f"    [{slot.sequence_index}] {date_s}  {slot.output_dir}")
+
+    kinds = [kind] if kind else ["late_arrival", "dropout", "intermittent"]
+    for k in kinds:
+        rows = report.with_anomaly(k)
+        print(f"  {k}: {len(rows)}")
+        for cell in rows:
+            marks = "".join("x" if p else "." for p in cell.present)
+            print(f"    {cell.global_cell_id}  [{marks}]  "
+                  f"first={cell.first_seen} last={cell.last_seen}")
     return 0
 
 

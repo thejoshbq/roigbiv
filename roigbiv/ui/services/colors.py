@@ -15,6 +15,11 @@ Four view modes drive the color assignment:
     via :func:`roigbiv.pipeline.cross_session_viewer._rgba_for_global_cell_id`,
     so the same cell is the same color across sessions. Unmatched (no gcid)
     ROIs fall back to a neutral gray.
+``status``
+    Hue keyed to ``ROIRender.match_status`` — whether this cell carried over
+    from an earlier session, first appeared here, or has gone missing. Three
+    colors total, so a contact sheet of several sessions stays readable;
+    per-cell identity is revealed on selection rather than by hue.
 """
 from __future__ import annotations
 
@@ -31,6 +36,15 @@ STAGE_PALETTE: dict[int, str] = {
     3: "rgba(155, 89, 182, 0.85)",    # Template — purple
     4: "rgba(241, 196, 15, 0.90)",    # Tonic    — gold
     USER_STAGE_SENTINEL: "rgba(231, 76, 60, 0.90)",   # User     — red
+}
+
+# Cross-session outcome for one cell in one session. "lost" is drawn at the
+# cell's last known position — it has no footprint in *this* session, which is
+# precisely the thing worth seeing.
+MATCH_STATUS_PALETTE: dict[str, str] = {
+    "matched": "rgba(0, 229, 255, 0.85)",         # accent teal — carried over
+    "new":     "rgba(243, 156, 18, 0.90)",        # amber — first seen here
+    "lost":    "rgba(231, 76, 60, 0.75)",         # red — absent here
 }
 
 FEATURE_PALETTE: dict[str, str] = {
@@ -50,6 +64,12 @@ def color_for_feature(activity_type: Optional[str]) -> str:
     if not activity_type:
         return UNTRACKED_COLOR
     return FEATURE_PALETTE.get(activity_type, UNTRACKED_COLOR)
+
+
+def color_for_match_status(status: Optional[str]) -> str:
+    if not status:
+        return UNTRACKED_COLOR
+    return MATCH_STATUS_PALETTE.get(status, UNTRACKED_COLOR)
 
 
 def color_for_gcid(gcid: Optional[str]) -> str:
@@ -93,6 +113,12 @@ STAGE_LABELS: dict[int, str] = {
     3: "Stage 3 — Template",
     4: "Stage 4 — Tonic",
     USER_STAGE_SENTINEL: "User correction",
+}
+
+MATCH_STATUS_LABELS: dict[str, str] = {
+    "matched": "Matched",
+    "new":     "New here",
+    "lost":    "Not detected",
 }
 
 FEATURE_LABELS: dict[str, str] = {

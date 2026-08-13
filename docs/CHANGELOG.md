@@ -6,6 +6,27 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- **Cross-session tracking HITL controls.** The `/cells` page gained an edit mode
+  (off by default) for the errors that were previously visible but unfixable there: a
+  missed or misplaced soma centroid, and a cell the matcher failed to link across
+  sessions. Delete / add / move a centroid; link or unlink a cell across sessions;
+  "place here" composes add + link in one gesture when a selected cell is missing from
+  the clicked session (`roigbiv/ui/pages/cells.py`). Edits apply instantly with an
+  "Undo last" spanning every log the FOV owns.
+
+  Two new append-only JSONL logs carry the edits — `corrections/centroids.jsonl` per
+  session, `corrections/matches/{fov_id}.jsonl` per FOV
+  (`roigbiv/pipeline/centroid_edits.py`, `roigbiv/registry/cell_edits.py`) — replayed by
+  a single materializer, `apply_tracking_edits`, that both `run_tracking` and the UI call
+  through. No ROICaT match runs for an edit: labels became explicit rather than
+  positional (`stamp_labeled_centroids`, byte-identical output for an unedited
+  workspace), so a moved centroid keeps its cell, a deleted one drops its observation,
+  and an added one gets a deterministic new cell. `run_tracking` replays both logs after
+  every registration, since a centroid edit changes the FOV fingerprint and would
+  otherwise be silently destroyed by the next re-match. See
+  `docs/adr/0004-tracking-hitl-additive-edit-logs.md` for the full design and named
+  tradeoffs.
+
 - **Canonical fixed-radius ROI stamps.** Every accepted/flagged ROI, from all four
   detection stages, now has its detector-native boundary (irregular Cellpose/Suite2p mask,
   or a regionprops-derived Stage-4 blob) replaced post-gate with a fixed-radius disk

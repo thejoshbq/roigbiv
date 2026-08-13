@@ -36,13 +36,18 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import numpy as np
 
 from roigbiv.io import discover_tifs, validate_tif
 from roigbiv.pipeline import fmt
 from roigbiv.pipeline.types import FOVData, PipelineConfig
+
+if TYPE_CHECKING:  # annotation-only — importing these eagerly is the slow path
+    import threading
+
+    from roigbiv.registry.config import RegistryConfig
 
 LogCallback = Callable[[str], None]
 
@@ -155,13 +160,23 @@ def _registry_config_from_workspace(workspace: WorkspacePaths) -> "RegistryConfi
     Creates workspace directories as a side effect (same as
     :func:`configure_registry_env`). Use this from the UI path so concurrent
     sessions never overwrite each other's registry env vars.
+
+    Only *storage location* is workspace-scoped. Everything else — device,
+    alignment method, d_cutoff, the accept/review thresholds — is read from the
+    environment, because those are matcher tuning rather than per-workspace
+    state. Constructing the dataclass field-by-field instead silently pinned
+    every one of them to its default, so ``ROIGBIV_FOV_ACCEPT_THRESHOLD`` and
+    ``ROIGBIV_ROICAT_D_CUTOFF`` had no effect on any workspace run.
     """
+    from dataclasses import replace
+
     from roigbiv.registry.config import RegistryConfig
 
     workspace.input_root.mkdir(parents=True, exist_ok=True)
     workspace.output_root.mkdir(parents=True, exist_ok=True)
     workspace.blob_root.mkdir(parents=True, exist_ok=True)
-    return RegistryConfig(
+    return replace(
+        RegistryConfig.from_env(),
         dsn=workspace.db_dsn,
         blob_backend="local",
         blob_root=workspace.blob_root,
@@ -187,6 +202,8 @@ class FOVRunResult:
     # foundation outputs are on disk; a --resume run with a confirmed profile
     # continues from Stage 1). Carries the confirmation payload for the UI.
     awaiting_confirmation: Optional[dict] = None
+    # Set when cfg.run_centroids ran (standalone or after foundation_only).
+    centroid_count: Optional[int] = None
 
 
 def run_with_workspace(
@@ -259,7 +276,17 @@ def run_with_workspace(
 
     _ensure_registry_schema(log, cfg)
 
-    parallel = n_workers > 1 and len(tifs_to_run) > 1
+    # Centroid-discovery-only runs skip Foundation/run_pipeline entirely (see
+    # _process_one) and are lightweight (Suite2p detection-only, no GPU
+    # registration) — the parallel batch path exists to fan out the expensive
+    # Foundation/Cellpose GPU work, so it's not worth wiring a second job shape
+    # through roigbiv.pipeline.batch for this case. Always sequential.
+    centroids_only = (bool(cfg_overrides.get("run_centroids"))
+                      and not bool(cfg_overrides.get("foundation_only")))
+    parallel = n_workers > 1 and len(tifs_to_run) > 1 and not centroids_only
+    if centroids_only and n_workers > 1:
+        log("Centroid-discovery-only runs execute sequentially "
+            "(lightweight; --n-workers applies to Foundation/Cellpose GPU work).")
     if parallel:
         log(f"Parallel:  n_workers={n_workers} (capped at 2)")
         results = _run_parallel(workspace, tifs_to_run, cfg_overrides, log,
@@ -290,6 +317,295 @@ def run_with_workspace(
         _safety_backfill(workspace, log, cfg)
 
     return results
+
+
+@dataclass
+class TrackingResult:
+    """One FOV's outcome from :func:`run_tracking`."""
+
+    stem: str
+    sequence_index: int
+    output_dir: Path
+    registry: Optional[dict] = None
+    n_centroids: Optional[int] = None
+    n_overlapping_pairs: int = 0
+    skipped: Optional[str] = None
+    error: Optional[str] = None
+
+
+def run_tracking(
+    workspace: WorkspacePaths,
+    cfg_overrides: Optional[dict] = None,
+    *,
+    log_cb: Optional[LogCallback] = None,
+    registry_config: Optional["RegistryConfig"] = None,
+    abort_event: Optional["threading.Event"] = None,
+) -> list[TrackingResult]:
+    """Register a workspace's centroid-marked FOVs as one cross-session timeline.
+
+    Walks ``session_order.json`` (proposing an order from filename dates when
+    the human has not set one), stamps each FOV's centroids into the label image
+    the registry reads, and registers the sessions **in that order**.
+
+    Order is load-bearing rather than cosmetic: within a ROICaT cluster the
+    earliest-registered observation owns the ``global_cell_id``
+    (``registry/orchestrator.py``), so registration sequence *is* cell-identity
+    seniority. It is also what makes "late arrival" and "dropout" meaningful in
+    :mod:`roigbiv.registry.anomalies`.
+
+    The order also asserts *grouping*, not just sequence. The first session
+    establishes the FOV and every later one is registered into it via
+    ``force_fov_id``, so matching decides which cells correspond and never
+    whether the sessions belong together. Left to decide that for itself the
+    orchestrator scored the same three-session prism FOV as three separate
+    FOVs, because its posterior is derived from the very cell clustering it
+    gates — a clustering failure silently became a grouping failure, and the
+    sessions the user had explicitly ordered stopped being comparable.
+    """
+    from roigbiv.pipeline.centroid_masks import write_merged_masks
+    from roigbiv.pipeline.session_order import (
+        discover_trackable_stems,
+        resolve_order,
+        save_order,
+    )
+
+    if registry_config is not None:
+        reg_cfg = registry_config
+    else:
+        configure_registry_env(workspace)
+        reg_cfg = _registry_config_from_workspace(workspace)
+    log = log_cb or (lambda _msg: None)
+
+    entries = resolve_order(workspace.input_root,
+                            discover_trackable_stems(workspace))
+    save_order(workspace.input_root, entries)
+
+    log(f"Workspace: {workspace.input_root}")
+    log(f"Registry:  {workspace.db_path}")
+    log(f"Tracking {len(entries)} session(s) in confirmed order.")
+    unreviewed = [e.stem for e in entries if e.needs_review]
+    if unreviewed:
+        log(f"  NOTE: {len(unreviewed)} session(s) have an ambiguous or "
+            f"unreadable filename date and have not been human-ordered. "
+            f"Confirm the order on the Track page if this timeline matters.")
+
+    _ensure_registry_schema(log, reg_cfg)
+    _warn_if_matching_unavailable(log)
+    cfg = _build_config(workspace.output_root, dict(cfg_overrides or {}))
+
+    results: list[TrackingResult] = []
+    # The FOV the first registered session lands in. Every later session in a
+    # confirmed order joins it by construction — see run_tracking's docstring.
+    timeline_fov_id: Optional[str] = None
+    for entry in entries:
+        if abort_event is not None and abort_event.is_set():
+            log(f"Stop requested — halting before session {entry.index}.")
+            break
+
+        out_dir = workspace.output_root / entry.stem
+        log(fmt.fov_separator())
+        log(f"[{entry.index}] {entry.stem}")
+
+        result = TrackingResult(stem=entry.stem, sequence_index=entry.index,
+                                output_dir=out_dir)
+        if not (out_dir / "centroids.json").exists():
+            result.skipped = "no centroids.json — run centroid discovery first"
+            log(f"  skipped: {result.skipped}")
+            results.append(result)
+            continue
+
+        try:
+            stamped = write_merged_masks(out_dir, cfg)
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"{type(exc).__name__}: {exc}"
+            log(f"  ERROR stamping masks: {result.error}")
+            results.append(result)
+            continue
+
+        result.n_centroids = stamped.n_centroids
+        result.n_overlapping_pairs = stamped.n_overlapping_pairs
+        log(f"  {stamped.n_centroids} centroid(s) stamped at "
+            f"radius {stamped.radius_px}px")
+        if stamped.radius_capped_from:
+            # Silently shrinking the stamp would look like a clean run while
+            # discarding the calibrated size, so name the constraint.
+            log(f"  NOTE: calibration implies radius "
+                f"{stamped.radius_capped_from}px, capped to {stamped.radius_px}px "
+                f"— ROICaT crops every ROI to a fixed 36x36 window, and a disk "
+                f"that fills it makes all ROIs identical (nothing clusters)")
+        if stamped.n_overlapping_pairs:
+            log(f"  WARNING: {stamped.n_overlapping_pairs} overlapping stamp "
+                f"pair(s) — somata closer than 2x the stamp radius")
+        if stamped.n_labels < stamped.n_centroids:
+            log(f"  WARNING: {stamped.n_centroids - stamped.n_labels} stamp(s) "
+                f"fully buried by a later one and will not reach the registry")
+        for warning in stamped.edit_warnings:
+            log(f"  WARNING: centroid edit {warning}")
+        if not stamped.written and (out_dir / "corrections" / "centroids.jsonl").exists():
+            log("  NOTE: masks come from a full pipeline cascade — centroid "
+                "edits do not apply here (real segmentation outranks them)")
+
+        try:
+            result.registry = _register_tracked_session(
+                entry, out_dir, reg_cfg, log, force_fov_id=timeline_fov_id)
+            if timeline_fov_id is None:
+                timeline_fov_id = result.registry.get("fov_id")
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"{type(exc).__name__}: {exc}"
+            log(f"  ERROR registering: {result.error}")
+        results.append(result)
+
+    _replay_tracking_edits(results, workspace, reg_cfg, log)
+    _log_tracking_summary(results, reg_cfg, log)
+    return results
+
+
+def _replay_tracking_edits(
+    results: list["TrackingResult"], workspace: WorkspacePaths,
+    reg_cfg: "RegistryConfig", log: LogCallback,
+) -> None:
+    """Reapply every FOV's centroid + match edit logs after a fresh registration.
+
+    A centroid edit changes the FOV fingerprint
+    (:mod:`roigbiv.registry.fingerprint`), so the idempotency guard in
+    ``register_or_match`` misses on the next run, the session is fully
+    re-registered, and its observations are rebuilt from ROICaT's cluster
+    labels alone — silently discarding every human edit made since the last
+    run. This is not a nicety on top of that: without it, editing a FOV and
+    then re-running tracking would be actively destructive.
+    """
+    from roigbiv.registry import build_store
+    from roigbiv.registry.cell_edits import apply_tracking_edits
+
+    fov_ids = list(dict.fromkeys(
+        r.registry.get("fov_id") for r in results
+        if r.registry and r.registry.get("fov_id")
+    ))
+    if not fov_ids:
+        return
+
+    store = build_store(reg_cfg)
+    for fov_id in fov_ids:
+        report = apply_tracking_edits(fov_id, workspace.input_root, store)
+        if report.warnings:
+            log(f"  WARNING: replaying edits for FOV {fov_id}:")
+            for warning in report.warnings:
+                log(f"    {warning}")
+
+
+def _warn_if_matching_unavailable(log: LogCallback) -> None:
+    """Say so up front when ROICaT is missing.
+
+    ``roicat`` is an optional extra (``pip install -e '.[embeddings]'``).
+    Without it ``match_fov`` raises, the orchestrator catches the exception and
+    falls through to ``new_fov`` — so a tracking run "succeeds" while matching
+    nothing, and every session becomes its own single-session FOV. That failure
+    is invisible in the per-FOV output, which is exactly why it is worth
+    stating before the run rather than leaving it to be inferred afterwards.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("roicat") is not None:
+        return
+    log("WARNING: ROICaT is not installed — cross-session matching cannot run. "
+        "Every session will register as a NEW FOV and no cells will be tracked "
+        "across sessions. Install it with: pip install -e '.[embeddings]'")
+
+
+def _register_tracked_session(
+    entry, out_dir: Path, reg_cfg: "RegistryConfig", log: LogCallback,
+    *, force_fov_id: Optional[str] = None,
+) -> dict:
+    """Register one ordered session and stamp its timeline position."""
+    from roigbiv.registry import (
+        build_adapter_config,
+        build_blob_store,
+        build_store,
+        load_calibration,
+        register_or_match,
+    )
+    from roigbiv.registry.roicat_adapter import load_session_input
+
+    store = build_store(reg_cfg)
+    query = load_session_input(out_dir, session_key=entry.stem)
+    report = register_or_match(
+        fov_stem=entry.stem,
+        query=query,
+        output_dir=out_dir,
+        store=store,
+        blob_store=build_blob_store(reg_cfg),
+        session_date_override=entry.as_date(),
+        calibration=load_calibration(reg_cfg),
+        adapter_config=build_adapter_config(reg_cfg),
+        accept_threshold=reg_cfg.fov_accept_threshold,
+        review_threshold=reg_cfg.fov_review_threshold,
+        force_fov_id=force_fov_id,
+    )
+    decision = report.get("decision", "unknown")
+    posterior = report.get("fov_posterior") or report.get("fov_sim")
+    log("  " + _format_registry_decision(decision, report, posterior).strip())
+    if report.get("grouping_warning"):
+        log(f"  WARNING: {report['grouping_warning']}")
+
+    # The review branch writes no session row, so there is nothing to position.
+    session_id = report.get("session_id")
+    if session_id:
+        store.update_session_sequence(session_id, entry.index)
+    return report
+
+
+def _log_tracking_summary(
+    results: list["TrackingResult"], reg_cfg: "RegistryConfig", log: LogCallback,
+) -> None:
+    """Per-FOV anomaly counts once every session in the timeline is registered."""
+    from roigbiv.registry import build_store
+    from roigbiv.registry.anomalies import cell_timeline
+
+    registered = [r for r in results if r.registry and r.registry.get("fov_id")]
+    if not registered:
+        return
+
+    log(fmt.fov_separator())
+    ok = len(registered)
+    skipped = sum(1 for r in results if r.skipped)
+    failed = sum(1 for r in results if r.error)
+    log(f"Tracked {ok} session(s); {skipped} skipped, {failed} failed.")
+
+    # A confirmed order registers into one FOV, so sessions can no longer
+    # scatter into separate FOVs — but they can still all come back with
+    # nothing matched, which is the same failure wearing a different hat. The
+    # per-FOV lines below look healthy either way, so name it here.
+    followers = [r for r in registered[1:]]
+    if followers and all(r.registry.get("n_matched", 0) == 0 for r in followers):
+        log("  WARNING: no cell matched across sessions — every ROI after the "
+            "first session registered as a new cell.")
+        # A matcher that *crashed* looks identical to one that simply found
+        # nothing. Say which one happened.
+        errors = [e for r in registered
+                  for e in (r.registry.get("match_errors") or [])]
+        if errors:
+            log("  The matcher did not decline these — it failed. "
+                f"{len(errors)} comparison(s) raised:")
+            for detail in dict.fromkeys(e["error"] for e in errors):
+                log(f"    {detail}")
+        else:
+            log("  Check that these sessions really are the same field of view.")
+
+    store = build_store(reg_cfg)
+    for fov_id in dict.fromkeys(r.registry["fov_id"] for r in registered):
+        try:
+            report = cell_timeline(store, fov_id)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  anomaly report unavailable for {fov_id}: "
+                f"{type(exc).__name__}: {exc}")
+            continue
+        counts = report.counts
+        log(f"  FOV {fov_id}: {counts['n_cells']} cell(s) over "
+            f"{counts['n_sessions']} session(s) — "
+            f"{counts['n_complete']} seen throughout, "
+            f"{counts['late_arrival']} late, {counts['dropout']} dropout, "
+            f"{counts['intermittent']} intermittent")
+    log("  Detail: roigbiv-registry anomalies <fov_id>")
 
 
 def _run_parallel(
@@ -396,6 +712,10 @@ def _run_parallel(
             f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
             f"reject={counts.get('reject', 0)}")
 
+        centroid_count = None
+        if getattr(cfg, "run_centroids", False):  # "both" mode only — see run_with_workspace
+            centroid_count = _run_centroids_after_foundation(tif, out_dir, cfg, log)
+
         stem = tif.stem.replace("_mc", "")
         registry: Optional[dict] = None
         if (skip_registry or getattr(cfg, "scout_mode", False)
@@ -422,6 +742,7 @@ def _run_parallel(
             tif=tif, output_dir=out_dir,
             duration_s=duration, fov=fov,
             registry=registry, roi_counts=counts,
+            centroid_count=centroid_count,
         )
 
     return [r for r in results if r is not None]
@@ -473,6 +794,12 @@ def _process_one(
     if not skip_registry:
         cfg_overrides = _apply_registry_memory(tif, cfg_overrides, registry_cfg, log)
     cfg = _build_config(out_dir, cfg_overrides)
+
+    if cfg.run_centroids and not cfg.foundation_only:
+        # Centroids-only: skip run_pipeline (and Foundation's SVD/L+S) entirely
+        # — see PipelineConfig.run_centroids.
+        return _run_centroids_only(tif, out_dir, cfg, log)
+
     t0 = time.perf_counter()
     try:
         fov = run_pipeline(tif, cfg, abort_event=abort_event)
@@ -513,6 +840,10 @@ def _process_one(
         f"accept={counts.get('accept', 0)} flag={counts.get('flag', 0)} "
         f"reject={counts.get('reject', 0)}")
 
+    centroid_count = None
+    if cfg.run_centroids:  # foundation_only is True here ("both" mode)
+        centroid_count = _run_centroids_after_foundation(tif, out_dir, cfg, log)
+
     registry: Optional[dict] = None
     if (skip_registry or getattr(cfg, "scout_mode", False)
             or getattr(cfg, "foundation_only", False)):
@@ -543,7 +874,77 @@ def _process_one(
         tif=tif, output_dir=out_dir,
         duration_s=duration, fov=fov,
         registry=registry, roi_counts=counts,
+        centroid_count=centroid_count,
     )
+
+
+def _run_centroids_only(
+    tif: Path, out_dir: Path, cfg: PipelineConfig, log: LogCallback,
+) -> FOVRunResult:
+    """Standalone centroid discovery: skips Foundation/run_pipeline entirely.
+
+    Requires an already motion-corrected stack — either ``tif`` itself (a
+    pre-corrected input) or a ``{stem}_mc.tif`` a prior Foundation run already
+    wrote to ``out_dir``. Fails fast (per-FOV) if neither exists, rather than
+    silently running motion correction first.
+    """
+    from roigbiv.io import detect_motion_corrected
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    t0 = time.perf_counter()
+    pre_corrected, _signal = detect_motion_corrected(tif)
+    if pre_corrected:
+        mc_tif = tif
+    else:
+        stem = tif.stem.replace("_mc", "")
+        candidate = out_dir / f"{stem}_mc.tif"
+        mc_tif = candidate if candidate.exists() else None
+
+    if mc_tif is None:
+        msg = ("no motion-corrected stack found for this FOV — run motion "
+              "correction first, or choose 'Both'")
+        log(f"  {msg}")
+        return FOVRunResult(tif=tif, output_dir=out_dir,
+                            duration_s=time.perf_counter() - t0, error=msg)
+
+    try:
+        result = run_centroid_discovery(mc_tif, out_dir, cfg)
+    except Exception as exc:  # noqa: BLE001
+        return FOVRunResult(tif=tif, output_dir=out_dir,
+                            duration_s=time.perf_counter() - t0,
+                            error=f"{type(exc).__name__}: {exc}")
+
+    duration = time.perf_counter() - t0
+    log(f"  centroid discovery OK ({duration:.1f}s) — {result.count} centroids")
+    return FOVRunResult(tif=tif, output_dir=out_dir, duration_s=duration,
+                        centroid_count=result.count)
+
+
+def _run_centroids_after_foundation(
+    tif: Path, out_dir: Path, cfg: PipelineConfig, log: LogCallback,
+) -> Optional[int]:
+    """Centroid discovery chained after a foundation_only run ("both" mode).
+
+    Resumes off the ``stat.npy``/``iscell.npy`` Foundation's own
+    ``run_suite2p_fov`` call just wrote — see ``centroids.py`` module docstring.
+    Failure is logged and swallowed (never fails the FOV): the motion-corrected
+    output is still valid even if this best-effort annotation step errors.
+    """
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    stem = tif.stem.replace("_mc", "")
+    mc_tif = out_dir / f"{stem}_mc.tif"
+    if not mc_tif.exists():
+        log(f"  centroid discovery skipped — {mc_tif.name} not found")
+        return None
+    try:
+        result = run_centroid_discovery(mc_tif, out_dir, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARNING: centroid discovery failed — "
+            f"{type(exc).__name__}: {exc}")
+        return None
+    log(f"  centroid discovery OK — {result.count} centroids")
+    return result.count
 
 
 def _write_traces_bundle(
@@ -723,15 +1124,23 @@ def _format_registry_decision(decision: str, report: dict,
     if decision == "already_registered":
         return (f"  registry: already_registered fov_id={report.get('fov_id')} "
                 f"(no-op)")
-    if decision in ("auto_match", "hash_match"):
+    if decision in ("auto_match", "hash_match", "forced_fov"):
         post = f"{posterior:.3f}" if posterior is not None else "n/a"
         return (f"  registry: {decision} fov_id={report.get('fov_id')} "
                 f"posterior={post} matched={report.get('n_matched', 0)} "
                 f"new={report.get('n_new', 0)} missing={report.get('n_missing', 0)}")
     if decision == "review":
         post = f"{posterior:.3f}" if posterior is not None else "n/a"
-        return (f"  registry: review band (posterior={post}) — "
-                "resolve in the UI's Registry tab.")
+        accept = report.get("accept_threshold")
+        bar = f" (accept >= {accept:.2f})" if isinstance(accept, (int, float)) else ""
+        # No session row is written for a review, so this session is absent
+        # from the timeline entirely — not merely unconfirmed. There is no
+        # in-app resolver yet (the Registry tab this used to name belonged to
+        # the retired Streamlit UI), so say what the operator can actually do.
+        return (f"  registry: review band (posterior={post}){bar} — session NOT "
+                "added to the timeline. Re-run with a lower "
+                "ROIGBIV_FOV_ACCEPT_THRESHOLD to accept it, after confirming "
+                "it is the same FOV.")
     return f"  registry: {decision} ({report})"
 
 

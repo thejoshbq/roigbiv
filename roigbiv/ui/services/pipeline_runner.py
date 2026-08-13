@@ -408,6 +408,7 @@ class PipelineRunner:
             "error": r.error,
             "awaiting_confirmation": r.awaiting_confirmation,
             "roi_counts": dict(r.roi_counts),
+            "centroid_count": r.centroid_count,
             "registry_decision": (
                 (r.registry or {}).get("decision") if r.registry else None
             ),

@@ -261,3 +261,266 @@ def test_override_changed_masks_drops_orphaned_prior_fov(tmp_path: Path):
     assert len(store.list_fovs()) == 1
     assert store.list_fovs()[0].fov_id == r2["fov_id"]
     assert len(store.list_sessions(r2["fov_id"])) == 1
+
+
+def test_a_failed_candidate_comparison_is_recorded_on_the_report(tmp_path: Path):
+    """A crashed matcher and a genuinely-new FOV both decide "new_fov".
+
+    Nothing downstream can tell them apart unless the failure is carried on
+    the report — the logger this used to go to is not configured by any
+    entry point, so the crash was invisible in every artifact.
+    """
+    from unittest.mock import patch
+
+    store, blob = _build_backends(tmp_path)
+    stem = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH"
+
+    first = tmp_path / "s1"
+    first.mkdir()
+    register_or_match(fov_stem=stem, query=_session("q1", [(16, 16), (32, 32)]),
+                      output_dir=first, store=store, blob_store=blob)
+
+    # Second session, same animal/region → the first FOV is a candidate. Its
+    # comparison raises the way ROICaT's clustering does on unalignable FOVs.
+    second = tmp_path / "s2"
+    second.mkdir()
+    with patch("roigbiv.registry.orchestrator._load_candidate_session_inputs",
+               return_value=[_session("c1", [(16, 16), (32, 32)])]), \
+         patch("roigbiv.registry.orchestrator.match_fov",
+               side_effect=ValueError("zero-size array to reduction "
+                                      "operation fmin which has no identity")):
+        report = register_or_match(
+            fov_stem=stem, query=_session("q2", [(20, 20), (40, 40)]),
+            output_dir=second, store=store, blob_store=blob)
+
+    assert report["decision"] == "new_fov"
+    assert len(report["match_errors"]) == 1
+    err = report["match_errors"][0]
+    assert "zero-size array" in err["error"]
+    assert err["candidate_fov_id"] == store.list_fovs()[0].fov_id
+
+
+def test_a_clean_new_fov_records_no_match_errors(tmp_path: Path):
+    store, blob = _build_backends(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    report = register_or_match(
+        fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH",
+        query=_session("q", [(16, 16), (32, 32)]),
+        output_dir=out_dir, store=store, blob_store=blob)
+    assert report["match_errors"] == []
+
+
+# ── Re-registering the same output directory ───────────────────────────────
+
+
+def _auto_match(candidate_counts: list[int], query_count: int) -> object:
+    """A ``match_fov`` result that pairs each query ROI with its candidate twin.
+
+    Stands in for ROICaT so the auto_match write path can be tested without
+    real-sized fixture data. Cluster label ``k`` holds ROI ``k`` of every
+    session, which is the shape a successful three-session match produces.
+    """
+    from roigbiv.registry.calibration import FOVFeatures
+    from roigbiv.registry.match import FOVMatchResult
+    from roigbiv.registry.roicat_adapter import ClusterResult
+
+    counts = list(candidate_counts) + [query_count]
+    labels = np.concatenate([np.arange(n, dtype=np.int32) for n in counts])
+    session_bool = np.zeros((int(sum(counts)), len(counts)), dtype=bool)
+    offset = 0
+    for j, n in enumerate(counts):
+        session_bool[offset:offset + n, j] = True
+        offset += n
+    return FOVMatchResult(
+        decision="auto_match",
+        fov_posterior=0.95,
+        features=FOVFeatures(n_shared_clusters=min(counts),
+                             fraction_query_clustered=1.0,
+                             alignment_quality=1.0,
+                             mean_cluster_cohesion=0.8),
+        cluster_result=ClusterResult(
+            labels=labels,
+            session_bool=session_bool,
+            per_session_label_ids=[np.arange(1, n + 1, dtype=np.int64)
+                                   for n in counts],
+            per_session_roi_count=counts,
+            quality_metrics={},
+            alignment_method="stub",
+            alignment_inlier_rate=1.0,
+            fov_height=64,
+            fov_width=64,
+        ),
+        query_session_idx=len(candidate_counts),
+    )
+
+
+def _orphaned_observations(store) -> list[str]:
+    """Observation ids whose ``session_id`` resolves to no session row."""
+    live = {
+        s.session_id
+        for fov in store.list_fovs()
+        for s in store.list_sessions(fov.fov_id)
+    }
+    orphans = []
+    for fov in store.list_fovs():
+        for cell in store.list_cells(fov.fov_id):
+            for obs in store.list_observations_for_cell(cell.global_cell_id):
+                if obs.session_id not in live:
+                    orphans.append(obs.observation_id)
+    return orphans
+
+
+def test_re_registering_an_output_dir_replaces_its_session(tmp_path: Path):
+    """Re-running tracking over a directory must not strand its observations.
+
+    ``(fov_id, output_dir)`` is unique, so the second registration cannot get
+    a row of its own. It used to mint a fresh ``session_id`` anyway, write
+    every observation against it, and lose the row at insert time — leaving
+    observations referencing a session that does not exist and a session row
+    still advertising the *previous* run's counts.
+    """
+    from unittest.mock import patch
+
+    store, blob = _build_backends(tmp_path)
+    stem = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH"
+
+    first = tmp_path / "s1"
+    first.mkdir()
+    register_or_match(fov_stem=stem, query=_session("q1", [(16, 16), (32, 32)]),
+                      output_dir=first, store=store, blob_store=blob)
+    fov_id = store.list_fovs()[0].fov_id
+
+    second = tmp_path / "s2"
+    second.mkdir()
+    candidate = _session("c1", [(16, 16), (32, 32)])
+
+    with patch("roigbiv.registry.orchestrator._load_candidate_session_inputs",
+               return_value=[candidate]), \
+         patch("roigbiv.registry.orchestrator.match_fov",
+               return_value=_auto_match([2], 2)):
+        first_report = register_or_match(
+            fov_stem=stem, query=_session("q2", [(17, 17), (33, 33)]),
+            output_dir=second, store=store, blob_store=blob)
+    assert first_report["decision"] == "auto_match"
+    assert first_report["n_matched"] == 2
+
+    # Re-run over the same directory with different masks — a re-stamp at a
+    # new radius does exactly this, and the changed fingerprint means the
+    # idempotency guard does not fire.
+    with patch("roigbiv.registry.orchestrator._load_candidate_session_inputs",
+               return_value=[candidate]), \
+         patch("roigbiv.registry.orchestrator.match_fov",
+               return_value=_auto_match([2], 3)):
+        second_report = register_or_match(
+            fov_stem=stem,
+            query=_session("q2", [(17, 17), (33, 33), (48, 48)]),
+            output_dir=second, store=store, blob_store=blob)
+
+    assert second_report["decision"] == "auto_match"
+    assert _orphaned_observations(store) == []
+
+    sessions = [s for s in store.list_sessions(fov_id)
+                if s.output_dir == str(second)]
+    assert len(sessions) == 1
+    row = sessions[0]
+    assert row.session_id == second_report["session_id"]
+    # Counts describe the re-run (3 ROIs: 2 matched + 1 new), not the first.
+    assert (row.n_matched, row.n_new) == (2, 1)
+    assert len(store.list_observations_for_session(row.session_id)) == 3
+
+
+# ── Forced FOV grouping ────────────────────────────────────────────────────
+
+
+def test_force_fov_id_registers_into_that_fov_despite_a_rejecting_posterior(
+    tmp_path: Path,
+):
+    """A human-confirmed session order outranks the matcher's opinion.
+
+    The posterior is derived from the cell clustering it gates, so a matcher
+    that cannot cluster these ROIs used to split the FOV — turning a cell
+    matching failure into a grouping failure and leaving the sessions
+    incomparable. Forced grouping keeps them together and reports the
+    disagreement instead.
+    """
+    from unittest.mock import patch
+
+    store, blob = _build_backends(tmp_path)
+    stem = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH"
+
+    first = tmp_path / "s1"
+    first.mkdir()
+    r1 = register_or_match(fov_stem=stem,
+                           query=_session("q1", [(16, 16), (32, 32)]),
+                           output_dir=first, store=store, blob_store=blob)
+    fov_id = r1["fov_id"]
+
+    rejecting = _auto_match([2], 2)
+    rejecting.decision = "reject"
+    rejecting.fov_posterior = 0.02
+
+    second = tmp_path / "s2"
+    second.mkdir()
+    with patch("roigbiv.registry.orchestrator._load_candidate_session_inputs",
+               return_value=[_session("c1", [(16, 16), (32, 32)])]), \
+         patch("roigbiv.registry.orchestrator.match_fov",
+               return_value=rejecting):
+        report = register_or_match(
+            fov_stem=stem, query=_session("q2", [(17, 17), (33, 33)]),
+            output_dir=second, store=store, blob_store=blob,
+            force_fov_id=fov_id)
+
+    assert report["decision"] == "forced_fov"
+    assert report["fov_id"] == fov_id
+    assert len(store.list_fovs()) == 1
+    assert len(store.list_sessions(fov_id)) == 2
+    # Cells were still assigned from the clustering, not abandoned.
+    assert report["n_matched"] == 2
+    # ...and the matcher's disagreement is on the record, not swallowed.
+    assert "0.020" in report["grouping_warning"]
+
+
+def test_force_fov_id_still_registers_when_clustering_raises(tmp_path: Path):
+    """A crashed matcher must not drop an ordered session from its own FOV."""
+    from unittest.mock import patch
+
+    store, blob = _build_backends(tmp_path)
+    stem = "T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH"
+
+    first = tmp_path / "s1"
+    first.mkdir()
+    r1 = register_or_match(fov_stem=stem,
+                           query=_session("q1", [(16, 16), (32, 32)]),
+                           output_dir=first, store=store, blob_store=blob)
+    fov_id = r1["fov_id"]
+
+    second = tmp_path / "s2"
+    second.mkdir()
+    with patch("roigbiv.registry.orchestrator._load_candidate_session_inputs",
+               return_value=[_session("c1", [(16, 16), (32, 32)])]), \
+         patch("roigbiv.registry.orchestrator.match_fov",
+               side_effect=RuntimeError("ROICaT could not infer a distance cutoff")):
+        report = register_or_match(
+            fov_stem=stem, query=_session("q2", [(17, 17), (33, 33)]),
+            output_dir=second, store=store, blob_store=blob,
+            force_fov_id=fov_id)
+
+    assert report["decision"] == "forced_fov"
+    assert len(store.list_sessions(fov_id)) == 2
+    assert report["n_matched"] == 0
+    assert report["n_new"] == 2
+    assert "distance cutoff" in report["match_errors"][0]["error"]
+
+
+def test_force_fov_id_rejects_an_unknown_fov(tmp_path: Path):
+    import pytest
+
+    store, blob = _build_backends(tmp_path)
+    out = tmp_path / "s1"
+    out.mkdir()
+    with pytest.raises(ValueError, match="not in the registry"):
+        register_or_match(fov_stem="T1_221209_PrL-NAc-G6-5M_HI-D1_FOV1_BEH",
+                          query=_session("q", [(16, 16)]),
+                          output_dir=out, store=store, blob_store=blob,
+                          force_fov_id="no-such-fov")
