@@ -40,7 +40,7 @@ from dash import Input, Output, State, dcc, html
 
 from roigbiv.ui.components import errors as error_components
 from roigbiv.ui.logging import configure_ui_logging
-from roigbiv.ui.pages import process, track
+from roigbiv.ui.pages import cells, process, track
 from roigbiv.ui.pages.review import (
     MAIN_COL_ID,
     RIGHT_SIDEBAR_COL_ID,
@@ -67,6 +67,7 @@ THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 PAGES = (
     ("/pipeline", "Pipeline", process),
     ("/track", "Track", track),
+    ("/cells", "Cells", cells),
 )
 
 

@@ -51,6 +51,18 @@ def test_flat_image_guard():
     assert heatmap.zmax > heatmap.zmin, "zmax must exceed zmin even for flat input"
 
 
+def test_background_clicks_reach_the_callback():
+    """hoverinfo="skip" swallows plotly_click too, not just the tooltip.
+
+    /cells' edit mode needs a click on empty background (no ROI under the
+    cursor) to fire, so it can place a new centroid there.
+    """
+    mean = np.zeros((4, 4), dtype=np.float32)
+    fig = build_roi_figure(mean=mean, rois=[], theme=None)
+    heatmap = next(t for t in fig.data if t.type == "heatmap")
+    assert heatmap.hoverinfo == "none"
+
+
 # ── status color mode + selection highlight (the /cells page) ──────────────
 
 

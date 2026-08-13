@@ -98,7 +98,10 @@ def build_roi_figure(
                 zmin=p1,
                 zmax=p99,
                 showscale=False,
-                hoverinfo="skip",
+                # "skip" (unlike "none") also swallows plotly_click, which
+                # /cells needs on empty background to place a new centroid in
+                # edit mode. Tooltip stays off either way.
+                hoverinfo="none",
                 name="mean_M",
             )
         )

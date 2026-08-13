@@ -3,6 +3,9 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, timezone
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from roigbiv.registry.store.base import (
     CellRecord,
     FOVRecord,
@@ -187,3 +190,86 @@ def test_supersede_session_noop_when_output_dir_absent():
     store = _new_store()
     counts = store.supersede_session("/tmp/never-registered")
     assert counts == {"sessions": 0, "observations": 0, "fovs": 0, "cells": 0}
+
+
+def test_replace_observations_relinks_labels_across_cells():
+    # Swapping which cell owns label 1 vs label 2 without a single transaction
+    # would transiently violate UniqueConstraint(session_id, local_label_id)
+    # on the insert side of a naive delete-then-insert.
+    store = _new_store()
+    fov_id, session_id = _seed_fov_with_session(store, output_dir="/tmp/out")
+    cell_a, cell_b = [c.global_cell_id for c in store.list_cells(fov_id)]
+
+    store.replace_observations([session_id], [
+        ObservationRecord(observation_id=str(uuid.uuid4()),
+                          global_cell_id=cell_b, session_id=session_id,
+                          local_label_id=1),
+        ObservationRecord(observation_id=str(uuid.uuid4()),
+                          global_cell_id=cell_a, session_id=session_id,
+                          local_label_id=2),
+    ])
+
+    obs = {o.local_label_id: o.global_cell_id
+           for o in store.list_observations_for_session(session_id)}
+    assert obs == {1: cell_b, 2: cell_a}
+
+
+def test_replace_observations_rolls_back_delete_on_insert_failure():
+    store = _new_store()
+    fov_id, session_id = _seed_fov_with_session(store, output_dir="/tmp/out")
+    cell_a, cell_b = [c.global_cell_id for c in store.list_cells(fov_id)]
+    original = store.list_observations_for_session(session_id)
+
+    # Two records with the same local_label_id in one session violates the
+    # unique constraint — the whole call must fail, not just the second insert.
+    with pytest.raises(IntegrityError):
+        store.replace_observations([session_id], [
+            ObservationRecord(observation_id=str(uuid.uuid4()),
+                              global_cell_id=cell_a, session_id=session_id,
+                              local_label_id=1),
+            ObservationRecord(observation_id=str(uuid.uuid4()),
+                              global_cell_id=cell_b, session_id=session_id,
+                              local_label_id=1),
+        ])
+
+    # The delete must not have survived the failed insert.
+    after = store.list_observations_for_session(session_id)
+    assert {o.observation_id for o in after} == {o.observation_id for o in original}
+
+
+def test_replace_observations_returns_deleted_count():
+    store = _new_store()
+    _, session_id = _seed_fov_with_session(store, output_dir="/tmp/out")
+    deleted = store.replace_observations([session_id], [])
+    assert deleted == 2
+    assert store.list_observations_for_session(session_id) == []
+
+
+def test_replace_observations_spans_multiple_sessions():
+    store = _new_store()
+    fov_id, session_1 = _seed_fov_with_session(store, output_dir="/tmp/one")
+    session_2 = str(uuid.uuid4())
+    store.upsert_session(SessionRecord(
+        session_id=session_2, fov_id=fov_id,
+        session_date=date(2023, 1, 2), output_dir="/tmp/two",
+        n_matched=0, n_new=0, n_missing=0,
+        created_at=datetime.now(timezone.utc),
+    ))
+    cell = store.list_cells(fov_id)[0].global_cell_id
+    store.insert_observations([ObservationRecord(
+        observation_id=str(uuid.uuid4()), global_cell_id=cell,
+        session_id=session_2, local_label_id=1)])
+
+    new_cell = str(uuid.uuid4())
+    store.insert_cell(CellRecord(global_cell_id=new_cell, fov_id=fov_id))
+    deleted = store.replace_observations([session_1, session_2], [
+        ObservationRecord(observation_id=str(uuid.uuid4()),
+                          global_cell_id=new_cell, session_id=session_1,
+                          local_label_id=1),
+        ObservationRecord(observation_id=str(uuid.uuid4()),
+                          global_cell_id=new_cell, session_id=session_2,
+                          local_label_id=1),
+    ])
+    assert deleted == 3
+    assert len(store.list_observations_for_session(session_1)) == 1
+    assert len(store.list_observations_for_session(session_2)) == 1

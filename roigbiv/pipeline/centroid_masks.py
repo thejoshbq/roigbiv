@@ -17,7 +17,7 @@ have thrown away anyway.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -96,6 +96,15 @@ class StampedMasks:
     # Radius anatomy asked for, when the matcher's ROI crop forced a smaller
     # one. None when nothing was clamped.
     radius_capped_from: Optional[int] = None
+    # False when a full-cascade merged_masks.tif already exists and this call
+    # left it alone (see write_merged_masks). ``labels`` above still reflects
+    # what centroid-only stamping WOULD have produced — a caller applying
+    # centroid edits needs to tell "wrote it" from "computed it but a real
+    # cascade outranks it" apart, since both return a populated StampedMasks.
+    written: bool = True
+    # Warnings from replaying corrections/centroids.jsonl (e.g. an op that
+    # named a label no longer present). Empty for an unedited FOV.
+    edit_warnings: list[str] = field(default_factory=list)
 
     @property
     def n_labels(self) -> int:
@@ -107,11 +116,77 @@ class StampedMasks:
         """
         return int(np.count_nonzero(np.unique(self.labels)))
 
+    @property
+    def present_labels(self) -> tuple[int, ...]:
+        """Non-zero labels actually present in the image after overlap resolution.
+
+        May be smaller than the label set requested, since a stamp completely
+        buried by a later one is invisible even though ``n_centroids`` counts it.
+        Sorted in ascending order.
+
+        Cast to plain ``int`` — ``np.unique`` on a uint16 array yields
+        ``numpy.uint16`` scalars, which SQLAlchemy stores as raw bytes rather
+        than an integer when one ends up in an ``ObservationRecord``.
+        """
+        return tuple(int(v) for v in sorted(np.unique(self.labels)[1:]))
+
 
 def load_centroid_points(centroids_json: Path) -> list[tuple[float, float]]:
     """The ``(y, x)`` centroids from a ``centroids.json``, in file order."""
     payload = json.loads(Path(centroids_json).read_text())
     return [(float(c["y"]), float(c["x"])) for c in payload.get("centroids", [])]
+
+
+def load_effective_centroids(
+    output_dir: Path,
+) -> tuple[dict[int, tuple[float, float]], list[str]]:
+    """This FOV's centroids after replaying its centroid-edit log.
+
+    ``centroids.json`` positions become labels ``1..N`` by file order — the
+    same convention :func:`stamp_centroids` uses for an unedited FOV — and
+    :func:`~roigbiv.pipeline.centroid_edits.apply_centroid_ops` replays
+    ``corrections/centroids.jsonl`` on top. ``centroids.json`` itself is never
+    rewritten: it is detector output, and rewriting it would either be reused
+    by a future discovery run as if it were detection, or be silently
+    overwritten by one.
+    """
+    from roigbiv.pipeline.centroid_edits import apply_centroid_ops, load_centroid_ops
+
+    output_dir = Path(output_dir)
+    points = load_centroid_points(output_dir / "centroids.json")
+    base = {i: p for i, p in enumerate(points, start=1)}
+    ops = load_centroid_ops(output_dir)
+    return apply_centroid_ops(base, ops)
+
+
+def stamp_labeled_centroids(
+    labeled: dict[int, tuple[float, float]],
+    shape: tuple[int, int],
+    radius: int,
+) -> StampedMasks:
+    """Stamp a canonical disk of *radius* at each explicit label's ``(y, x)``.
+
+    Where disks overlap the later label wins — deterministic, and the same
+    first-come-last-served convention a label image forces on any
+    overlapping-footprint source. Labels are stamped in ascending order so that
+    higher labels overwrite lower ones in overlap regions, preserving the
+    registration invariant that the output is byte-identical to positional
+    stamping when labels are ``1..N``.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    labels = np.zeros((height, width), dtype=np.uint16)
+    points_for_count = list(labeled.values())
+
+    for label in sorted(labeled):
+        cy, cx = labeled[label]
+        labels[disk_mask(cy, cx, radius, height, width)] = label
+
+    return StampedMasks(
+        labels=labels,
+        n_centroids=len(labeled),
+        n_overlapping_pairs=_count_overlapping_pairs(points_for_count, radius),
+        radius_px=int(radius),
+    )
 
 
 def stamp_centroids(
@@ -125,17 +200,8 @@ def stamp_centroids(
     wins — deterministic, and the same first-come-last-served convention a
     label image forces on any overlapping-footprint source.
     """
-    height, width = int(shape[0]), int(shape[1])
-    labels = np.zeros((height, width), dtype=np.uint16)
-    for i, (cy, cx) in enumerate(points, start=1):
-        labels[disk_mask(cy, cx, radius, height, width)] = i
-
-    return StampedMasks(
-        labels=labels,
-        n_centroids=len(points),
-        n_overlapping_pairs=_count_overlapping_pairs(points, radius),
-        radius_px=int(radius),
-    )
+    return stamp_labeled_centroids(
+        {i: p for i, p in enumerate(points, start=1)}, shape, radius)
 
 
 def _count_overlapping_pairs(points, radius: int) -> int:
@@ -166,10 +232,17 @@ def write_merged_masks(
     whether that is a skip or an error. *shape* defaults to that of
     ``summary/mean_M.tif``, which centroid discovery guarantees exists.
 
+    Stamps ``load_effective_centroids`` — ``centroids.json`` as edited by
+    ``corrections/centroids.jsonl`` — not the raw file, so a human's
+    delete/add/move edits reach the registry without a re-match.
+
     A ``merged_masks.tif`` from a full cascade run is never overwritten: real
     per-stage detections outrank centroid stamps. ``pipeline_log.json`` is the
     marker for that — ``outputs.py`` writes it alongside the cascade's masks, so
-    its absence means any masks here are ours to refresh.
+    its absence means any masks here are ours to refresh. In that case the
+    returned ``StampedMasks.written`` is ``False`` — centroid edits still show
+    up in ``labels``/``edit_warnings`` for a caller to inspect, but nothing was
+    written to disk, since a full cascade's segmentation outranks them.
     """
     import tifffile
 
@@ -188,13 +261,15 @@ def write_merged_masks(
                 "re-run centroid discovery to persist one")
         shape = tuple(np.asarray(tifffile.imread(mean_path)).shape[:2])
 
-    points = load_centroid_points(centroids_json)
+    labeled, warnings = load_effective_centroids(output_dir)
     wanted = calibrated_stamp_radius(output_dir, cfg)
     radius = min(wanted, _MAX_STAMP_RADIUS)
-    stamped = stamp_centroids(points, shape, radius)
+    stamped = stamp_labeled_centroids(labeled, shape, radius)
+    stamped.edit_warnings = warnings
     if wanted > radius:
         stamped.radius_capped_from = wanted
 
-    if not (cascade_ran and masks_path.exists()):
+    stamped.written = not (cascade_ran and masks_path.exists())
+    if stamped.written:
         tifffile.imwrite(str(masks_path), stamped.labels)
     return stamped

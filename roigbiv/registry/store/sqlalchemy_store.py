@@ -442,6 +442,43 @@ class SQLAlchemyStore:
                 ))
             s.commit()
 
+    def replace_observations(
+        self, session_ids: list[str], observations: list[ObservationRecord]
+    ) -> int:
+        """Atomically swap every observation of ``session_ids`` for ``observations``.
+
+        ``(session_id, local_label_id)`` is unique, so moving a label from one
+        cell to another is necessarily a delete followed by an insert — no
+        in-place update avoids a transient constraint violation. Every other
+        method in this class commits its own single statement, so that pair
+        cannot otherwise be made atomic. That matters more here than it does
+        for a fresh registration: the engine is built with
+        ``check_same_thread=False`` and the Dash UI serves callbacks on
+        multiple threads, so an interactive edit can genuinely interleave with
+        another write. One session and one commit means a failed insert rolls
+        the delete back with it, rather than leaving the affected sessions
+        with no observations at all.
+
+        Returns the number of rows deleted.
+        """
+        with self._Session() as s:
+            result = s.execute(
+                delete(m.CellObservation).where(
+                    m.CellObservation.session_id.in_(session_ids)
+                )
+            )
+            for obs in observations:
+                s.add(m.CellObservation(
+                    observation_id=obs.observation_id,
+                    global_cell_id=obs.global_cell_id,
+                    session_id=obs.session_id,
+                    local_label_id=obs.local_label_id,
+                    match_score=obs.match_score,
+                    cluster_label=obs.cluster_label,
+                ))
+            s.commit()
+            return int(result.rowcount or 0)
+
     def list_observations_for_cell(self, global_cell_id: str) -> list[ObservationRecord]:
         with self._Session() as s:
             rows = s.scalars(

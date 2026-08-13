@@ -439,6 +439,11 @@ def run_tracking(
         if stamped.n_labels < stamped.n_centroids:
             log(f"  WARNING: {stamped.n_centroids - stamped.n_labels} stamp(s) "
                 f"fully buried by a later one and will not reach the registry")
+        for warning in stamped.edit_warnings:
+            log(f"  WARNING: centroid edit {warning}")
+        if not stamped.written and (out_dir / "corrections" / "centroids.jsonl").exists():
+            log("  NOTE: masks come from a full pipeline cascade — centroid "
+                "edits do not apply here (real segmentation outranks them)")
 
         try:
             result.registry = _register_tracked_session(
@@ -450,8 +455,42 @@ def run_tracking(
             log(f"  ERROR registering: {result.error}")
         results.append(result)
 
+    _replay_tracking_edits(results, workspace, reg_cfg, log)
     _log_tracking_summary(results, reg_cfg, log)
     return results
+
+
+def _replay_tracking_edits(
+    results: list["TrackingResult"], workspace: WorkspacePaths,
+    reg_cfg: "RegistryConfig", log: LogCallback,
+) -> None:
+    """Reapply every FOV's centroid + match edit logs after a fresh registration.
+
+    A centroid edit changes the FOV fingerprint
+    (:mod:`roigbiv.registry.fingerprint`), so the idempotency guard in
+    ``register_or_match`` misses on the next run, the session is fully
+    re-registered, and its observations are rebuilt from ROICaT's cluster
+    labels alone — silently discarding every human edit made since the last
+    run. This is not a nicety on top of that: without it, editing a FOV and
+    then re-running tracking would be actively destructive.
+    """
+    from roigbiv.registry import build_store
+    from roigbiv.registry.cell_edits import apply_tracking_edits
+
+    fov_ids = list(dict.fromkeys(
+        r.registry.get("fov_id") for r in results
+        if r.registry and r.registry.get("fov_id")
+    ))
+    if not fov_ids:
+        return
+
+    store = build_store(reg_cfg)
+    for fov_id in fov_ids:
+        report = apply_tracking_edits(fov_id, workspace.input_root, store)
+        if report.warnings:
+            log(f"  WARNING: replaying edits for FOV {fov_id}:")
+            for warning in report.warnings:
+                log(f"    {warning}")
 
 
 def _warn_if_matching_unavailable(log: LogCallback) -> None:
