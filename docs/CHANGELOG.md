@@ -6,6 +6,39 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- **Seeded cell boundaries from confirmed centroids.** Since ADR-0003 the project has
+  had no real cell boundary anywhere: `merged_masks.tif` stamps fixed-radius disks, and
+  centroid discovery computed Cellpose's masks only to throw everything away but their
+  centre of mass. `/cells` now renders a real boundary per confirmed cell, written to a
+  new `boundaries.tif` (+ `boundaries.json`) alongside — not instead of — the disks the
+  registry matches on. Both carry the same label ids over the same effective centroids,
+  so `CellObservation.local_label_id` resolves in either and the registry needed no
+  change.
+
+  The boundary is Cellpose's own flow field, re-clustered against the confirmed
+  centroids instead of its histogram peaks (`roigbiv/pipeline/seeded_masks.py`): the
+  flow decides which pixels are cell material, a watershed seeded on the centroids
+  decides which cell each one belongs to, and a seed that captures no basin falls back
+  to the canonical disk so a confirmed cell can never disappear. The two-step split
+  matters — where Cellpose merges two touching somata its flow field has a single
+  attractor equidistant from both, so a nearest-seed rule assigns nothing; the watershed
+  recovers both cells. Centroid discovery now caches `dP`/`cellprob` under `flows/` on
+  the same recompute key `centroids.json` uses, so a HITL centroid edit redraws
+  boundaries without re-running inference.
+
+  Measured against 782 hand-drawn ImageJ somata across 5 cranial-window FOVs
+  (`scripts/boundary_bakeoff/`): on the cells where a flow field exists, seeded
+  boundaries score mean IoU 0.668 against fixed disks' 0.640, while recall stays at
+  0.977 versus free Cellpose's 0.143 on the same data. The win is small because these
+  somata are near-circular at ~18 px and a disk is already close to ideal; the prism
+  FOVs this was built for have no boundary ground truth yet. See
+  `docs/adr/0005-seeded-boundaries-parallel-geometry-track.md` for the full numbers and
+  the traps in reading them.
+
+  New config: `centroid_persist_flows` (default on, ~6 MB/FOV at 512²),
+  `boundary_capture_px`, `boundary_min_area`, `boundary_max_area`.
+  `centroids.json` schema 4 → 5.
+
 - **Cross-session tracking HITL controls.** The `/cells` page gained an edit mode
   (off by default) for the errors that were previously visible but unfixable there: a
   missed or misplaced soma centroid, and a cell the matcher failed to link across

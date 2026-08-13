@@ -426,6 +426,25 @@ class PipelineConfig:
     centroid_tissue_mask: bool = False
     centroid_tissue_mask_sigma: float = 8.0
 
+    # Persist Cellpose's flow field alongside centroids.json so seeded
+    # boundaries can be redrawn after a HITL centroid edit without re-running
+    # inference (roigbiv/pipeline/boundaries.py). Costs ~6 MB per 512x512 FOV;
+    # turn off for a disk-constrained batch and boundaries fall back to the
+    # canonical disk stamps.
+    centroid_persist_flows: bool = True
+
+    # Seeded-boundary formation (roigbiv/pipeline/seeded_masks.py). A flow
+    # trajectory converging farther than boundary_capture_px from every
+    # confirmed centroid is not cell material.
+    #
+    # None on the first two means "resolve per FOV" (boundaries.resolve_*):
+    # whatever a human pinned on the Boundaries page, else the calibrated soma
+    # radius, which is a measurement rather than a guess. Setting either here
+    # overrides every FOV and makes that page's control inert.
+    boundary_capture_px: Optional[float] = None
+    boundary_min_area: Optional[int] = None
+    boundary_max_area: Optional[int] = None
+
     # ── Pipeline mode (top-level architecture switch) ──────────────────────
     # "cascade_legacy":  sequential subtractive detection (default) — each
     #                    stage detects on the residual after prior stages
