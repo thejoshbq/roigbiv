@@ -18,7 +18,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from roigbiv.ui.pages import cells
+from roigbiv.ui.pages import tracking as cells
 from roigbiv.ui.services.loaders import ROIRender
 from roigbiv.ui.services.registry_service import FOVRow
 from roigbiv.ui.services.tracked_cells import TrackedCell, TrackedFOV, TrackedSession
@@ -134,14 +134,21 @@ def callbacks():
 
 
 def _layout():
+    """The review half of the Tracking page.
+
+    Only that half: the setup half above it needs a real workspace to resolve a
+    session order from, and none of these cases is about session ordering.
+    ``tracking.layout()`` is what stitches the two together, and
+    ``test_tracking_setup.py`` covers the seam.
+    """
     with patch.object(cells, "get_app_state", return_value=_FakeState()), \
             patch.object(cells, "list_fovs", return_value=[]):
-        return cells.layout()
+        return cells._review_section()
 
 
 def test_layout_carries_the_stores_and_navigation_controls():
     assert {cells.SELECTED_ID, cells.VIEW_ID, cells.SHEET_ID, cells.STRIP_ID,
-            cells.LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
+            cells.CELL_LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
             cells.DRAWER_ID, cells.RAIL_TOGGLE_ID} <= _ids(_layout())
 
 
@@ -237,10 +244,16 @@ def test_without_a_workspace_the_page_asks_for_a_scan():
         assert "Scan a workspace" in _text(cells._fov_picker())
 
 
-def test_with_no_tracked_fovs_the_page_points_at_the_track_page():
+def test_with_no_tracked_fovs_the_page_points_at_the_setup_above_it():
+    """The way out is now on this page, not on another one.
+
+    Tracking and review were two pages, so the empty state had to name the
+    other one. They are two halves of one page now, and the setup half is
+    directly above.
+    """
     with patch.object(cells, "get_app_state", return_value=_FakeState()), \
             patch.object(cells, "list_fovs", return_value=[]):
-        assert "Track page" in _text(cells._fov_picker())
+        assert "run tracking above" in _text(cells._fov_picker())
 
 
 def test_a_registry_failure_is_reported_rather_than_blanking():

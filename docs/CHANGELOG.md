@@ -4,7 +4,62 @@ All notable changes to roigbiv are documented here.
 
 ## Unreleased
 
+### Changed
+
+- **One UI page per operation, in the order the operations happen.** The Dash app was
+  three pages, one of which (`pages/process.py`, 1412 lines) did four unrelated jobs —
+  workspace scanning, motion-correction parameters, a live registration view, and
+  Cellpose calibration — with a run-mode radio deciding which of them its single Run
+  button meant. Now: **Motion correction** → **Centroids** → **Tracking** →
+  **Boundaries**, each owning its own run and nothing else. `/pipeline`, `/process`,
+  `/registry`, `/track`, `/cells` and `/viewer` redirect to their successors.
+
+  Tracking and cell review merged onto one page (`pages/tracking.py`): session order,
+  the tracking run and the anomaly report sit in a collapse that opens itself only when
+  the workspace has nothing tracked yet, with the contact sheet at full width below.
+  Split across two pages they were a loop with a navigation step in the middle.
+
+  Two things every page needs and none owns moved out: the **workspace scanner** is now
+  a disclosure in the navbar (`components/workspace_bar.py`), so no page's empty state
+  has to name a different page; and the **run status** is a shared panel
+  (`components/run_panel.py`), since there is one runner behind one GPU gate. Both
+  register their callbacks once, in `build_app`. Pages coordinate through a
+  `roigbiv-workspace-version` counter rather than writing into each other's controls —
+  the scan callback used to set another concern's `disabled` and `options` directly,
+  which only worked while all of them lived on the same page.
+
+  The banner now names which run is active ("Running centroid discovery · Stage 1"), and
+  the per-FOV results table drops columns the run did not produce, so a centroids-only
+  run no longer shows four em-dashed motion-correction metrics that read as failure.
+
+  **Removed:** the `mc` / `centroids` / `both` run-mode radio. A fresh workspace now
+  takes two runs where "both" took one — accepted deliberately, since motion correction
+  is the hours-long half and the split is what makes "did motion correction finish" and
+  "did detection work" separately answerable.
+
 ### Added
+
+- **A Boundaries page.** `boundary_capture_px` is the one real tuning knob seeded
+  boundaries have and had no surface at all. The page draws a FOV's seeded outlines over
+  its mean projection and recomputes them live as `capture_px` / `min_area` move, which
+  is only possible because the expensive half of the computation — Cellpose's pixel
+  dynamics, ~0.5–2 s on CPU at 512² — does not depend on either and is cached per FOV
+  (`ui/services/boundary_preview.py`). Seeds, disk fallbacks and orphan pixels are
+  reported next to the picture, along with the disk area each boundary replaces: a high
+  fallback rate means the detector never fired there, which `capture_px` cannot fix
+  (measured: sweeping it 6 → 45 px moved the fallback count only 419 → 393), and a page
+  showing only outlines would make a detection problem look like a tuning problem.
+
+  Saving writes `boundaries.tif` and pins the settings into a `settings` block in
+  `boundaries.json`, which later automatic redraws read back — so a tuned FOV stays
+  tuned, while a FOV nobody tuned keeps tracking its calibration.
+
+- **Boundaries follow centroid edits.** `apply_tracking_edits` now redraws each
+  session's `boundaries.tif` alongside re-stamping its disks. The `/cells` sheet draws
+  boundaries in preference to disks, so without this an added cell had no outline and a
+  deleted one kept its old one. The redraw is pure numpy off the cached flow field and
+  is guarded — `merged_masks.tif` is what the registry matches on and is already correct
+  by that point, so a boundary failure records a warning rather than failing the edit.
 
 - **Seeded cell boundaries from confirmed centroids.** Since ADR-0003 the project has
   had no real cell boundary anywhere: `merged_masks.tif` stamps fixed-radius disks, and
