@@ -198,3 +198,37 @@ def test_secret_key_warning(monkeypatch):
         and "ROIGBIV_SECRET_KEY" in str(w.message)
     ]
     assert secret_key_warnings, "Expected a UserWarning about ROIGBIV_SECRET_KEY"
+
+
+def test_workspace_config_honours_matcher_env_knobs(tmp_path, monkeypatch):
+    """Only storage is workspace-scoped; tuning comes from the environment.
+
+    Building the dataclass field-by-field pinned every matcher knob to its
+    default, so ROIGBIV_FOV_ACCEPT_THRESHOLD and ROIGBIV_ROICAT_D_CUTOFF were
+    silently ignored on every workspace run — including `--track`.
+    """
+    from roigbiv.pipeline.workspace import _registry_config_from_workspace
+
+    monkeypatch.setenv("ROIGBIV_FOV_ACCEPT_THRESHOLD", "0.75")
+    monkeypatch.setenv("ROIGBIV_ROICAT_D_CUTOFF", "0.7")
+    monkeypatch.setenv("ROIGBIV_ROICAT_ALIGNMENT", "PhaseCorrelation")
+
+    cfg = _registry_config_from_workspace(_make_workspace(tmp_path))
+
+    assert cfg.fov_accept_threshold == 0.75
+    assert cfg.roicat_d_cutoff == 0.7
+    assert cfg.roicat_alignment == "PhaseCorrelation"
+
+
+def test_workspace_paths_still_win_over_the_environment(tmp_path, monkeypatch):
+    """Storage must stay workspace-scoped even when the env names another."""
+    from roigbiv.pipeline.workspace import _registry_config_from_workspace
+
+    monkeypatch.setenv("ROIGBIV_REGISTRY_DSN", "sqlite:////elsewhere/other.db")
+    monkeypatch.setenv("ROIGBIV_BLOB_ROOT", "/elsewhere/blobs")
+
+    workspace = _make_workspace(tmp_path)
+    cfg = _registry_config_from_workspace(workspace)
+
+    assert cfg.dsn == workspace.db_dsn
+    assert cfg.blob_root == workspace.blob_root

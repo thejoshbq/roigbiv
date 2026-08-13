@@ -442,3 +442,74 @@ hr {
     border-radius: var(--roigbiv-radius);
 }
 .nav-pills .nav-link:hover { color: var(--roigbiv-accent); }
+
+/* ── Track page: drag-to-reorder session list ──────────────────────────── */
+.roigbiv-track-row {
+    cursor: grab;
+    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--roigbiv-radius);
+    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+}
+.roigbiv-track-row:hover { border-color: var(--roigbiv-accent); }
+.roigbiv-track-row:active { cursor: grabbing; }
+.roigbiv-track-dragging { opacity: 0.4; border-style: dashed; }
+.roigbiv-track-handle {
+    color: var(--roigbiv-text-secondary);
+    font-size: 1.1rem;
+    line-height: 1;
+}
+.roigbiv-track-seq {
+    font-family: var(--roigbiv-font-mono);
+    color: var(--roigbiv-accent);
+    min-width: 2.5rem;
+}
+
+/* ── Cells page: contact sheet + per-cell filmstrip ────────────────────── */
+.roigbiv-cells-swatch {
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 2px;
+    margin-right: 0.35rem;
+    vertical-align: -1px;
+}
+/* The sheet is the page: panels fill the window and share its width evenly,
+   scrolling sideways past ~5 sessions rather than shrinking to unusable.
+   --roigbiv-cells-chrome is the navbar + toolbar + caption above them. */
+:root { --roigbiv-cells-chrome: 15rem; }
+
+.roigbiv-cells-sheet {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+    overflow-x: auto;
+}
+.roigbiv-cells-panel {
+    flex: 1 1 0;
+    min-width: 16rem;
+}
+.roigbiv-cells-panel-graph {
+    height: calc(100vh - var(--roigbiv-cells-chrome));
+    min-height: 22rem;
+}
+.roigbiv-cells-list {
+    height: calc(100vh - var(--roigbiv-cells-chrome));
+    min-height: 22rem;
+    overflow-y: auto;
+}
+.roigbiv-cells-drawer {
+    height: auto !important;
+    max-height: 60vh;
+}
+.roigbiv-cells-row { cursor: pointer; }
+.roigbiv-cells-row:hover { background: rgba(0, 229, 255, 0.06); }
+.roigbiv-cells-row-active {
+    background: rgba(0, 229, 255, 0.12);
+    box-shadow: inset 2px 0 0 var(--roigbiv-accent);
+}
+/* The border carries the cell's cross-session status, so it is set inline
+   per card and must not be overridden here. */
+.roigbiv-cell-crop {
+    border-width: 2px;
+    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+}

@@ -10,7 +10,8 @@ Maintenance actions (migrate, backfill, dedupe) live in the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 
 @dataclass
@@ -50,7 +51,75 @@ def list_fovs(cfg=None) -> list[FOVRow]:
     return rows
 
 
+def anomaly_payload(report) -> dict:
+    """Flatten a :class:`~roigbiv.registry.anomalies.FOVAnomalyReport` for Dash.
+
+    Only cells *with* an anomaly are carried — a fully-present cell needs no
+    explanation and a large FOV would otherwise ship hundreds of rows into the
+    browser on every poll.
+    """
+    return {
+        "counts": report.counts,
+        "ordering_is_confirmed": report.ordering_is_confirmed,
+        "cells": [
+            {
+                "global_cell_id": c.global_cell_id,
+                "present": list(c.present),
+                "anomalies": c.anomalies,
+                "first_seen": c.first_seen,
+                "last_seen": c.last_seen,
+            }
+            for c in report.cells if c.anomalies
+        ],
+        "sessions": [
+            {
+                "sequence_index": s.sequence_index,
+                "session_date": (s.session_date.isoformat()
+                                 if s.session_date else None),
+                "output_dir": s.output_dir,
+            }
+            for s in report.sessions
+        ],
+    }
+
+
+def workspace_anomalies(output_dirs: Iterable[Path], cfg=None) -> dict[str, dict]:
+    """Anomaly reports for every FOV this workspace's sessions belong to.
+
+    Read from the registry rather than from a run's in-memory results, so a
+    workspace tracked in an earlier UI session — or from ``roigbiv-pipeline
+    --track`` — still reports. Returns ``{fov_id: anomaly_payload}``, empty when
+    none of these output directories has been registered yet.
+    """
+    from roigbiv.registry import build_store
+    from roigbiv.registry.anomalies import cell_timeline
+
+    store = build_store(cfg=cfg)
+    store.ensure_schema()
+
+    fov_ids: list[str] = []
+    for out_dir in output_dirs:
+        session = _session_for(store, out_dir)
+        if session is not None and session.fov_id not in fov_ids:
+            fov_ids.append(session.fov_id)
+    return {fid: anomaly_payload(cell_timeline(store, fid)) for fid in fov_ids}
+
+
 # ── internals ──────────────────────────────────────────────────────────────
+
+
+def _session_for(store, out_dir: Path):
+    """Look a session up by output directory, tolerating path spelling.
+
+    Sessions are keyed by the exact string the registering run passed in, which
+    may or may not have been resolved; try both rather than silently reporting
+    a tracked workspace as untracked.
+    """
+    for key in dict.fromkeys([str(out_dir), str(Path(out_dir).resolve())]):
+        session = store.get_session_by_output_dir(key)
+        if session is not None:
+            return session
+    return None
 
 
 def _known_animal_region_pairs(store) -> set[tuple[str, str]]:

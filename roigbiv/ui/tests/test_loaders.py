@@ -181,3 +181,96 @@ def test_load_centroids_round_trip(tmp_path: Path) -> None:
 def test_load_centroids_corrupt_json_returns_empty(tmp_path: Path) -> None:
     (tmp_path / "centroids.json").write_text("not valid json {")
     assert load_centroids(tmp_path, (32, 32)) == []
+
+
+# ── load_cross_session_bundle: timeline ordering ───────────────────────────
+
+
+def _session_row(session_id, output_dir, session_date, created_at):
+    return SimpleNamespace(
+        session_id=session_id, output_dir=str(output_dir),
+        session_date=session_date, created_at=created_at, fov_posterior=None,
+    )
+
+
+class _OrderedStore:
+    """A store returning sessions in timeline order, as the real one does."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def ensure_schema(self):
+        pass
+
+    def get_fov(self, fov_id):
+        return SimpleNamespace(animal_id="DS-Prism-3", region="DS-Prism")
+
+    def list_sessions(self, fov_id):
+        return list(self._rows)
+
+    def list_observations_for_session(self, session_id):
+        return []
+
+
+def test_cross_session_bundle_keeps_the_human_confirmed_order(tmp_path,
+                                                              monkeypatch):
+    """``list_sessions`` already orders by sequence_index; re-sorting by date
+    undoes it.
+
+    The dates here are chosen to disagree with the human order in both ways
+    that actually occur: one stem's date is unreadable (``date_source`` is
+    ``unparsed``), and the remaining two run backwards relative to the order
+    the researcher set.
+    """
+    from datetime import date as _date
+
+    from roigbiv.ui.services import loaders as L
+
+    stems = ["pre-005", "beh-006", "post-007"]
+    dates = [None, _date(2026, 5, 21), _date(2026, 5, 20)]
+    rows = []
+    for i, (stem, session_date) in enumerate(zip(stems, dates)):
+        out = tmp_path / stem
+        out.mkdir()
+        rows.append(_session_row(f"s{i}", out, session_date, None))
+
+    store = _OrderedStore(rows)
+    monkeypatch.setattr("roigbiv.registry.build_store", lambda cfg=None: store)
+    monkeypatch.setattr(L, "load_fov_bundle", lambda out_dir: SimpleNamespace(
+        output_dir=out_dir, rois=[]))
+
+    bundle = L.load_cross_session_bundle("fov-1")
+
+    assert [s.session_id for s in bundle.sessions] == ["s0", "s1", "s2"]
+    assert [s.output_dir.name for s in bundle.sessions] == stems
+
+
+def test_cross_session_bundle_dedupes_without_reordering(tmp_path, monkeypatch):
+    """A re-registered output_dir keeps its original timeline position."""
+    from datetime import date as _date, datetime as _dt
+
+    from roigbiv.ui.services import loaders as L
+
+    stems = ["pre-005", "beh-006"]
+    for stem in stems:
+        (tmp_path / stem).mkdir()
+    rows = [
+        # pre-005 is first in the human order despite carrying the later date.
+        _session_row("s0", tmp_path / "pre-005", _date(2026, 5, 21),
+                     _dt(2026, 5, 22, 9, 0)),
+        _session_row("s1", tmp_path / "beh-006", _date(2026, 5, 20),
+                     _dt(2026, 5, 22, 9, 1)),
+        # pre-005 registered a second time, later — newest row wins, but the
+        # position must not move to the end of the timeline.
+        _session_row("s2", tmp_path / "pre-005", _date(2026, 5, 21),
+                     _dt(2026, 5, 22, 10, 0)),
+    ]
+
+    store = _OrderedStore(rows)
+    monkeypatch.setattr("roigbiv.registry.build_store", lambda cfg=None: store)
+    monkeypatch.setattr(L, "load_fov_bundle", lambda out_dir: SimpleNamespace(
+        output_dir=out_dir, rois=[]))
+
+    bundle = L.load_cross_session_bundle("fov-1")
+
+    assert [s.session_id for s in bundle.sessions] == ["s2", "s1"]

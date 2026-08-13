@@ -46,12 +46,14 @@ from roigbiv.registry.match import (
     AUTO_ACCEPT_THRESHOLD,
     REVIEW_THRESHOLD,
     FOVMatchResult,
+    compute_fov_features,
     match_fov,
 )
 from roigbiv.registry.roicat_adapter import (
     AdapterConfig,
     ClusterResult,
     SessionInput,
+    cluster_sessions,
     load_session_input,
 )
 from roigbiv.registry.store.base import (
@@ -99,6 +101,7 @@ def register_or_match(
     review_threshold: float = REVIEW_THRESHOLD,
     resolved_config: Optional[dict] = None,
     override: bool = False,
+    force_fov_id: Optional[str] = None,
 ) -> dict:
     """Register a newly-processed session against the cross-session registry.
 
@@ -123,6 +126,19 @@ def register_or_match(
         before registering, and bypass the idempotency guard so the run
         always re-registers fresh. Lets a re-run replace rather than
         accumulate rows in the workspace DB. Default False (opt-in).
+    force_fov_id : Optional[str]
+        Register into this FOV, whatever the matcher thinks. Candidate search
+        is skipped and the decision banding does not apply: clustering still
+        runs, but only to assign cells within the given FOV.
+
+        For a human-confirmed session order the grouping is not the registry's
+        question to answer — the user has already stated that these sessions
+        are one field of view. Left to decide for itself, the orchestrator
+        derives FOV identity from a posterior computed *from* the cell
+        clustering, so a clustering failure splits the FOV instead of
+        surfacing as unmatched cells, and the sessions stop being comparable
+        at all. The posterior is still computed and returned so a genuine
+        mis-grouping stays visible.
     """
     store.ensure_schema()
 
@@ -133,6 +149,7 @@ def register_or_match(
             region=meta.region,
             session_date=session_date_override,
             fov_number=meta.fov_number,
+            date_source="manual",
         )
     session_date = meta.session_date or date.today()
     calibration = calibration or CalibrationModel()
@@ -169,8 +186,22 @@ def register_or_match(
             store=store, output_dir=output_dir,
             fingerprint_hash=fp.fingerprint_hash,
         )
-        if existing_report is not None:
+        if existing_report is not None and (
+            force_fov_id is None
+            or existing_report.get("fov_id") == force_fov_id
+        ):
             return existing_report
+
+    if force_fov_id is not None:
+        report = _register_into_fov(
+            store=store, blob_store=blob_store, fov_id=force_fov_id,
+            meta=meta, session_date=session_date, query=query,
+            output_dir=output_dir, fp=fp, calibration=calibration,
+            adapter_config=adapter_config, resolved_config=resolved_config,
+            accept_threshold=accept_threshold,
+            review_threshold=review_threshold,
+        )
+        return _write_report(output_dir, report)
 
     # 1. Hash pre-filter — exact re-run shortcut.
     hit = store.get_fov_by_hash(fp.fingerprint_hash)
@@ -207,6 +238,11 @@ def register_or_match(
     best_result: Optional[FOVMatchResult] = None
     best_sessions: Optional[list[SessionRecord]] = None
     best_inputs: Optional[list[SessionInput]] = None
+    # A candidate that *crashes* and a candidate that legitimately doesn't match
+    # both end at "new_fov". Keep the failures so the report can tell them
+    # apart — otherwise a broken matcher is indistinguishable from a new field
+    # of view, in every artifact the run produces.
+    match_errors: list[dict] = []
     for cand in v3_candidates:
         cand_sessions = store.list_sessions(cand.fov_id)
         cand_inputs = _load_candidate_session_inputs(cand_sessions)
@@ -229,6 +265,10 @@ def register_or_match(
             log.exception(
                 "ROICaT match_fov failed for candidate %s: %s", cand.fov_id, exc
             )
+            match_errors.append({
+                "candidate_fov_id": cand.fov_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
             continue
         if best_result is None or result.fov_posterior > best_result.fov_posterior:
             best_record = cand
@@ -252,6 +292,11 @@ def register_or_match(
             match_result=best_result,
             resolved_config=resolved_config,
         )
+        # Record the cutoff in force. The accept default moved 0.9 -> 0.8, so
+        # "was this accepted only because the bar was lowered?" is a question
+        # a reader of an old report can no longer answer from the posterior.
+        report["accept_threshold"] = float(accept_threshold)
+        report["review_threshold"] = float(review_threshold)
         return _write_report(output_dir, report)
 
     if best_result is not None and best_result.decision == "review":
@@ -279,11 +324,123 @@ def register_or_match(
         best_candidate_fov_id=best_record.fov_id if best_record else None,
         best_match_result=best_result,
         resolved_config=resolved_config,
+        match_errors=match_errors,
     )
     return _write_report(output_dir, report)
 
 
+def _register_into_fov(
+    *,
+    store: RegistryStore,
+    blob_store: BlobStore,
+    fov_id: str,
+    meta: FilenameMetadata,
+    session_date: date,
+    query: SessionInput,
+    output_dir: Path,
+    fp: Fingerprint,
+    calibration: CalibrationModel,
+    adapter_config: AdapterConfig,
+    resolved_config: Optional[dict],
+    accept_threshold: float,
+    review_threshold: float,
+) -> dict:
+    """Register into a caller-asserted FOV; cluster only to assign cells.
+
+    The posterior is computed and reported but never gates: the caller has
+    already decided these sessions belong together. A value below
+    ``review_threshold`` is carried on the report as ``grouping_warning`` so
+    the disagreement reaches the run log instead of being discarded.
+
+    If clustering cannot run — no reachable prior sessions, or ROICaT raising
+    — the session is still registered, with every ROI as a new cell. Refusing
+    to write would leave a session the user explicitly ordered missing from
+    its own FOV, which is worse than recording it with nothing matched.
+    """
+    fov_record = store.get_fov(fov_id)
+    if fov_record is None:
+        raise ValueError(f"force_fov_id {fov_id!r} is not in the registry")
+
+    sessions = [s for s in store.list_sessions(fov_id)
+                if s.output_dir != str(output_dir)]
+    inputs = _load_candidate_session_inputs(sessions)
+    error: Optional[str] = None
+    result: Optional[FOVMatchResult] = None
+
+    if inputs:
+        try:
+            result = match_fov(
+                query=query, candidate_sessions=inputs,
+                calibration=calibration, adapter_config=adapter_config,
+                accept_threshold=accept_threshold,
+                review_threshold=review_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Clustering failed inside forced FOV %s: %s", fov_id, exc)
+            error = f"{type(exc).__name__}: {exc}"
+    if result is None:
+        result = _all_new_match_result(query, adapter_config, calibration)
+        sessions = []
+
+    report = _register_auto_match(
+        store=store, blob_store=blob_store, fov_record=fov_record,
+        candidate_sessions=sessions, meta=meta, session_date=session_date,
+        query=query, output_dir=output_dir, fp=fp, match_result=result,
+        resolved_config=resolved_config,
+    )
+    report["decision"] = "forced_fov"
+    report["forced_fov_id"] = fov_id
+    report["accept_threshold"] = float(accept_threshold)
+    report["review_threshold"] = float(review_threshold)
+    if error is not None:
+        report["match_errors"] = [{"candidate_fov_id": fov_id, "error": error}]
+    if result.fov_posterior < review_threshold:
+        report["grouping_warning"] = (
+            f"posterior {result.fov_posterior:.3f} is below the review "
+            f"threshold {review_threshold:.2f} — the matcher does not agree "
+            f"this session belongs to FOV {fov_id}"
+        )
+    return report
+
+
+def _all_new_match_result(
+    query: SessionInput,
+    adapter_config: AdapterConfig,
+    calibration: CalibrationModel,
+) -> FOVMatchResult:
+    """A degenerate result placing every query ROI in its own cluster.
+
+    ``cluster_sessions`` on a single session already produces exactly this and
+    does so without importing ROICaT, so the all-new path costs nothing and
+    stays shape-compatible with ``_register_auto_match``.
+    """
+    cluster_result = cluster_sessions([query], adapter_config)
+    features = compute_fov_features(cluster_result, query_session_idx=0)
+    return FOVMatchResult(
+        decision="reject",
+        fov_posterior=float(calibration.p_same_fov(features)),
+        features=features,
+        cluster_result=cluster_result,
+        query_session_idx=0,
+    )
+
+
 # ── Idempotency ────────────────────────────────────────────────────────────
+
+
+def _resolve_session_id(
+    store: RegistryStore, fov_id: str, output_dir: Path
+) -> str:
+    """The id this registration will actually own for ``(fov_id, output_dir)``.
+
+    Resolved up front rather than after the writes, because ``session_id``
+    is stamped into cell records, observations and the cluster-labels blob
+    path before the session row is ever touched. Minting a fresh id and
+    discovering only at insert time that the key is taken is what left
+    observations pointing at a session that does not exist.
+    """
+    existing = store.get_session(fov_id, str(output_dir))
+    return existing.session_id if existing is not None else str(uuid.uuid4())
 
 
 def _load_idempotent_report(
@@ -370,7 +527,7 @@ def _register_hash_match(
     fp: Fingerprint,
 ) -> dict:
     """The exact-rerun shortcut — same fingerprint, write observations 1:1."""
-    session_id = str(uuid.uuid4())
+    session_id = _resolve_session_id(store, fov_record.fov_id, output_dir)
     now = datetime.now(timezone.utc)
 
     # Hash match means label_ids + centroids are identical to the first
@@ -418,7 +575,7 @@ def _register_hash_match(
             "match_kind": kind,
         })
 
-    store.insert_session(SessionRecord(
+    session_id = store.upsert_session(SessionRecord(
         session_id=session_id,
         fov_id=fov_record.fov_id,
         session_date=session_date,
@@ -432,6 +589,7 @@ def _register_hash_match(
     ))
     for cell in new_cells:
         store.insert_cell(cell)
+    store.delete_observations_for_session(session_id)
     store.insert_observations(observations)
     store.update_fov_latest_session(fov_record.fov_id, session_date)
 
@@ -468,7 +626,7 @@ def _register_auto_match(
     resolved_config: Optional[dict] = None,
 ) -> dict:
     """Write a new session mapped via ROICaT cluster labels → global cell IDs."""
-    session_id = str(uuid.uuid4())
+    session_id = _resolve_session_id(store, fov_record.fov_id, output_dir)
     now = datetime.now(timezone.utc)
 
     cr = match_result.cluster_result
@@ -617,7 +775,7 @@ def _register_auto_match(
         serialize_array(query_cluster_labels),
     )
 
-    store.insert_session(SessionRecord(
+    session_id = store.upsert_session(SessionRecord(
         session_id=session_id,
         fov_id=fov_record.fov_id,
         session_date=session_date,
@@ -632,6 +790,7 @@ def _register_auto_match(
     ))
     for cell in new_cells:
         store.insert_cell(cell)
+    store.delete_observations_for_session(session_id)
     store.insert_observations(observations)
     store.update_fov_latest_session(fov_record.fov_id, session_date)
     # Refresh the FOV's resolved optics config from this successful run, but only
@@ -697,10 +856,14 @@ def _review_report(
         "session_date": session_date.isoformat(),
         "fingerprint_hash": fp.fingerprint_hash,
         "fingerprint_version": fp.fingerprint_version,
+        "accept_threshold": float(accept_threshold),
+        "review_threshold": float(review_threshold),
         "message": (
             f"posterior={match_result.fov_posterior:.3f} in review band "
             f"[{review_threshold}, {accept_threshold}); "
-            "no session written. Resolve in the Streamlit Registry tab."
+            "no session written, so this session is absent from the FOV's "
+            "timeline. Re-run with a lower ROIGBIV_FOV_ACCEPT_THRESHOLD to "
+            "accept it, after confirming it is the same field of view."
         ),
     }
 
@@ -717,6 +880,7 @@ def _mint_new_fov(
     best_candidate_fov_id: Optional[str] = None,
     best_match_result: Optional[FOVMatchResult] = None,
     resolved_config: Optional[dict] = None,
+    match_errors: Optional[list[dict]] = None,
 ) -> dict:
     """Create a new FOV + session + cells keyed to fresh global IDs."""
     fov_id = str(uuid.uuid4())
@@ -754,7 +918,9 @@ def _mint_new_fov(
         roi_embeddings_uri=merged_masks_uri,
         resolved_config_uri=resolved_config_uri,
     ))
-    store.insert_session(SessionRecord(
+    # No collision possible: fov_id was minted a few lines above, so nothing
+    # can already hold this (fov_id, output_dir).
+    store.upsert_session(SessionRecord(
         session_id=session_id,
         fov_id=fov_id,
         session_date=session_date,
@@ -809,6 +975,7 @@ def _mint_new_fov(
         "best_candidate_posterior": (
             best_match_result.fov_posterior if best_match_result else None
         ),
+        "match_errors": list(match_errors or []),
         "cluster_labels_uri": cluster_labels_uri,
         "cell_assignments": [
             {

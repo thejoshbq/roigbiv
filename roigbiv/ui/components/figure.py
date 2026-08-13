@@ -4,8 +4,8 @@ One entry point — :func:`build_roi_figure` — parameterised by two
 orthogonal view-mode axes:
 
 * ``geometry ∈ {"outline", "fill"}`` — render contours vs. tinted mask fills.
-* ``color_mode ∈ {"single", "stage", "feature", "gcid"}`` — what drives the
-  hue of each ROI. See :mod:`roigbiv.ui.services.colors`.
+* ``color_mode ∈ {"single", "stage", "feature", "gcid", "status"}`` — what
+  drives the hue of each ROI. See :mod:`roigbiv.ui.services.colors`.
 
 The figure uses a ``heatmap`` trace for the mean projection (fast, supports
 zoom + pan natively) and one ``scatter`` trace per ROI for contours, plus a
@@ -25,6 +25,7 @@ from roigbiv.ui.services.colors import (
     SINGLE_COLOR,
     color_for_feature,
     color_for_gcid,
+    color_for_match_status,
     color_for_stage,
 )
 from roigbiv.ui.services.loaders import ROIRender
@@ -37,7 +38,10 @@ from roigbiv.ui.services.theme import (
 
 
 GeometryMode = str        # "outline" | "fill"
-ColorMode = str           # "single" | "stage" | "feature" | "gcid"
+ColorMode = str           # "single" | "stage" | "feature" | "gcid" | "status"
+
+_OUTLINE_WIDTH = 3.2
+_HIGHLIGHT_WIDTH = 5.5
 
 
 def build_roi_figure(
@@ -50,6 +54,7 @@ def build_roi_figure(
     show_overlay: bool = True,
     title: Optional[str] = None,
     theme: Optional[str] = None,
+    highlight_labels: Optional[dict[int, str]] = None,
 ) -> go.Figure:
     """Compose the mean projection with ROI overlays.
 
@@ -73,6 +78,11 @@ def build_roi_figure(
         inspecting registration or motion-correction quality.
     title :
         Optional figure title — kept small so the plot dominates.
+    highlight_labels :
+        ``{label_id: badge_text}``. Those ROIs draw thicker and get their badge
+        printed at the centroid. Used by the /cells page to make one cell stand
+        out simultaneously across several session panels; the badge carries the
+        cell's display number, which this module has no other way to know.
     """
     fig = go.Figure()
     if mean is not None:
@@ -106,8 +116,10 @@ def build_roi_figure(
 
         # Outlines are drawn in both modes — they're the click target and give
         # fills a clean edge. For "outline" mode, this is the only ROI glyph.
+        highlight = highlight_labels or {}
         for render in visible:
             color = _pick_color(render, color_mode)
+            lit = int(render.label_id) in highlight
             for ys, xs in render.contours:
                 if not ys:
                     continue
@@ -116,13 +128,22 @@ def build_roi_figure(
                         x=xs + [xs[0]],
                         y=ys + [ys[0]],
                         mode="lines",
-                        line=dict(color=color, width=3.2),
+                        line=dict(
+                            color=color,
+                            width=_HIGHLIGHT_WIDTH if lit else _OUTLINE_WIDTH,
+                            dash=_line_dash(render, color_mode),
+                        ),
                         hovertemplate=_hover_text(render),
                         name=str(render.label_id),
+                        # ``meta`` is what trace_index_map reads back; unlike
+                        # ``name`` it stays an int and is never rendered.
+                        meta=int(render.label_id),
                         customdata=[[render.label_id]] * (len(xs) + 1),
                         showlegend=False,
                     )
                 )
+            if lit:
+                fig.add_trace(_badge_trace(render, color, highlight))
 
     H, W = (mean.shape if mean is not None else (1, 1))
     fig.update_layout(
@@ -146,7 +167,48 @@ def build_roi_figure(
     return fig
 
 
+def trace_index_map(fig: go.Figure) -> dict[int, list[int]]:
+    """``{label_id: [trace indices]}`` for the ROI outlines in *fig*.
+
+    Read back off the built figure rather than recomputed from the ROI list, so
+    it cannot drift from what was actually drawn. Callers use it to restyle a
+    selection through ``dash.Patch`` — repainting one outline instead of
+    shipping a fresh multi-megabyte heatmap to the browser on every click.
+    """
+    out: dict[int, list[int]] = {}
+    for i, trace in enumerate(fig.data):
+        meta = getattr(trace, "meta", None)
+        if isinstance(meta, int):
+            out.setdefault(meta, []).append(i)
+    return out
+
+
 # ── internals ──────────────────────────────────────────────────────────────
+
+
+def _badge_trace(render: ROIRender, color: str, highlight: dict[int, str]):
+    """The ``#N`` label pinned at a highlighted ROI's centroid."""
+    cy, cx = render.centroid_yx
+    return go.Scatter(
+        x=[cx], y=[cy],
+        mode="text",
+        text=[str(highlight[int(render.label_id)])],
+        textfont=dict(color=color, size=13, family="monospace"),
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+
+def _line_dash(render: ROIRender, color_mode: ColorMode) -> str:
+    """Dot a cell that isn't really here.
+
+    A "lost" ROI is drawn at its last known position in a session where it was
+    never detected. A solid outline would claim a detection that does not
+    exist, so only this one case departs from a solid line.
+    """
+    if color_mode == "status" and render.match_status == "lost":
+        return "dot"
+    return "solid"
 
 
 def _pick_color(render: ROIRender, color_mode: ColorMode) -> str:
@@ -158,6 +220,8 @@ def _pick_color(render: ROIRender, color_mode: ColorMode) -> str:
         return color_for_feature(render.activity_type)
     if color_mode == "gcid":
         return color_for_gcid(render.global_cell_id)
+    if color_mode == "status":
+        return color_for_match_status(render.match_status)
     return SINGLE_COLOR
 
 
@@ -169,6 +233,8 @@ def _hover_text(render: ROIRender) -> str:
     ]
     if render.activity_type:
         lines.append(f"<b>activity</b>: {render.activity_type}")
+    if render.match_status:
+        lines.append(f"<b>across sessions</b>: {render.match_status}")
     if render.global_cell_id:
         lines.append(f"<b>gcid</b>: {render.global_cell_id[:8]}")
     if render.area:

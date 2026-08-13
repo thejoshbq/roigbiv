@@ -23,6 +23,11 @@ quintile and 14 in the brightest, and only 1 of the 62 inside the tissue sat on
 a local maximum of the mean image. Cellpose on the same mean image put every one
 of its masks on a real soma.
 
+When Foundation never ran, the mean projection detection falls back to is also
+written to ``summary/mean_M.tif`` — the cross-session registry needs an
+anatomical image to align sessions, and this makes a centroids-only workspace
+trackable without paying for Foundation.
+
 Recompute is keyed on the resolved detection parameters and a schema version,
 both recorded in ``centroids.json``: a changed ``calibration.json`` recomputes,
 an unchanged one resumes.
@@ -41,7 +46,7 @@ import numpy as np
 # Bumped whenever the centroids.json payload changes shape. Part of the
 # recompute key: an artifact written by an older schema is recomputed rather
 # than reused, so a stale pre-fix result can't survive an upgrade untouched.
-_SCHEMA = 3
+_SCHEMA = 4
 
 # A Suite2p candidate this close to a Cellpose centroid counts as corroborating
 # it. One soma radius at the diameters this workflow sees (40-80 px).
@@ -60,6 +65,7 @@ class _Substrate(NamedTuple):
     morph: np.ndarray      # mean_M — the anatomical channel
     ch2: np.ndarray        # vcorr_S — Stage 1's second channel
     max_S: Optional[np.ndarray]
+    source: str            # "mean_M" (Foundation's) or "mean_projection" (ours)
 
 
 def _with_overrides(cfg, **overrides):
@@ -135,7 +141,7 @@ def _load_substrate(output_dir: Path, mc_tif_path: Path) -> _Substrate:
                 f"no anatomical image for this FOV: neither {mean_path} nor a "
                 f"readable stack at {mc_tif_path} — run motion correction first")
         morph = _mean_projection(mc_tif_path)
-        return _Substrate(morph, morph, None)
+        return _Substrate(morph, morph, None, "mean_projection")
 
     morph = np.asarray(tifffile.imread(mean_path), dtype=np.float32)
     ch2_path = summary / "vcorr_S.tif"
@@ -144,7 +150,28 @@ def _load_substrate(output_dir: Path, mc_tif_path: Path) -> _Substrate:
     max_path = summary / "max_S.tif"
     max_S = (np.asarray(tifffile.imread(max_path), dtype=np.float32)
              if max_path.exists() else None)
-    return _Substrate(morph, ch2, max_S)
+    return _Substrate(morph, ch2, max_S, "mean_M")
+
+
+def _persist_substrate(output_dir: Path, morph: np.ndarray) -> None:
+    """Write the detection substrate to ``summary/mean_M.tif`` if nothing is there.
+
+    The cross-session registry needs an anatomical image to align sessions
+    (``roicat_adapter.load_session_input``), and a centroids-only workspace has
+    never run Foundation. This is the same mean projection detection just ran
+    on, so persisting it costs nothing and makes the FOV trackable.
+
+    Never overwrites: Foundation's own ``mean_M`` is the better image and wins
+    whenever it exists.
+    """
+    import tifffile
+
+    summary = Path(output_dir) / "summary"
+    mean_path = summary / "mean_M.tif"
+    if mean_path.exists():
+        return
+    summary.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(mean_path), np.asarray(morph, dtype=np.float32))
 
 
 def _tissue_mask(morph: np.ndarray, sigma: float) -> tuple[Optional[np.ndarray], dict]:
@@ -260,6 +287,8 @@ def run_centroid_discovery(
                                   count=len(prior.get("centroids", [])))
 
     substrate = _load_substrate(output_dir, mc_tif_path)
+    if substrate.source == "mean_projection":
+        _persist_substrate(output_dir, substrate.morph)
 
     overrides = {
         "cellprob_threshold": params["cellprob_threshold"],
@@ -309,6 +338,7 @@ def run_centroid_discovery(
         "stem": stem,
         "schema": _SCHEMA,
         "source": "cellpose",
+        "substrate_source": substrate.source,
         "generated_at": time.time(),
         "params": params,
         "n_detected": n_detected,

@@ -86,6 +86,8 @@ class Session(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     # v3: blob URI for the per-session int32 ROICaT cluster label array.
     cluster_labels_uri: Mapped[str] = mapped_column(String(512), nullable=True)
+    # Human-assigned timeline position (Track page). NULL = not yet ordered.
+    sequence_index: Mapped[int] = mapped_column(Integer, nullable=True)
 
     fov = relationship("FOV", back_populates="sessions")
 

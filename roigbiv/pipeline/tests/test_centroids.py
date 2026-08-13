@@ -88,7 +88,8 @@ def test_detects_on_mean_m_and_writes_expected_schema():
 
         payload = json.loads(result.output_path.read_text())
         assert payload["source"] == "cellpose"
-        assert payload["schema"] == 3
+        assert payload["schema"] == 4
+        assert payload["substrate_source"] == "mean_M"
         assert result.count == 2
 
         c0 = payload["centroids"][0]
@@ -306,6 +307,59 @@ def test_falls_back_to_a_mean_projection_without_foundation_summaries():
     print("  [PASS] test_falls_back_to_a_mean_projection_without_foundation_summaries")
 
 
+def test_fallback_substrate_is_persisted_for_the_registry():
+    """A centroids-only FOV must end up with an anatomical image on disk.
+
+    The cross-session registry aligns sessions against ``summary/mean_M.tif``
+    (roicat_adapter.load_session_input); without this a centroids-only
+    workspace could never be tracked.
+    """
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        stack = np.zeros((12, 64, 64), dtype=np.uint16)
+        stack[:, 5:35, 5:35] = 200
+        tifffile.imwrite(mc_tif, stack)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+                   side_effect=_fake_cellpose(masks, probs)):
+            result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+
+        mean_path = output_dir / "summary" / "mean_M.tif"
+        assert mean_path.exists()
+        written = tifffile.imread(mean_path)
+        assert written.shape == (64, 64)
+        assert float(written.max()) == pytest.approx(200.0)
+
+        payload = json.loads(result.output_path.read_text())
+        assert payload["substrate_source"] == "mean_projection"
+    print("  [PASS] test_fallback_substrate_is_persisted_for_the_registry")
+
+
+def test_foundation_mean_m_is_never_overwritten():
+    """Foundation's mean_M is the better image — it always wins."""
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        mean_path = output_dir / "summary" / "mean_M.tif"
+        before = mean_path.read_bytes()
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+                   side_effect=_fake_cellpose(masks, probs)):
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+
+        assert mean_path.read_bytes() == before
+    print("  [PASS] test_foundation_mean_m_is_never_overwritten")
+
+
 def test_resumes_on_unchanged_params_and_recomputes_on_change():
     from roigbiv.pipeline.calibration import write_calibration
     from roigbiv.pipeline.centroids import run_centroid_discovery
@@ -425,6 +479,8 @@ if __name__ == "__main__":
         test_missing_suite2p_output_means_no_cross_check_not_failure,
         test_no_summary_and_no_stack_fails_fast_with_guidance,
         test_falls_back_to_a_mean_projection_without_foundation_summaries,
+        test_fallback_substrate_is_persisted_for_the_registry,
+        test_foundation_mean_m_is_never_overwritten,
         test_resumes_on_unchanged_params_and_recomputes_on_change,
         test_stale_schema_forces_recompute,
         test_tissue_mask_is_opt_in,

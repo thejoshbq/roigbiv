@@ -193,16 +193,62 @@ class SQLAlchemyStore:
                 s.commit()
 
     # ── Session ───────────────────────────────────────────────────────────
-    def insert_session(self, session: SessionRecord) -> None:
+    def get_session(
+        self, fov_id: str, output_dir: str
+    ) -> Optional[SessionRecord]:
+        """The session row for exactly this ``(fov_id, output_dir)``, if any.
+
+        Keyed on the pair the unique constraint uses, so a caller can learn the
+        id a re-registration will land on *before* it builds anything that
+        references it. ``get_session_by_output_dir`` answers a different
+        question (newest row across all FOVs) and is not a substitute.
+        """
         with self._Session() as s:
-            existing = s.scalar(
+            row = s.scalar(
+                select(m.Session).where(
+                    m.Session.fov_id == fov_id,
+                    m.Session.output_dir == output_dir,
+                )
+            )
+            return _session_to_record(row) if row else None
+
+    def upsert_session(self, session: SessionRecord) -> str:
+        """Insert *session*, or refresh the row already holding its key.
+
+        Returns the ``session_id`` now authoritative for
+        ``(fov_id, output_dir)`` — **not necessarily the one passed in**. The
+        unique constraint means a re-registration of the same output directory
+        cannot get its own row, and the previous version of this method dealt
+        with that by returning silently: the caller went on to write
+        observations against a ``session_id`` that was never inserted, leaving
+        rows referencing a session that does not exist (44 of them in the
+        reference workspace) and stale counts on the row that survived.
+
+        Adopting the existing row also means refreshing it. The counts,
+        posterior and cluster-labels blob all describe *this* registration, so
+        leaving the previous run's values in place would make the row disagree
+        with the ``registry_match.json`` written beside it.
+        """
+        with self._Session() as s:
+            row = s.scalar(
                 select(m.Session).where(
                     m.Session.fov_id == session.fov_id,
                     m.Session.output_dir == session.output_dir,
                 )
             )
-            if existing is not None:
-                return
+            if row is not None:
+                row.session_date = session.session_date
+                row.fov_sim = session.fov_sim
+                row.fov_posterior = session.fov_posterior
+                row.n_matched = session.n_matched
+                row.n_new = session.n_new
+                row.n_missing = session.n_missing
+                if session.cluster_labels_uri is not None:
+                    row.cluster_labels_uri = session.cluster_labels_uri
+                if session.sequence_index is not None:
+                    row.sequence_index = session.sequence_index
+                s.commit()
+                return row.session_id
             s.add(m.Session(
                 session_id=session.session_id,
                 fov_id=session.fov_id,
@@ -215,8 +261,25 @@ class SQLAlchemyStore:
                 n_missing=session.n_missing,
                 created_at=session.created_at or datetime.now(timezone.utc),
                 cluster_labels_uri=session.cluster_labels_uri,
+                sequence_index=session.sequence_index,
             ))
             s.commit()
+            return session.session_id
+
+    def delete_observations_for_session(self, session_id: str) -> int:
+        """Drop a session's observations so a re-registration can replace them.
+
+        ``(session_id, local_label_id)`` is unique, so re-registering an output
+        directory without this raises on the first repeated label.
+        """
+        with self._Session() as s:
+            result = s.execute(
+                delete(m.CellObservation).where(
+                    m.CellObservation.session_id == session_id
+                )
+            )
+            s.commit()
+            return int(result.rowcount or 0)
 
     def update_session_cluster_labels(
         self, session_id: str, cluster_labels_uri: str
@@ -229,12 +292,33 @@ class SQLAlchemyStore:
             row.cluster_labels_uri = cluster_labels_uri
             s.commit()
 
+    def update_session_sequence(
+        self, session_id: str, sequence_index: Optional[int]
+    ) -> None:
+        """Set (or clear) a session's human-assigned timeline position."""
+        with self._Session() as s:
+            row = s.get(m.Session, session_id)
+            if row is None:
+                return
+            row.sequence_index = sequence_index
+            s.commit()
+
     def list_sessions(self, fov_id: str) -> list[SessionRecord]:
+        """Sessions in timeline order.
+
+        A human-assigned ``sequence_index`` wins where one exists; unordered
+        sessions fall back to ``session_date`` and sort after the ordered ones,
+        so a partially-ordered FOV still reads sensibly.
+        """
         with self._Session() as s:
             rows = s.scalars(
                 select(m.Session)
                 .where(m.Session.fov_id == fov_id)
-                .order_by(m.Session.session_date)
+                .order_by(
+                    m.Session.sequence_index.is_(None),
+                    m.Session.sequence_index,
+                    m.Session.session_date,
+                )
             ).all()
             return [_session_to_record(r) for r in rows]
 
@@ -405,6 +489,7 @@ def _session_to_record(row: m.Session) -> SessionRecord:
         n_missing=row.n_missing,
         created_at=row.created_at,
         cluster_labels_uri=row.cluster_labels_uri,
+        sequence_index=row.sequence_index,
     )
 
 

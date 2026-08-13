@@ -49,6 +49,10 @@ class ROIRender:
     global_cell_id: Optional[str] = None
     is_user: bool = False
     features: dict = field(default_factory=dict)
+    # Cross-session outcome for this ROI in this session — "matched", "new", or
+    # "lost". Only the /cells page populates it; every other loader leaves it
+    # None, which the "status" color mode renders as untracked gray.
+    match_status: Optional[str] = None
 
 
 @dataclass
@@ -419,13 +423,16 @@ def load_cross_session_bundle(fov_id: str, cfg=None) -> CrossSessionBundle:
     store.ensure_schema()
 
     fov = store.get_fov(fov_id)
-    _all_rows = sorted(
-        store.list_sessions(fov_id), key=lambda s: s.session_date or date.min,
-    )
+    # ``list_sessions`` already returns the timeline order: the human-confirmed
+    # ``sequence_index`` first (nulls last), then session_date. Do not re-sort
+    # by date — sessions recorded on one day are orderable only by hand, and
+    # that ordering is what makes "arrived late" / "dropped out" mean anything.
+    _all_rows = store.list_sessions(fov_id)
     # Deduplicate by output_dir, keeping the row with the highest created_at.
     # Multiple rows can exist when the pipeline or backfill registers the same
     # output_dir more than once; treat the newest as authoritative (consistent
-    # with store.get_session_by_output_dir).
+    # with store.get_session_by_output_dir). Assigning to an existing key keeps
+    # the dict's original insertion position, so timeline order survives.
     _best: dict[str, object] = {}
     for _row in _all_rows:
         _ex = _best.get(_row.output_dir)
@@ -434,7 +441,7 @@ def load_cross_session_bundle(fov_id: str, cfg=None) -> CrossSessionBundle:
             and (_ex.created_at is None or _row.created_at > _ex.created_at)
         ):
             _best[_row.output_dir] = _row
-    sessions_rows = sorted(_best.values(), key=lambda s: s.session_date or date.min)
+    sessions_rows = list(_best.values())
 
     session_refs: list[SessionRef] = []
     bundles: dict[str, FOVBundle] = {}

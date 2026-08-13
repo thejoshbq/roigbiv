@@ -5,10 +5,14 @@ from roigbiv.pipeline.corrections import USER_STAGE_SENTINEL
 from roigbiv.ui.services.colors import (
     FEATURE_LABELS,
     FEATURE_PALETTE,
+    MATCH_STATUS_LABELS,
+    MATCH_STATUS_PALETTE,
     STAGE_LABELS,
     STAGE_PALETTE,
+    UNTRACKED_COLOR,
     color_for_feature,
     color_for_gcid,
+    color_for_match_status,
     color_for_stage,
 )
 
@@ -49,3 +53,21 @@ def test_color_for_gcid_is_deterministic() -> None:
 def test_color_for_gcid_none_returns_untracked() -> None:
     result = color_for_gcid(None)
     assert result.startswith("rgba(")
+
+
+def test_match_status_palette_covers_the_three_outcomes() -> None:
+    expected = {"matched", "new", "lost"}
+    assert set(MATCH_STATUS_PALETTE) == expected
+    assert set(MATCH_STATUS_LABELS) == expected
+
+
+def test_each_match_status_is_visually_distinct() -> None:
+    """Three statuses, three colors — the whole point of the status mode."""
+    colors = [color_for_match_status(s) for s in ("matched", "new", "lost")]
+    assert len(set(colors)) == 3
+
+
+def test_unknown_or_absent_match_status_reads_as_untracked() -> None:
+    assert color_for_match_status(None) == UNTRACKED_COLOR
+    assert color_for_match_status("") == UNTRACKED_COLOR
+    assert color_for_match_status("nonsense") == UNTRACKED_COLOR

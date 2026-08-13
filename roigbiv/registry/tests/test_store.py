@@ -73,7 +73,7 @@ def test_session_observation_cell_roundtrip():
         created_at=datetime.now(timezone.utc),
     ))
     session_id = str(uuid.uuid4())
-    store.insert_session(SessionRecord(
+    store.upsert_session(SessionRecord(
         session_id=session_id,
         fov_id=fov_id,
         session_date=date(2022, 12, 9),
@@ -124,7 +124,7 @@ def _seed_fov_with_session(store, *, output_dir, fingerprint=None):
         created_at=datetime.now(timezone.utc),
     ))
     session_id = str(uuid.uuid4())
-    store.insert_session(SessionRecord(
+    store.upsert_session(SessionRecord(
         session_id=session_id, fov_id=fov_id,
         session_date=date(2022, 12, 9), output_dir=output_dir,
         n_matched=0, n_new=2, n_missing=0,
@@ -165,7 +165,7 @@ def test_supersede_session_preserves_fov_with_other_sessions():
     fov_id, keep_session = _seed_fov_with_session(store, output_dir="/tmp/keep")
     # A second session on the SAME FOV but a different output_dir.
     other = str(uuid.uuid4())
-    store.insert_session(SessionRecord(
+    store.upsert_session(SessionRecord(
         session_id=other, fov_id=fov_id,
         session_date=date(2023, 1, 2), output_dir="/tmp/drop",
         n_matched=0, n_new=0, n_missing=0,
