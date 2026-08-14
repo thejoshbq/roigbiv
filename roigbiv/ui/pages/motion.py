@@ -2,7 +2,7 @@
 
 The first operation in the pipeline and, on wall-clock, most of it. This page
 owns that and nothing else: no centroid calibration, no detection settings, no
-workspace scanner. Those moved to :mod:`roigbiv.ui.pages.centroids` and
+workspace scanner. Those moved to :mod:`roigbiv.ui.pages.discovery` and
 :mod:`roigbiv.ui.components.workspace_bar` respectively, because a page that
 also held them made "did motion correction finish" and "did detection work" one
 question with one Run button and one shared results table.

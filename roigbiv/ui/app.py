@@ -4,12 +4,12 @@ One page per operation, in the order the operations happen:
 
 1. **Motion correction** — parameters, a live view of the registration, and the
    per-FOV quality metrics (``pages/motion.py``).
-2. **Centroids** — per-FOV Cellpose calibration and the detection run
-   (``pages/centroids.py``).
+2. **Discovery** — per-FOV Cellpose calibration, the detection run, and
+   tuning the seeded boundaries detection produces
+   (``pages/discovery.py``). Was two pages (Centroids, Boundaries); merged
+   because they are one workflow on one FOV, not two.
 3. **Tracking** — session order, cross-session registration, and the contact
    sheet where cells are reviewed and corrected (``pages/tracking.py``).
-4. **Boundaries** — seeded cell outlines, and the one knob that tunes them
-   (``pages/boundaries.py``).
 
 Each page owns its own run and nothing else. They used to be one 1400-line
 Pipeline page with a run-mode radio deciding which of four jobs its single Run
@@ -54,7 +54,7 @@ from dash import Input, Output, State, dcc, html, no_update
 from roigbiv.ui.components import errors as error_components
 from roigbiv.ui.components import run_panel, workspace_bar
 from roigbiv.ui.logging import configure_ui_logging
-from roigbiv.ui.pages import boundaries, centroids, motion, tracking
+from roigbiv.ui.pages import discovery, motion, tracking
 from roigbiv.ui.pages.review import (
     MAIN_COL_ID,
     RIGHT_SIDEBAR_COL_ID,
@@ -80,14 +80,14 @@ THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
     ("/motion-correction", "Motion correction", motion),
-    ("/centroids", "Centroids", centroids),
+    ("/discovery", "Discovery", discovery),
     ("/tracking", "Tracking", tracking),
-    ("/boundaries", "Boundaries", boundaries),
 )
 
 #: Paths that used to exist, and where their content went. ``/cells`` and
-#: ``/track`` are two halves of one page now; ``/registry`` was retired to the
-#: CLI. Bookmarks and half-remembered URLs are cheap to honour.
+#: ``/track`` are two halves of one page now; ``/centroids`` and
+#: ``/boundaries`` are two more; ``/registry`` was retired to the CLI.
+#: Bookmarks and half-remembered URLs are cheap to honour.
 _REDIRECTS = {
     "/pipeline": "/motion-correction",
     "/process": "/motion-correction",
@@ -95,6 +95,8 @@ _REDIRECTS = {
     "/track": "/tracking",
     "/cells": "/tracking",
     "/viewer": "/tracking",
+    "/centroids": "/discovery",
+    "/boundaries": "/discovery",
 }
 
 
@@ -165,6 +167,9 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     from roigbiv.ui.routes.cells_api import (
         register_flask_routes as register_cells_api_routes)
     register_cells_api_routes(app.server)
+    from roigbiv.ui.routes.discovery_api import (
+        register_flask_routes as register_discovery_api_routes)
+    register_discovery_api_routes(app.server)
     _wire_sidebar_toggles(app)
     _wire_theme_toggle(app)
     error_components.register_callbacks(app)
