@@ -34,7 +34,7 @@ def _render(client, pathname: str):
 
 def test_the_pages_are_in_operation_order():
     assert [label for _, label, _ in PAGES] == [
-        "Motion correction", "Centroids", "Tracking", "Boundaries"]
+        "Motion correction", "Discovery", "Tracking"]
 
 
 @pytest.mark.parametrize("path", [p for p, _, _ in PAGES])
@@ -56,6 +56,8 @@ def test_the_root_serves_the_first_operation():
     ("/track", "/tracking"),
     ("/cells", "/tracking"),
     ("/viewer", "/tracking"),
+    ("/centroids", "/discovery"),
+    ("/boundaries", "/discovery"),
 ])
 def test_retired_paths_redirect(old, new):
     """The address bar is rewritten rather than the new page served under the
@@ -67,8 +69,8 @@ def test_retired_paths_redirect(old, new):
 
 
 def test_a_live_page_does_not_redirect():
-    assert resolve_route("/boundaries") == ("/boundaries", None)
-    assert resolve_route("/boundaries/") == ("/boundaries", None)
+    assert resolve_route("/discovery") == ("/discovery", None)
+    assert resolve_route("/discovery/") == ("/discovery", None)
 
 
 def test_an_unknown_path_resolves_to_nothing():
