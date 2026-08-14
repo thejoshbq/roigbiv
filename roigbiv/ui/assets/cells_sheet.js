@@ -38,6 +38,7 @@
     selected: null,
     showNumbers: true,
     editOn: false,
+    showBoundaries: false,
     focusIndex: null,
     syncing: false,
     osdPromise: null,
@@ -88,8 +89,9 @@
 
   // ── fetch ────────────────────────────────────────────────────────────────
 
-  function fetchState(fovId) {
-    return fetch("/api/cells/" + encodeURIComponent(fovId), {
+  function fetchState(fovId, showBoundaries) {
+    var qs = showBoundaries ? "?show_boundaries=1" : "";
+    return fetch("/api/cells/" + encodeURIComponent(fovId) + qs, {
       headers: { Accept: "application/json" },
     }).then(function (r) {
       if (!r.ok) {
@@ -104,10 +106,17 @@
   function postGesture(gesture) {
     if (!state.fovId) { return Promise.resolve(); }
     say("working…");
+    // show_boundaries rides along so the response's re-serialized state
+    // matches the geometry already on screen — see cells_api.py's gesture
+    // route, which re-fetches with this rather than trusting the gesture's
+    // own (always disk-geometry) reload.
+    var payload = {};
+    for (var key in gesture) { if (gesture.hasOwnProperty(key)) { payload[key] = gesture[key]; } }
+    payload.show_boundaries = state.showBoundaries;
     return fetch("/api/cells/" + encodeURIComponent(state.fovId) + "/gesture", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(gesture),
+      body: JSON.stringify(payload),
     }).then(function (r) {
       return r.json().catch(function () { return {}; });
     }).then(function (body) {
@@ -608,20 +617,28 @@
 
     state.showNumbers = config.show_numbers !== false;
     state.editOn = !!config.edit_on;
+    var showBoundaries = !!config.show_boundaries;
 
     if (!config.fov_id) {
       destroy();
       state.fovId = null;
+      state.showBoundaries = showBoundaries;
       root.innerHTML = "";
       return;
     }
 
-    // Selection and the two switches never rebuild anything: repainting the
-    // sheet for them is what used to throw the zoom away.
+    // Selection and the display switches never rebuild anything: repainting
+    // the sheet for them is what used to throw the zoom away.
     if (config.fov_id === state.fovId && state.panels.length) {
       if (config.selected_gcid !== undefined
           && config.selected_gcid !== state.selected) {
         state.selected = config.selected_gcid || null;
+      }
+      if (showBoundaries !== state.showBoundaries) {
+        // A geometry-track change needs fresh contours from the server, but
+        // still no viewer teardown — same contract as a gesture's response.
+        reloadGeometry(config.fov_id, showBoundaries);
+        return;
       }
       restyle();
       return;
@@ -630,12 +647,13 @@
     destroy();
     state.fovId = config.fov_id;
     state.selected = config.selected_gcid || null;
+    state.showBoundaries = showBoundaries;
     state.focusIndex = null;
     var generation = state.generation;
 
     root.innerHTML = '<div class="text-muted small p-3">Loading sessions…</div>';
 
-    Promise.all([ensureOSD(), fetchState(config.fov_id)])
+    Promise.all([ensureOSD(), fetchState(config.fov_id, showBoundaries)])
       .then(function (results) {
         if (generation !== state.generation || state.fovId !== config.fov_id) {
           return;   // a different FOV was picked while this was in flight
@@ -650,6 +668,27 @@
         alert.className = "alert alert-danger";
         alert.textContent = "Could not load this FOV's sessions: " + err.message;
         root.appendChild(alert);
+      });
+  }
+
+  function reloadGeometry(fovId, showBoundaries) {
+    var generation = state.generation;
+    state.showBoundaries = showBoundaries;
+    fetchState(fovId, showBoundaries)
+      .then(function (data) {
+        // A further toggle, a FOV change, or a destroy() could all have
+        // landed while this was in flight; only the most recent request's
+        // response is allowed to paint.
+        if (generation !== state.generation || state.fovId !== fovId
+            || state.showBoundaries !== showBoundaries) {
+          return;
+        }
+        state.data = data;
+        redrawOverlays();
+      })
+      .catch(function (err) {
+        if (generation !== state.generation || state.fovId !== fovId) { return; }
+        say("could not load boundaries: " + err.message);
       });
   }
 
