@@ -206,7 +206,13 @@ def seeded_labels(
     else:
         ws = np.zeros((height, width), dtype=np.int32)
 
-    # --- 3 + 4. cleanup, then fallback for anything left empty --------------
+    # --- 3. cleanup: decide each seed's region, painting nothing yet --------
+    #      Painting happens in the two passes below so a disk fallback can
+    #      never steal pixels a flow-derived neighbour already legitimately
+    #      owns — see the module docstring's "why step 2 is not just nearest
+    #      seed" for why flow-derived identity is the one that has real data
+    #      behind it and a disk is only ever a placeholder guess.
+    needs_fallback: list[int] = []
     for i, key in enumerate(ordered, start=1):
         region = ws == i
         if region.any():
@@ -225,16 +231,44 @@ def seeded_labels(
             npix = 0
 
         if npix == 0:
-            region = disk_mask(*seeds[key], fallback_radius, height, width)
-            origins[key] = ORIGIN_DISK_FALLBACK
+            needs_fallback.append(key)
         else:
             origins[key] = ORIGIN_FLOW
+            labels[region] = key
 
-        labels[region] = key
-        areas[key] = int(region.sum())
+    # --- 4. disk fallback, in two steps so no seed can ever end up with zero
+    #      pixels just because a neighbour's disk happened to paint later.
+    #
+    #      4a. reserve each fallback seed's own centre pixel first — this is
+    #      the floor no other seed's disk may ever take, painted below the
+    #      flow snapshot so a real flow boundary still wins the pixel if one
+    #      already claimed it (a disk is only ever a guess; a flow region is
+    #      measured).
+    flow_owned = labels.copy()
+    for key in needs_fallback:
+        y = min(max(int(round(seeds[key][0])), 0), height - 1)
+        x = min(max(int(round(seeds[key][1])), 0), width - 1)
+        if labels[y, x] == 0:
+            labels[y, x] = key
+    center_owner = labels.copy()
 
-    # A later label can overwrite an earlier one where two regions touch, so
+    #      4b. paint the full disks in ascending label order — later disks
+    #      may still overwrite an *earlier* disk's ordinary pixels, matching
+    #      the "later label wins" convention centroid_masks.py already
+    #      documents for canonical stamps — but never a flow pixel, and never
+    #      another seed's reserved centre, regardless of paint order.
+    for key in needs_fallback:
+        disk = disk_mask(*seeds[key], fallback_radius, height, width)
+        blocked = (flow_owned != 0) | ((center_owner != 0) & (center_owner != key))
+        labels[disk & ~blocked] = key
+        origins[key] = ORIGIN_DISK_FALLBACK
+
+    # A neighbour can still claim part of a fallback disk's non-floor area, so
     # re-read areas from the image rather than trusting the per-region counts.
+    # Only reachable now when a seed's own centre pixel is itself inside
+    # another seed's flow boundary — the one case the floor above cannot
+    # cover, since a measured boundary is deliberately never displaced by a
+    # guess.
     for key in ordered:
         areas[key] = int(np.count_nonzero(labels == key))
         if areas[key] == 0:

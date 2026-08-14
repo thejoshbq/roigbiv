@@ -84,6 +84,54 @@ def test_single_attractor_basin_splits_between_two_seeds():
 
 
 # --------------------------------------------------------------------------
+# Crowding: a nearby seed's disk fallback can never erase a neighbour
+# --------------------------------------------------------------------------
+
+def test_close_disk_fallback_never_erases_neighbor_flow_boundary():
+    """A seed with no basin of its own must not swallow a neighbour's real
+    flow boundary just because it sorts after it and its fallback disk
+    happens to overlap.
+    """
+    # sigma small enough that the basin itself (cellprob > 0.25) stays well
+    # short of empty_seed — otherwise empty_seed would sit inside the real
+    # basin and legitimately earn a flow origin, which is not what this test
+    # is exercising.
+    flow_seed, empty_seed = (64.0, 60.0), (64.0, 75.0)
+    cellprob = _gauss(*flow_seed, 6.0).astype(np.float32)
+    inds, converged = _basin(cellprob > 0.25, flow_seed)
+
+    solo = _call({1: flow_seed}, inds, converged, cellprob, fallback_radius=12)
+    out = _call({1: flow_seed, 2: empty_seed}, inds, converged, cellprob,
+                fallback_radius=12)
+
+    assert out.origins == {1: ORIGIN_FLOW, 2: ORIGIN_DISK_FALLBACK}
+    assert out.areas[1] == solo.areas[1]
+    assert out.areas[2] > 0
+    assert not any("fully overwritten" in w for w in out.warnings)
+
+
+def test_close_disk_fallbacks_split_without_erasing():
+    """Two seeds with no basin at all, close enough that their disks
+    overlap: the earlier label must keep at least its own centre pixel even
+    though the later label wins the contested area, matching
+    ``centroid_masks.py``'s documented "later label wins" convention.
+    """
+    seeds = {1: (64.0, 60.0), 2: (64.0, 66.0)}
+    cellprob = np.zeros((H, W), np.float32)
+    empty = np.zeros((2, 0), np.float32)
+
+    solo = _call({1: seeds[1]}, empty, empty, cellprob, fallback_radius=10)
+    out = _call(seeds, empty, empty, cellprob, fallback_radius=10)
+
+    assert out.n_disk_fallback == 2
+    assert out.areas[1] > 0 and out.areas[2] > 0
+    assert out.labels[64, 60] == 1        # label 1's own centre survives
+    # label 2 wins everything except the one pixel reserved as label 1's floor
+    assert out.areas[2] == solo.areas[1] - 1
+    assert not any("fully overwritten" in w for w in out.warnings)
+
+
+# --------------------------------------------------------------------------
 # Recall: a confirmed cell can never disappear
 # --------------------------------------------------------------------------
 
