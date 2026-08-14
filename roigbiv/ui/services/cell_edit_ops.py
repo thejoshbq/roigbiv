@@ -5,8 +5,8 @@ appended JSONL ops, replays them through
 :func:`roigbiv.registry.cell_edits.apply_tracking_edits`, and hands back the
 refreshed FOV. Pipeline output is never mutated; see ADR-0004.
 
-Why this is not in ``pages/cells.py``
-------------------------------------
+Why this is not in ``pages/tracking.py``
+----------------------------------------
 It has two callers: the Flask endpoint the browser posts to
 (:mod:`roigbiv.ui.routes.cells_api`) and its own tests. Neither wants Dash
 imported, and the endpoint cannot use a callback's seven-tuple return. Nothing

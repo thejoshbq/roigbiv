@@ -1,23 +1,36 @@
 """Dash app factory.
 
-Pages in a top nav:
+One page per operation, in the order the operations happen:
 
-* **Pipeline** — scan a workspace, set motion-correction params, run the
-  pipeline (currently scoped to Foundation only — see
-  ``roigbiv/ui/pages/process.py``).
-* **Track** — confirm the chronological order of a scanned workspace's
-  sessions, then register them as one cross-session timeline and review the
-  per-cell anomalies (``roigbiv/ui/pages/track.py``).
+1. **Motion correction** — parameters, a live view of the registration, and the
+   per-FOV quality metrics (``pages/motion.py``).
+2. **Centroids** — per-FOV Cellpose calibration and the detection run
+   (``pages/centroids.py``).
+3. **Tracking** — session order, cross-session registration, and the contact
+   sheet where cells are reviewed and corrected (``pages/tracking.py``).
+4. **Boundaries** — seeded cell outlines, and the one knob that tunes them
+   (``pages/boundaries.py``).
 
-The Review page (unified viewing + HITL corrections; ``roigbiv/ui/pages/
-review.py``) is currently unrouted while the UI is refocused on
-motion-correction optimization. Its code and the Flask ROI-editor routes are
-left in place (dormant, not deleted) for a future re-enable — just re-add it
-to ``PAGES`` and its ``/viewer`` redirect below.
+Each page owns its own run and nothing else. They used to be one 1400-line
+Pipeline page with a run-mode radio deciding which of four jobs its single Run
+button meant, which made "did motion correction finish" and "did detection
+work" the same question with the same answer.
 
-Registry browsing/maintenance lives in the ``roigbiv-registry`` CLI
-(``list``, ``show``, ``migrate``, ``backfill``, ...). The UI never needed
-to expose those — they're admin-grade operations.
+Two things are *not* per page, because every page needs them and none owns one:
+
+* the workspace scanner, a disclosure in the navbar
+  (``components/workspace_bar.py``);
+* the pipeline run status, since there is one runner behind one GPU gate
+  (``components/run_panel.py``).
+
+Both register their callbacks once, here — a page-level registration would give
+Dash duplicate Outputs on the same ids. Pages coordinate through
+``workspace_bar.WORKSPACE_VERSION`` rather than by writing into each other's
+controls.
+
+The Review page (unified viewing + HITL corrections; ``pages/review.py``) is
+unrouted and dormant, not deleted. Registry browsing/maintenance lives in the
+``roigbiv-registry`` CLI — admin-grade operations the UI never needed.
 
 State is held server-side in a single shared :class:`AppState` instance and
 mirrored to the client via ``dcc.Store`` only for the pieces the UI needs
@@ -36,11 +49,12 @@ from typing import Optional
 
 import dash
 import dash_bootstrap_components as dbc
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.ui.components import errors as error_components
+from roigbiv.ui.components import run_panel, workspace_bar
 from roigbiv.ui.logging import configure_ui_logging
-from roigbiv.ui.pages import cells, process, track
+from roigbiv.ui.pages import boundaries, centroids, motion, tracking
 from roigbiv.ui.pages.review import (
     MAIN_COL_ID,
     RIGHT_SIDEBAR_COL_ID,
@@ -65,10 +79,23 @@ THEME_TOGGLE_ID = "roigbiv-theme-toggle"
 THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
-    ("/pipeline", "Pipeline", process),
-    ("/track", "Track", track),
-    ("/cells", "Cells", cells),
+    ("/motion-correction", "Motion correction", motion),
+    ("/centroids", "Centroids", centroids),
+    ("/tracking", "Tracking", tracking),
+    ("/boundaries", "Boundaries", boundaries),
 )
+
+#: Paths that used to exist, and where their content went. ``/cells`` and
+#: ``/track`` are two halves of one page now; ``/registry`` was retired to the
+#: CLI. Bookmarks and half-remembered URLs are cheap to honour.
+_REDIRECTS = {
+    "/pipeline": "/motion-correction",
+    "/process": "/motion-correction",
+    "/registry": "/motion-correction",
+    "/track": "/tracking",
+    "/cells": "/tracking",
+    "/viewer": "/tracking",
+}
 
 
 _SESSION_TTL = 7200   # seconds before an idle session's state is evicted
@@ -125,7 +152,10 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     _start_session_cleanup()
     app.server.config["ROIGBIV_PRESET_WORKSPACE"] = preset_workspace
 
-    app.layout = _build_layout()
+    # A *callable* layout: Dash evaluates it per page load, inside a request
+    # context. The navbar now reports the session's workspace, which a layout
+    # built once at import time could not know about.
+    app.layout = _build_layout
     _wire_routes(app)
     from roigbiv.ui.routes.roi_editor import register_flask_routes
     register_flask_routes(app.server)
@@ -138,6 +168,10 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     _wire_sidebar_toggles(app)
     _wire_theme_toggle(app)
     error_components.register_callbacks(app)
+    # Registered once, not per page: both live outside the routed container and
+    # a second registration would be duplicate Outputs on the same ids.
+    workspace_bar.register_callbacks(app)
+    run_panel.register_callbacks(app)
     for _, _, page in PAGES:
         page.register_callbacks(app)
     return app
@@ -155,12 +189,6 @@ def _build_layout() -> html.Div:
         ], className="roigbiv-brand"),
         html.Div("// CALCIUM REGISTRY", className="roigbiv-brand-sub"),
     ], className="d-flex flex-column")
-    registry_indicator = html.Small(
-        _active_registry_label(),
-        id="roigbiv-active-registry",
-        className="text-muted ms-3",
-        title="Active registry DSN (change with `roigbiv-ui --workspace PATH`)",
-    )
     theme_toggle = dbc.Button(
         html.I(id=THEME_TOGGLE_ICON_ID, className="bi bi-sun-fill"),
         id=THEME_TOGGLE_ID,
@@ -172,53 +200,73 @@ def _build_layout() -> html.Div:
     navbar = dbc.Navbar(
         dbc.Container(
             [
-                dcc.Link(brand, href="/pipeline",
+                dcc.Link(brand, href=PAGES[0][0],
                          style={"textDecoration": "none", "color": "inherit"}),
-                registry_indicator,
+                html.Span(workspace_bar.toggle_button(), className="ms-3"),
                 dbc.Nav(nav_items, navbar=True, className="ms-auto"),
                 theme_toggle,
             ],
             fluid=True,
         ),
         sticky="top",
-        className="roigbiv-navbar mb-3",
+        className="roigbiv-navbar mb-2",
     )
     return html.Div([
         dcc.Location(id="roigbiv-url", refresh=False),
+        dcc.Location(id="roigbiv-redirect", refresh=False),
         # Default = "dark" (the lab uses ROIGBIV in a darkened scope room).
         # Persisted in localStorage so the choice survives reloads.
         dcc.Store(id=THEME_STORE_ID, storage_type="local", data="dark"),
+        workspace_bar.stores(),
         navbar,
+        dbc.Container([workspace_bar.collapse()], fluid=True),
         dbc.Container(id="roigbiv-page-content", fluid=True, className="pb-5"),
     ])
 
 
-def _active_registry_label() -> str:
-    """One-line initial registry indicator shown before a workspace is scanned."""
-    return "registry: scan a workspace to begin"
+def resolve_route(pathname: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """``(page_path, redirect_to)`` for a URL. Either may be ``None``.
+
+    ``redirect_to`` is set for a retired path, so the address bar can be
+    rewritten rather than the new page being served under the old URL — the
+    nav's ``active="exact"`` matching keys on the path, and a stale one would
+    leave every nav item unhighlighted.
+    """
+    if not pathname or pathname == "/":
+        return PAGES[0][0], PAGES[0][0]
+    path = pathname.rstrip("/") or "/"
+    if path in _REDIRECTS:
+        return _REDIRECTS[path], _REDIRECTS[path]
+    for page_path, _, _ in PAGES:
+        if path == page_path.rstrip("/"):
+            return page_path, None
+    return None, None
 
 
 def _wire_routes(app: dash.Dash) -> None:
+    _page_by_path = {path: page for path, _, page in PAGES}
+
     @app.callback(
         Output("roigbiv-page-content", "children"),
         Input("roigbiv-url", "pathname"),
     )
     def _render(pathname: str):  # noqa: ANN001
-        if not pathname or pathname == "/":
-            return process.layout()
-        # The Process page was renamed to Pipeline (/process → /pipeline);
-        # registry browsing was retired. Route both stragglers to the page.
-        if pathname.rstrip("/") in ("/process", "/registry"):
-            return process.layout()
-        for path, _, page in PAGES:
-            if pathname.rstrip("/") == path.rstrip("/"):
-                return page.layout()
-        # Review (and its old /viewer alias) is currently unrouted while the
-        # UI is refocused on motion-correction — falls through here.
-        return dbc.Alert(
-            f"Unknown page: {pathname}. Navigate via the top bar.",
-            color="warning",
-        )
+        page_path, _ = resolve_route(pathname)
+        if page_path is None:
+            return dbc.Alert(
+                f"Unknown page: {pathname}. Navigate via the top bar.",
+                color="warning")
+        return _page_by_path[page_path].layout()
+
+    @app.callback(
+        Output("roigbiv-redirect", "pathname"),
+        Input("roigbiv-url", "pathname"),
+    )
+    def _redirect(pathname: str):  # noqa: ANN001
+        # A second Location writes the URL; one component cannot be both the
+        # Input and the Output of the same callback.
+        _, target = resolve_route(pathname)
+        return target if target is not None else no_update
 
 
 def _wire_theme_toggle(app: dash.Dash) -> None:

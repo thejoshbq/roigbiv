@@ -29,6 +29,34 @@ cellpose:
   # Optional Cellpose3 image restoration before segmentation
   denoise: false
 
+# ── Seeded cell boundaries (ADR-0005) ────────────────────────────────────────
+# Drawn from confirmed centroids into boundaries.tif, alongside — not instead
+# of — the fixed-radius disks merged_masks.tif keeps for the registry.
+boundaries:
+  # Persist Cellpose's flow field under flows/ during centroid discovery so a
+  # HITL centroid edit can redraw boundaries without re-running inference.
+  # ~6 MB per 512x512 FOV. Off means boundaries fall back to the disk stamps.
+  centroid_persist_flows: true
+
+  # A flow trajectory converging farther than this from every confirmed
+  # centroid is not cell material. Deliberately uncapped, unlike the stamp
+  # radius: ROICaT's 36x36 ROI crop constrains what the *matcher* can read, and
+  # boundaries never go to the matcher.
+  #
+  # Setting it here overrides every FOV. Leave it null and the value resolves
+  # per FOV: whatever a human pinned on the Boundaries page (recorded in that
+  # FOV's boundaries.json "settings" block), else the calibrated soma radius,
+  # which is a measurement rather than a guess. Tune on the page, not here —
+  # a value here makes the page's slider inert.
+  boundary_capture_px: null
+
+  # Smallest seeded boundary to keep; below it the seed falls back to the
+  # canonical disk. Same per-FOV resolution as boundary_capture_px above.
+  boundary_min_area: null
+
+  # Largest seeded boundary to keep. null = unbounded. Config-level only.
+  boundary_max_area: null
+
 motion_correction:
   # Registration backend. CLI: --motion-correction {phasecorr|rowwise-pcc|legacy}.
   # "phasecorr" (default): Suite2p rigid + non-rigid registration via

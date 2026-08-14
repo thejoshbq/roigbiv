@@ -179,6 +179,21 @@ body::before {
 .roigbiv-theme-toggle {
     display: none !important;
 }
+/* Workspace disclosure: reads as status the whole time, and as a control on
+   hover. It is the only navbar item that is neither branding nor navigation. */
+.roigbiv-workspace-toggle {
+    font-family: var(--roigbiv-font-mono);
+    font-size: 0.78rem;
+    color: var(--roigbiv-text-secondary) !important;
+    border: 1px solid transparent;
+    border-radius: var(--roigbiv-radius);
+    padding: 0.15rem 0.6rem !important;
+    transition: color 0.2s, border-color 0.2s;
+}
+.roigbiv-workspace-toggle:hover {
+    color: var(--roigbiv-accent) !important;
+    border-color: rgba(0, 229, 255, 0.35);
+}
 
 /* ── Cards ─────────────────────────────────────────────────────────────── */
 .card {

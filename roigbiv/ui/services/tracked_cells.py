@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from roigbiv.registry.anomalies import CellTimeline
-from roigbiv.ui.services.loaders import ROIRender
+from roigbiv.ui.services.loaders import ROIRender, label_shapes
 
 # A cell that is *absent* from a session still gets an outline, drawn at the
 # position it last held. It owns no label in this session's mask, so it is
@@ -224,7 +224,7 @@ def _load_sessions(slots, records, cells, kept_positions) -> list[TrackedSession
         except (FileNotFoundError, ValueError):
             continue
 
-        shapes = _label_shapes(session_input.merged_masks)
+        shapes = label_shapes(_render_geometry(out_dir, session_input))
         rois: list[ROIRender] = []
         for label_id, (centroid, contours, area) in sorted(shapes.items()):
             cell = cell_by_label[i].get(label_id)
@@ -283,33 +283,25 @@ def _ghosts(cells, i: int, last_known: dict) -> list[ROIRender]:
     return out
 
 
-def _label_shapes(merged_masks: np.ndarray) -> dict[int, tuple]:
-    """``{label_id: (centroid_yx, contours, area)}`` for one label image.
+def _render_geometry(out_dir: Path, session_input) -> np.ndarray:
+    """The label image to draw this session from.
 
-    Contours are traced inside each label's padded bounding box rather than the
-    full frame: a 1024x1024 FOV with 17 ROIs would otherwise trace 17 full-size
-    arrays for a few hundred pixels of actual footprint.
+    ``boundaries.tif`` when it exists, ``merged_masks.tif`` otherwise. The two
+    carry the *same* label ids over the same effective centroids (see
+    ``roigbiv/pipeline/boundaries.py``), so swapping between them changes only
+    each cell's outline — never which cell a label resolves to, which is what
+    ``cell_by_label`` and every edit gesture on this page key on.
+
+    Shape is checked rather than assumed: a boundaries.tif left over from a
+    differently-sized run would otherwise silently misplace every contour.
     """
-    from scipy.ndimage import find_objects
-    from skimage.measure import find_contours
+    from roigbiv.pipeline.boundaries import load_boundary_labels
 
-    masks = np.asarray(merged_masks)
-    out: dict[int, tuple] = {}
-    for label_id, window in enumerate(find_objects(masks), start=1):
-        if window is None:
-            continue
-        y0, x0 = window[0].start, window[1].start
-        # Pad by one pixel so a footprint touching its own bbox edge still
-        # closes into a ring instead of being clipped open.
-        sub = np.pad((masks[window] == label_id).astype(float), 1)
-        ys, xs = np.nonzero(sub)
-        centroid = (float(ys.mean()) + y0 - 1.0, float(xs.mean()) + x0 - 1.0)
-        contours = [
-            ((ring[:, 0] + y0 - 1.0).tolist(), (ring[:, 1] + x0 - 1.0).tolist())
-            for ring in find_contours(sub, 0.5)
-        ]
-        out[int(label_id)] = (centroid, contours, int(ys.size))
-    return out
+    merged = np.asarray(session_input.merged_masks)
+    boundaries = load_boundary_labels(out_dir)
+    if boundaries is None or boundaries.shape != merged.shape:
+        return merged
+    return boundaries
 
 
 def _is_stale(output_dir: Path, session_id: str) -> bool:
@@ -399,6 +391,10 @@ def _fingerprint(fov_id: str, cfg) -> tuple:
         store.ensure_schema()
         for row in store.list_sessions(fov_id):
             parts.append(_mtime(Path(row.output_dir) / "merged_masks.tif"))
+            # boundaries.tif is what _render_geometry actually draws when it
+            # exists, so a redraw after a centroid edit has to invalidate here
+            # too — otherwise the page keeps serving the previous outlines.
+            parts.append(_mtime(Path(row.output_dir) / "boundaries.tif"))
     except Exception:  # noqa: BLE001 — an unreadable store simply won't cache
         return (None,)
     return tuple(parts)
