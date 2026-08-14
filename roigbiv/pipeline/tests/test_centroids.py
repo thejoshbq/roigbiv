@@ -41,13 +41,27 @@ def _two_masks(shape=(64, 64)):
 
 
 def _fake_cellpose(masks, probs):
+    """Stand-in for ``run_cellpose_flows``.
+
+    Discovery re-splits the label image through ``stage1._split_labels``, which
+    reads each ROI's probability back out of the cellprob map, so the map has
+    to carry the per-mask probabilities rather than being blank.
+    """
+    from roigbiv.pipeline.stage1 import CellposeFlows
+
     def _run(morph, ch2, cfg, *, max_S=None):
         _fake_cellpose.seen_cfg = cfg
         _fake_cellpose.seen_morph = morph
         label = np.zeros(morph.shape, dtype=np.uint16)
-        for i, m in enumerate(masks, start=1):
+        cellprob = np.zeros(morph.shape, dtype=np.float32)
+        for i, (m, p) in enumerate(zip(masks, probs), start=1):
             label[m] = i
-        return masks, probs, label, np.zeros(morph.shape, dtype=np.float32)
+            cellprob[m] = p
+        # A flow field that points nowhere: these tests cover discovery's own
+        # contract, and seeded boundaries have their own suite.
+        dP = np.zeros((2,) + morph.shape, dtype=np.float32)
+        return CellposeFlows(label_image=label, dP=dP, cellprob=cellprob,
+                             niter=200, dp_scale=5.0, diameter=12.0)
     return _run
 
 
@@ -82,13 +96,13 @@ def test_detects_on_mean_m_and_writes_expected_schema():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
         payload = json.loads(result.output_path.read_text())
         assert payload["source"] == "cellpose"
-        assert payload["schema"] == 4
+        assert payload["schema"] == 5
         assert payload["substrate_source"] == "mean_M"
         assert result.count == 2
 
@@ -119,7 +133,7 @@ def test_calibration_overrides_diameter_threshold_and_model():
                           cellpose_model="cyto3")
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -155,7 +169,7 @@ def test_detection_substrate_is_pinned_single_channel_undenoised():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -181,7 +195,7 @@ def test_uncalibrated_leaves_diameter_estimation_alone():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -205,7 +219,7 @@ def test_caller_config_is_not_mutated():
         cfg = _FakeCfg()
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             run_centroid_discovery(mc_tif, output_dir, cfg)
 
@@ -227,7 +241,7 @@ def test_activity_cross_check_annotates_without_rerunning_suite2p():
         _write_suite2p_stat(output_dir, "fovA", [(14, 14)])
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)), \
              patch("roigbiv.suite2p.run_suite2p_fov") as mock_runner:
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
@@ -252,7 +266,7 @@ def test_missing_suite2p_output_means_no_cross_check_not_failure():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -296,7 +310,7 @@ def test_falls_back_to_a_mean_projection_without_foundation_summaries():
         assert not (output_dir / "summary").exists()
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -324,7 +338,7 @@ def test_fallback_substrate_is_persisted_for_the_registry():
         tifffile.imwrite(mc_tif, stack)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             result = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -352,7 +366,7 @@ def test_foundation_mean_m_is_never_overwritten():
         before = mean_path.read_bytes()
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
 
@@ -371,7 +385,7 @@ def test_resumes_on_unchanged_params_and_recomputes_on_change():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)) as mock_cp:
             run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
             run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
@@ -399,7 +413,7 @@ def test_stale_schema_forces_recompute():
         _write_summary(output_dir)
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)) as mock_cp:
             run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
             payload = json.loads((output_dir / "centroids.json").read_text())
@@ -409,6 +423,137 @@ def test_stale_schema_forces_recompute():
 
         assert mock_cp.call_count == 2
     print("  [PASS] test_stale_schema_forces_recompute")
+
+
+def test_flow_cache_is_written_beside_the_centroids():
+    """Cellpose's flow field is persisted so boundaries can be redrawn cheaply.
+
+    Without the cache, every HITL centroid edit on the /cells page would have to
+    re-run inference before it could redraw a boundary.
+    """
+    from roigbiv.pipeline.centroids import load_flow_cache, run_centroid_discovery
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
+                   side_effect=_fake_cellpose(masks, probs)):
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+
+        flow_dir = output_dir / "flows"
+        assert (flow_dir / "dP.npy").exists()
+        assert (flow_dir / "cellprob.npy").exists()
+
+        params = json.loads((output_dir / "centroids.json").read_text())["params"]
+        cached = load_flow_cache(output_dir, params)
+        assert cached is not None
+        assert cached["dP"].shape == (2, 64, 64)
+        assert cached["cellprob"].shape == (64, 64)
+        assert cached["niter"] == 200
+    print("  [PASS] test_flow_cache_is_written_beside_the_centroids")
+
+
+def test_flow_cache_under_different_params_reads_as_absent():
+    """A field from other detection settings must never seed boundaries.
+
+    Staleness is the dangerous case: the boundaries would be drawn confidently
+    off a field that has nothing to do with the centroids seeding them.
+    """
+    from roigbiv.pipeline.centroids import load_flow_cache, run_centroid_discovery
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
+                   side_effect=_fake_cellpose(masks, probs)):
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+
+        params = json.loads((output_dir / "centroids.json").read_text())["params"]
+        assert load_flow_cache(output_dir, params) is not None
+        assert load_flow_cache(output_dir, {**params, "diameter_px": 99.0}) is None
+    print("  [PASS] test_flow_cache_under_different_params_reads_as_absent")
+
+
+def test_missing_flow_cache_forces_recompute():
+    """Resuming past a deleted flow cache would leave boundaries undrawable."""
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
+                   side_effect=_fake_cellpose(masks, probs)) as mock_cp:
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+            assert mock_cp.call_count == 1
+
+            (output_dir / "flows" / "meta.json").unlink()
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+            assert mock_cp.call_count == 2, (
+                "an unchanged centroids.json is not resumable without its flows")
+    print("  [PASS] test_missing_flow_cache_forces_recompute")
+
+
+def test_persist_flows_off_writes_no_cache_and_still_resumes():
+    """The opt-out is for disk-constrained batches; discovery itself is unchanged."""
+    from roigbiv.pipeline.centroids import run_centroid_discovery
+
+    class _NoFlowCfg(_FakeCfg):
+        centroid_persist_flows = False
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
+                   side_effect=_fake_cellpose(masks, probs)) as mock_cp:
+            result = run_centroid_discovery(mc_tif, output_dir, _NoFlowCfg())
+            assert not (output_dir / "flows" / "dP.npy").exists()
+            assert result.count == 2
+
+            run_centroid_discovery(mc_tif, output_dir, _NoFlowCfg())
+            assert mock_cp.call_count == 1, (
+                "opting out of flows must not also disable resume")
+    print("  [PASS] test_persist_flows_off_writes_no_cache_and_still_resumes")
+
+
+def test_clear_centroid_output_also_clears_the_flow_cache():
+    """A cleared detection must not leave its field behind for the next run."""
+    from roigbiv.pipeline.centroids import (
+        clear_centroid_output,
+        run_centroid_discovery,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        mc_tif = output_dir / "fovA_mc.tif"
+        mc_tif.touch()
+        _write_summary(output_dir)
+        masks, probs = _two_masks()
+
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
+                   side_effect=_fake_cellpose(masks, probs)):
+            run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
+
+        assert (output_dir / "flows" / "dP.npy").exists()
+        clear_centroid_output(output_dir, "fovA")
+        assert not (output_dir / "flows" / "dP.npy").exists()
+        assert not (output_dir / "centroids.json").exists()
+    print("  [PASS] test_clear_centroid_output_also_clears_the_flow_cache")
 
 
 def test_tissue_mask_is_opt_in():
@@ -427,7 +572,7 @@ def test_tissue_mask_is_opt_in():
         # _two_masks puts the second mask in the dark quadrant, outside tissue.
         masks, probs = _two_masks()
 
-        with patch("roigbiv.pipeline.stage1.run_cellpose_detection",
+        with patch("roigbiv.pipeline.stage1.run_cellpose_flows",
                    side_effect=_fake_cellpose(masks, probs)):
             off = run_centroid_discovery(mc_tif, output_dir, _FakeCfg())
             (output_dir / "centroids.json").unlink()
@@ -483,6 +628,11 @@ if __name__ == "__main__":
         test_foundation_mean_m_is_never_overwritten,
         test_resumes_on_unchanged_params_and_recomputes_on_change,
         test_stale_schema_forces_recompute,
+        test_flow_cache_is_written_beside_the_centroids,
+        test_flow_cache_under_different_params_reads_as_absent,
+        test_missing_flow_cache_forces_recompute,
+        test_persist_flows_off_writes_no_cache_and_still_resumes,
+        test_clear_centroid_output_also_clears_the_flow_cache,
         test_tissue_mask_is_opt_in,
         test_clear_centroid_output_leaves_foundation_suite2p_intact,
         test_clear_centroid_output_no_op_when_nothing_to_clear,

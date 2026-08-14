@@ -46,7 +46,12 @@ import numpy as np
 # Bumped whenever the centroids.json payload changes shape. Part of the
 # recompute key: an artifact written by an older schema is recomputed rather
 # than reused, so a stale pre-fix result can't survive an upgrade untouched.
-_SCHEMA = 4
+_SCHEMA = 5
+
+# Cellpose's flow field, cached beside centroids.json so seeded boundaries can
+# be redrawn on every HITL centroid edit without paying for inference again.
+# See roigbiv/pipeline/seeded_masks.py for what consumes it.
+_FLOW_DIR = "flows"
 
 # A Suite2p candidate this close to a Cellpose centroid counts as corroborating
 # it. One soma radius at the diameters this workflow sees (40-80 px).
@@ -251,6 +256,71 @@ def _centroids_from_masks(masks, probs, activity: Optional[np.ndarray]) -> list[
     return centroids
 
 
+def flow_cache_dir(output_dir: Path) -> Path:
+    """Where this FOV's cached Cellpose flow field lives."""
+    return Path(output_dir) / _FLOW_DIR
+
+
+def load_flow_cache(output_dir: Path, params: dict) -> Optional[dict]:
+    """The cached flow field, or ``None`` when absent or stale.
+
+    Staleness is the failure worth designing against: a flow field from
+    different detection parameters would draw confident boundaries that have
+    nothing to do with the centroids they are seeded by. The cache therefore
+    carries the same ``params``/``schema`` key ``centroids.json`` does, and a
+    mismatch is treated exactly like a missing cache.
+    """
+    flow_dir = flow_cache_dir(output_dir)
+    meta_path = flow_dir / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if meta.get("params") != params or meta.get("schema") != _SCHEMA:
+        return None
+
+    try:
+        dP = np.load(flow_dir / "dP.npy")
+        cellprob = np.load(flow_dir / "cellprob.npy")
+    except (OSError, ValueError):
+        return None
+
+    return {
+        "dP": dP,
+        "cellprob": cellprob,
+        "niter": int(meta.get("niter", 200)),
+        "dp_scale": float(meta.get("dp_scale", 5.0)),
+        "diameter": float(meta.get("diameter", 0.0)),
+    }
+
+
+def _write_flow_cache(output_dir: Path, flows, params: dict) -> None:
+    """Persist the flow field and the key it was computed under."""
+    flow_dir = flow_cache_dir(output_dir)
+    flow_dir.mkdir(parents=True, exist_ok=True)
+    np.save(flow_dir / "dP.npy", flows.dP.astype(np.float32))
+    np.save(flow_dir / "cellprob.npy", flows.cellprob.astype(np.float32))
+    (flow_dir / "meta.json").write_text(json.dumps({
+        "schema": _SCHEMA,
+        "params": params,
+        "niter": int(flows.niter),
+        "dp_scale": float(flows.dp_scale),
+        "diameter": float(flows.diameter),
+        "shape": list(flows.cellprob.shape),
+    }, indent=2))
+
+
+def clear_flow_cache(output_dir: Path) -> None:
+    """Remove a FOV's cached flow field. Safe when there is nothing to remove."""
+    flow_dir = flow_cache_dir(output_dir)
+    for name in ("dP.npy", "cellprob.npy", "meta.json"):
+        (flow_dir / name).unlink(missing_ok=True)
+    if flow_dir.is_dir() and not any(flow_dir.iterdir()):
+        flow_dir.rmdir()
+
+
 def run_centroid_discovery(
     mc_tif_path: Path,
     output_dir: Path,
@@ -266,7 +336,11 @@ def run_centroid_discovery(
     run with identical resolved parameters and schema is reused as-is.
     """
     from roigbiv.pipeline.calibration import load_calibration
-    from roigbiv.pipeline.stage1 import run_cellpose_detection
+    from roigbiv.pipeline.stage1 import (
+        _split_labels,
+        run_cellpose_detection,
+        run_cellpose_flows,
+    )
 
     mc_tif_path = Path(mc_tif_path)
     output_dir = Path(output_dir)
@@ -275,14 +349,20 @@ def run_centroid_discovery(
 
     calib = load_calibration(output_dir)
     params = _resolved_params(cfg, calib)
+    persist_flows = bool(getattr(cfg, "centroid_persist_flows", True))
 
     if output_path.exists():
         try:
             prior = json.loads(output_path.read_text())
         except json.JSONDecodeError:
             prior = None
+        # A resumable centroids.json is not enough on its own: the flow cache
+        # is a second artifact under the same key, and resuming past a missing
+        # one would leave boundaries permanently unable to be drawn.
+        flows_ready = (not persist_flows
+                       or load_flow_cache(output_dir, params) is not None)
         if (prior and prior.get("params") == params
-                and prior.get("schema") == _SCHEMA):
+                and prior.get("schema") == _SCHEMA and flows_ready):
             return CentroidResult(output_path=output_path,
                                   count=len(prior.get("centroids", [])))
 
@@ -315,8 +395,26 @@ def run_centroid_discovery(
         overrides["cellpose_model"] = params["cellpose_model"]
     det_cfg = _with_overrides(cfg, **overrides)
 
-    masks, probs, _labels, _cellprob = run_cellpose_detection(
-        substrate.morph, substrate.ch2, det_cfg, max_S=substrate.max_S)
+    # The cpsam sidecar hands labels back across a process boundary with no
+    # flow field, so it can produce centroids but never seeded boundaries.
+    # Detect anyway and leave the cache empty rather than failing the FOV.
+    has_flows = getattr(det_cfg, "stage1_backend", "cellpose3") != "cpsam_sidecar"
+    if has_flows:
+        flows = run_cellpose_flows(
+            substrate.morph, substrate.ch2, det_cfg, max_S=substrate.max_S)
+        masks, probs, _labels, _cellprob = _split_labels(
+            flows.label_image, flows.cellprob)
+    else:
+        flows = None
+        masks, probs, _labels, _cellprob = run_cellpose_detection(
+            substrate.morph, substrate.ch2, det_cfg, max_S=substrate.max_S)
+
+    if persist_flows and flows is not None:
+        _write_flow_cache(output_dir, flows, params)
+    else:
+        # Otherwise a cache from an earlier run would outlive the detection it
+        # belongs to and seed boundaries off a superseded field.
+        clear_flow_cache(output_dir)
 
     activity = _suite2p_candidates(output_dir, stem)
     centroids = _centroids_from_masks(masks, probs, activity)
@@ -369,3 +467,6 @@ def clear_centroid_output(output_dir: Path, stem: str) -> None:
     centroids_path = output_dir / "centroids.json"
     if centroids_path.exists():
         centroids_path.unlink()
+    # The flow cache is keyed to the detection this deletes; leaving it would
+    # let the next run resume onto a field for centroids that no longer exist.
+    clear_flow_cache(output_dir)

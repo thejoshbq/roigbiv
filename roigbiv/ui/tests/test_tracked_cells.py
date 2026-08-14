@@ -348,3 +348,115 @@ def test_invalidate_tracked_fov_does_not_touch_other_fovs(tracked):
 
     assert other_key in _cache
     del _cache[other_key]
+
+
+# ── which geometry the page draws ──────────────────────────────────────────
+
+
+def _write_boundaries(out_dir: Path, labels: dict[int, tuple[int, int]]) -> None:
+    """Seeded boundaries for the same labels, at a visibly different size.
+
+    Bigger than ``_write_session``'s 7x7 stamps so a test can tell which of the
+    two images was drawn without depending on their exact shapes.
+    """
+    masks = np.zeros((40, 40), dtype=np.uint16)
+    for label_id, (y, x) in labels.items():
+        masks[y - 5:y + 6, x - 5:x + 6] = label_id
+    tifffile.imwrite(str(out_dir / "boundaries.tif"), masks)
+
+
+def test_boundaries_are_off_by_default(tracked):
+    """The canonical disks load first, even when boundaries exist on disk.
+
+    ADR-0003's stamps are what the registry matched on; a reviewer should see
+    that geometry unless they ask for the other track.
+    """
+    cfg, fov_id, tmp_path, _gcids, _sids = tracked
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+
+    fov = load_tracked_fov(fov_id, cfg=cfg)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 7 * 7, "default view is the disk stamps, not boundaries.tif"
+
+
+def test_boundaries_are_drawn_when_requested(tracked):
+    """Seeded boundaries replace the canonical disks, opt-in.
+
+    ``merged_masks.tif`` stays what the registry matched on (ADR-0003); it is
+    only what the *viewer* renders that changes.
+    """
+    cfg, fov_id, tmp_path, _gcids, _sids = tracked
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+
+    fov = load_tracked_fov(fov_id, cfg=cfg, show_boundaries=True)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 11 * 11, "boundaries.tif should be the geometry source"
+    # A session without boundaries keeps the stamps.
+    other = {r.label_id: r.area for r in fov.sessions[1].rois if r.area}
+    assert other[1] == 7 * 7
+
+
+def test_label_to_cell_association_survives_the_geometry_swap(tracked):
+    """Both images carry the same label ids, so identity cannot shift."""
+    cfg, fov_id, tmp_path, gcids, _sids = tracked
+    before = load_tracked_fov(fov_id, cfg=cfg)
+    before_map = {r.label_id: r.global_cell_id for r in before.sessions[0].rois}
+
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+    after = load_tracked_fov(fov_id, cfg=cfg, show_boundaries=True)
+
+    after_map = {r.label_id: r.global_cell_id for r in after.sessions[0].rois}
+    assert after_map == before_map
+    assert after_map[1] == gcids["A"]
+
+
+def test_boundaries_of_the_wrong_shape_are_ignored(tracked):
+    """A leftover from a differently-sized run would misplace every contour."""
+    cfg, fov_id, tmp_path, *_ = tracked
+    tifffile.imwrite(str(tmp_path / STEMS[0] / "boundaries.tif"),
+                     np.zeros((20, 20), dtype=np.uint16))
+
+    fov = load_tracked_fov(fov_id, cfg=cfg, show_boundaries=True)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 7 * 7, "must fall back to merged_masks.tif"
+
+
+def test_redrawn_boundaries_invalidate_the_cache(tracked):
+    """A centroid edit redraws boundaries; the page must not serve the old ones."""
+    cfg, fov_id, tmp_path, *_ = tracked
+    load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=True)
+    assert len(_cache_keys(fov_id, cfg.dsn)) == 1
+
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+    fov = load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=True)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 11 * 11
+
+
+def test_each_geometry_caches_separately_and_does_not_cross_serve(tracked):
+    """A tab with boundaries on must never be handed the other tab's disks.
+
+    ``show_boundaries`` is part of the cache key precisely so this can't
+    happen — see ``load_tracked_fov_cached``'s docstring.
+    """
+    cfg, fov_id, tmp_path, *_ = tracked
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+
+    disks = load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=False)
+    boundaries = load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=True)
+
+    disk_areas = {r.label_id: r.area for r in disks.sessions[0].rois if r.area}
+    boundary_areas = {r.label_id: r.area
+                      for r in boundaries.sessions[0].rois if r.area}
+    assert disk_areas[1] == 7 * 7
+    assert boundary_areas[1] == 11 * 11
+    assert len(_cache_keys(fov_id, cfg.dsn)) == 2
+
+    # Re-fetching each is a cache hit, not a re-derivation of the other.
+    assert load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=False) is disks
+    assert (load_tracked_fov_cached(fov_id, cfg=cfg, show_boundaries=True)
+            is boundaries)

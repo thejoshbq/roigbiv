@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -335,28 +336,14 @@ def run_cellpose_detection(
     label_image      : (H, W) uint16 — labeled image (0 = background)
     cellprob_map     : (H, W) float32 — continuous cellpose probability map
     """
-    from cellpose.models import CellposeModel
-
-    if cfg.force_cpu:
-        gpu = False
-    elif not cuda_compute_capable():
-        print(
-            "  WARNING: CUDA device detected but compute probe failed "
-            "(sm/CC mismatch — PyTorch build lacks kernels for this GPU); "
-            "falling back to CPU for Cellpose.",
-            flush=True,
-        )
-        gpu = False
-    else:
-        gpu = True
-
-    # Channel-2 content selection (Phase 4 A/B; default vcorr_S = unchanged).
-    ch2, ch2_label = _resolve_stage1_ch2(vcorr_S, max_S, cfg)
-    if ch2_label != "vcorr_S":
-        print(f"  Stage-1 channel-2 source: {ch2_label}", flush=True)
-
-    backend = getattr(cfg, "stage1_backend", "cellpose3")
-    if backend == "cpsam_sidecar":
+    if getattr(cfg, "stage1_backend", "cellpose3") == "cpsam_sidecar":
+        # Kept here rather than in run_cellpose_flows: the sidecar hands back
+        # labels + cellprob across a process boundary and no flow field, so it
+        # can satisfy this contract but not that one.
+        gpu = _resolve_gpu(cfg)
+        ch2, ch2_label = _resolve_stage1_ch2(vcorr_S, max_S, cfg)
+        if ch2_label != "vcorr_S":
+            print(f"  Stage-1 channel-2 source: {ch2_label}", flush=True)
         # cpsam is channel-invariant + noise-robust: no denoise, 2-channel
         # stack ([morph, ch2]); the channels=(1,2) role convention is inert.
         morph = mean_S.astype(np.float32)
@@ -366,6 +353,82 @@ def run_cellpose_detection(
         label_image, cellprob_map = _run_cpsam_sidecar(x, eff, cfg, gpu)
         print(f"  cpsam inference in {time.time()-t0:.2f}s", flush=True)
         return _split_labels(label_image, cellprob_map)
+
+    result = run_cellpose_flows(mean_S, vcorr_S, cfg, max_S=max_S)
+    return _split_labels(result.label_image, result.cellprob)
+
+
+def _resolve_gpu(cfg: PipelineConfig) -> bool:
+    """Whether Cellpose should run on GPU for this config and this machine."""
+    if cfg.force_cpu:
+        return False
+    if not cuda_compute_capable():
+        print(
+            "  WARNING: CUDA device detected but compute probe failed "
+            "(sm/CC mismatch — PyTorch build lacks kernels for this GPU); "
+            "falling back to CPU for Cellpose.",
+            flush=True,
+        )
+        return False
+    return True
+
+
+@dataclass
+class CellposeFlows:
+    """One Cellpose inference, including the flow field it normally discards.
+
+    ``dP``/``cellprob`` are what Cellpose itself clusters into ``label_image``:
+    :func:`roigbiv.pipeline.seeded_masks.seeded_labels` re-runs that clustering
+    against confirmed centroids instead of the histogram peaks Cellpose uses,
+    which is only possible if the raw field survives the call.
+
+    ``niter`` and ``dp_scale`` are recorded rather than recomputed downstream
+    because both are derived from ``rescale``, which lives only inside
+    ``CellposeModel.eval`` — running dynamics with different values than the
+    inference used would converge pixels differently than the label image they
+    are being compared against.
+    """
+
+    label_image: np.ndarray   # (H, W) uint16 — Cellpose's own free-hand result
+    dP: np.ndarray            # (2, H, W) float32 — flow field
+    cellprob: np.ndarray      # (H, W) float32 — cell probability
+    niter: int
+    dp_scale: float
+    diameter: float
+
+
+def run_cellpose_flows(
+    mean_S: np.ndarray,
+    vcorr_S: np.ndarray,
+    cfg: PipelineConfig,
+    *,
+    max_S: Optional[np.ndarray] = None,
+) -> CellposeFlows:
+    """Run Cellpose inference and keep the flow field alongside the labels.
+
+    Identical inference to :func:`run_cellpose_detection` — which is now a thin
+    wrapper over this — so Stage 1's behavior is unchanged. The only difference
+    is what survives the return.
+    """
+    from cellpose.models import CellposeModel
+
+    gpu = _resolve_gpu(cfg)
+
+    # Channel-2 content selection (Phase 4 A/B; default vcorr_S = unchanged).
+    ch2, ch2_label = _resolve_stage1_ch2(vcorr_S, max_S, cfg)
+    if ch2_label != "vcorr_S":
+        print(f"  Stage-1 channel-2 source: {ch2_label}", flush=True)
+
+    backend = getattr(cfg, "stage1_backend", "cellpose3")
+    if backend == "cpsam_sidecar":
+        # The sidecar returns only labels + cellprob across the process
+        # boundary; there is no flow field to hand back. Raise rather than
+        # fabricate one — a caller that needs flows must know it didn't get
+        # them (boundaries.py degrades to disk stamps on this).
+        raise NotImplementedError(
+            "stage1_backend='cpsam_sidecar' returns no flow field; "
+            "seeded boundaries require the 'cellpose3' backend"
+        )
     if backend != "cellpose3":
         raise ValueError(
             f"unknown stage1_backend {backend!r} "
@@ -436,5 +499,30 @@ def run_cellpose_detection(
         # Fall back to a map where each ROI pixel has a constant prob = 1.0
         cellprob_map = (label_image > 0).astype(np.float32)
 
-    # Split labels into per-ROI boolean masks; extract per-ROI prob from centroid
-    return _split_labels(label_image, cellprob_map)
+    # flows[1] is dP, the (2, H, W) flow field Cellpose clustered into
+    # `label_image`. Cellpose discards it after mask formation; we keep it so
+    # seeded_labels can redo that clustering against confirmed centroids.
+    dP = np.zeros((2,) + label_image.shape, dtype=np.float32)
+    if isinstance(flows, (list, tuple)) and len(flows) >= 2:
+        candidate = np.asarray(flows[1], dtype=np.float32)
+        if candidate.shape == dP.shape:
+            dP = candidate
+
+    # Mirror CellposeModel.eval's own dynamics parameters. `rescale` is
+    # diam_mean/diameter, and eval computes niter under resample=True (its
+    # default) as (1/rescale)*200 — running dynamics with anything else would
+    # converge pixels differently than the label image we compare against.
+    rescale = model.diam_mean / float(effective_diameter)
+    niter = int(round((1.0 / rescale) * 200))
+
+    return CellposeFlows(
+        label_image=label_image,
+        dP=dP,
+        cellprob=cellprob_map,
+        niter=niter,
+        # cellpose.dynamics divides the flow field by 5.0 before following it
+        # (resize_and_compute_masks); the value is a constant in its source,
+        # carried here so the seeded path cannot drift from it silently.
+        dp_scale=5.0,
+        diameter=float(effective_diameter),
+    )

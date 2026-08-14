@@ -110,6 +110,7 @@ readers downstream (`ui/services/tracked_cells.py`'s label index, `anomalies.py`
 - `roigbiv/registry/cell_edits.py` — the match op log and `apply_tracking_edits`.
 - `roigbiv/registry/store/sqlalchemy_store.py::replace_observations`.
 - `roigbiv/pipeline/workspace.py::run_tracking`'s post-loop replay call.
-- `roigbiv/ui/pages/cells.py` — the `/cells` edit-mode UI this log design serves.
+- `roigbiv/ui/pages/tracking.py` — the edit-mode UI this log design serves (was
+  `pages/cells.py` at `/cells`; the review half now shares a page with the tracking run).
 - [ADR-0003](0003-centroid-canonical-roi-stamps.md) — the "HITL corrections are exempt"
   precedent this ADR extends from ROI polygons to centroids.

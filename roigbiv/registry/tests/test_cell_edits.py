@@ -379,3 +379,125 @@ def test_apply_tracking_edits_warns_when_an_observation_loses_its_centroid(
     report = apply_tracking_edits(fov_id, root, store)
 
     assert any("dropped" in w for w in report.warnings)
+
+
+# ── boundary redraw ────────────────────────────────────────────────────────
+#
+# The /cells sheet draws boundaries.tif in preference to the disks, so an edit
+# that re-stamps only the disks leaves the page showing geometry that
+# contradicts the centroids it was just told about.
+
+
+def _write_flow_cache(out_dir: Path, points: list) -> None:
+    """A flow field whose every cell pixel converges onto its nearest point.
+
+    Mirrors ``pipeline/tests/test_boundaries.py::_fixture`` — the shape cellpose
+    produces when it does *not* merge two cells.
+    """
+    H = W = 64
+    params = json.loads((out_dir / "centroids.json").read_text()).get("params")
+    yy, xx = np.mgrid[:H, :W].astype(np.float32)
+
+    cellprob = np.zeros((H, W), np.float32)
+    for cy, cx in points:
+        g = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * 7.0 ** 2))
+        cellprob = np.maximum(cellprob, g.astype(np.float32))
+    cellprob = cellprob * 4.0 - 2.0
+
+    best = np.full((H, W), np.inf, np.float32)
+    nearest = np.full((H, W), -1, np.int32)
+    for i, (cy, cx) in enumerate(points):
+        d = np.hypot(yy - cy, xx - cx)
+        take = d < best
+        best, nearest = np.where(take, d, best), np.where(take, i, nearest)
+    dy, dx = np.zeros((H, W), np.float32), np.zeros((H, W), np.float32)
+    for i, (cy, cx) in enumerate(points):
+        sel = nearest == i
+        dy[sel], dx[sel] = (cy - yy)[sel], (cx - xx)[sel]
+
+    flows = out_dir / "flows"
+    flows.mkdir(exist_ok=True)
+    np.save(flows / "dP.npy", np.stack([dy, dx]).astype(np.float32) * 5.0)
+    np.save(flows / "cellprob.npy", cellprob)
+    (flows / "meta.json").write_text(json.dumps({
+        "schema": 5, "params": params, "niter": 200,
+        "dp_scale": 5.0, "diameter": 20.0, "shape": [H, W],
+    }))
+
+
+@pytest.fixture
+def two_sessions_with_flows(two_sessions):
+    store, fov_id, root, stems, session_ids = two_sessions
+    for stem in stems:
+        _write_flow_cache(root / stem, [(10.0, 10.0), (40.0, 40.0)])
+    return two_sessions
+
+
+def test_an_added_centroid_gets_a_boundary(two_sessions_with_flows):
+    from roigbiv.pipeline.boundaries import load_boundary_labels
+
+    store, fov_id, root, stems, _ = two_sessions_with_flows
+    apply_tracking_edits(fov_id, root, store)
+    before = set(np.unique(load_boundary_labels(root / stems[0]))) - {0}
+
+    append_centroid_op(root / stems[0], CentroidOp.add(9, 40.0, 10.0))
+    apply_tracking_edits(fov_id, root, store)
+
+    after = set(np.unique(load_boundary_labels(root / stems[0]))) - {0}
+    assert 9 in after and after - before == {9}
+
+
+def test_a_deleted_centroid_loses_its_boundary(two_sessions_with_flows):
+    from roigbiv.pipeline.boundaries import load_boundary_labels
+
+    store, fov_id, root, stems, _ = two_sessions_with_flows
+    apply_tracking_edits(fov_id, root, store)
+    assert 1 in set(np.unique(load_boundary_labels(root / stems[0])))
+
+    append_centroid_op(root / stems[0], CentroidOp.delete(1))
+    apply_tracking_edits(fov_id, root, store)
+
+    assert 1 not in set(np.unique(load_boundary_labels(root / stems[0])))
+
+
+def test_boundaries_carry_the_same_label_ids_as_the_disks(
+        two_sessions_with_flows):
+    """What lets the registry stay ignorant that boundaries.tif exists."""
+    from roigbiv.pipeline.boundaries import load_boundary_labels
+
+    store, fov_id, root, stems, session_ids = two_sessions_with_flows
+    apply_tracking_edits(fov_id, root, store)
+
+    for stem, sid in zip(stems, session_ids):
+        drawn = set(np.unique(load_boundary_labels(root / stem))) - {0}
+        observed = {o.local_label_id
+                    for o in store.list_observations_for_session(sid)}
+        assert drawn == observed
+
+
+def test_a_boundary_failure_does_not_fail_the_edit(two_sessions_with_flows,
+                                                   monkeypatch):
+    """merged_masks.tif is what the registry matches on and is already correct."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("flow cache exploded")
+
+    monkeypatch.setattr("roigbiv.pipeline.boundaries.write_boundaries", _boom)
+
+    store, fov_id, root, stems, session_ids = two_sessions_with_flows
+    report = apply_tracking_edits(fov_id, root, store)
+
+    assert report.n_observations == 4
+    assert any("boundaries not redrawn" in w for w in report.warnings)
+    for sid in session_ids:
+        assert len(store.list_observations_for_session(sid)) == 2
+
+
+def test_a_session_without_a_flow_cache_keeps_its_disks(two_sessions):
+    """The behavior that shipped before boundaries existed."""
+    from roigbiv.pipeline.boundaries import load_boundary_labels
+
+    store, fov_id, root, stems, _ = two_sessions
+    report = apply_tracking_edits(fov_id, root, store)
+
+    assert report.warnings == []
+    assert load_boundary_labels(root / stems[0]) is None

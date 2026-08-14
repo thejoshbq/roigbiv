@@ -126,6 +126,31 @@ def _label_of(state, session_index, cell_index):
     return None
 
 
+def _write_boundaries(out_dir: Path, shape: tuple[int, int],
+                      labels: dict[int, tuple[float, float]]) -> None:
+    """A seeded-boundary label image, deliberately much bigger than the radius-8
+    disk stamps ``write_merged_masks`` draws — big enough that a test can tell
+    which geometry a response actually came from just from a contour's extent.
+    """
+    masks = np.zeros(shape, dtype=np.uint16)
+    for label_id, (y, x) in labels.items():
+        y, x = int(round(y)), int(round(x))
+        masks[max(y - 12, 0):y + 13, max(x - 12, 0):x + 13] = label_id
+    tifffile.imwrite(str(out_dir / "boundaries.tif"), masks)
+
+
+def _ring_width(roi: dict) -> float:
+    """The x-extent of an roi's contours — >24px for the fake boundary above,
+    well under it for a radius-8 disk."""
+    xs = [point[0] for ring in roi["contours"] for point in ring]
+    return max(xs) - min(xs) if xs else 0.0
+
+
+def _roi(state: dict, session_index: int, label_id: int) -> dict:
+    return next(r for r in state["sessions"][session_index]["rois"]
+               if r["label_id"] == label_id)
+
+
 # ── the wire format ────────────────────────────────────────────────────────
 
 
@@ -186,6 +211,40 @@ def test_the_caption_counts_what_the_panel_is_actually_drawing(client, workspace
 
 def test_an_unknown_fov_is_a_404_rather_than_a_stack_trace(client):
     assert client.get("/api/cells/not-a-fov").status_code == 404
+
+
+# ── which geometry the state draws ─────────────────────────────────────────
+
+
+def test_the_default_geometry_is_the_disk_stamps(client, workspace):
+    """No ``show_boundaries`` means the canonical disks — even when a
+    boundaries.tif exists on disk."""
+    out_dir = Path(workspace.tmp_path) / STEMS[0]
+    _write_boundaries(out_dir, (64, 64), {1: (20.0, 20.0), 2: (40.0, 40.0)})
+
+    state = _state(client, workspace)
+    assert _ring_width(_roi(state, 0, 1)) < 20, \
+        "default view must be the disk stamps, not boundaries.tif"
+
+
+def test_show_boundaries_query_param_switches_the_geometry(client, workspace):
+    out_dir = Path(workspace.tmp_path) / STEMS[0]
+    _write_boundaries(out_dir, (64, 64), {1: (20.0, 20.0), 2: (40.0, 40.0)})
+
+    resp = client.get(f"/api/cells/{workspace.fov_id}?show_boundaries=1")
+    assert resp.status_code == 200
+    state = resp.get_json()
+    assert _ring_width(_roi(state, 0, 1)) >= 20, \
+        "the query param must select boundaries.tif"
+
+
+def test_a_falsy_query_param_still_reads_as_disks(client, workspace):
+    out_dir = Path(workspace.tmp_path) / STEMS[0]
+    _write_boundaries(out_dir, (64, 64), {1: (20.0, 20.0), 2: (40.0, 40.0)})
+
+    resp = client.get(f"/api/cells/{workspace.fov_id}?show_boundaries=0")
+    state = resp.get_json()
+    assert _ring_width(_roi(state, 0, 1)) < 20
 
 
 def test_without_a_workspace_the_routes_say_so(client, workspace, monkeypatch):
@@ -367,6 +426,38 @@ def test_a_confirm_without_a_coordinate_is_a_bad_request(client, workspace):
     resp = _gesture(client, workspace,
                     {"kind": "confirm", "stem": STEMS[1], "selected_gcid": "x"})
     assert resp.status_code == 400
+
+
+def test_gesture_response_honours_show_boundaries(client, workspace):
+    """The gesture route's own reload always fetches the disk-geometry cache
+    entry (it has no notion of which track the caller is viewing) — the route
+    has to re-fetch under the request's own flag so the response matches what
+    the browser has on screen."""
+    out_dir = Path(workspace.tmp_path) / STEMS[0]
+    _write_boundaries(out_dir, (64, 64), {1: (20.0, 20.0), 2: (40.0, 40.0)})
+
+    # The edit lands in the other session so STEMS[0]'s boundaries.tif — and
+    # the label this asserts on — is untouched by the write itself.
+    body = _gesture(client, workspace, {
+        "kind": "add", "stem": STEMS[1], "y": 55.0, "x": 12.0,
+        "show_boundaries": True,
+    }).get_json()
+
+    assert body["ok"]
+    assert _ring_width(_roi(body["state"], 0, 1)) >= 20, \
+        "the gesture response must honour the request's show_boundaries"
+
+
+def test_gesture_response_defaults_to_disks_without_the_flag(client, workspace):
+    out_dir = Path(workspace.tmp_path) / STEMS[0]
+    _write_boundaries(out_dir, (64, 64), {1: (20.0, 20.0), 2: (40.0, 40.0)})
+
+    body = _gesture(client, workspace,
+                    {"kind": "add", "stem": STEMS[1], "y": 55.0, "x": 12.0}
+                    ).get_json()
+
+    assert body["ok"]
+    assert _ring_width(_roi(body["state"], 0, 1)) < 20
 
 
 def test_undo_reverses_the_last_edit(client, workspace):

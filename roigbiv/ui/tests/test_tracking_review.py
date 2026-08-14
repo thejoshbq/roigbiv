@@ -18,7 +18,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from roigbiv.ui.pages import cells
+from roigbiv.ui.pages import tracking as cells
 from roigbiv.ui.services.loaders import ROIRender
 from roigbiv.ui.services.registry_service import FOVRow
 from roigbiv.ui.services.tracked_cells import TrackedCell, TrackedFOV, TrackedSession
@@ -134,15 +134,23 @@ def callbacks():
 
 
 def _layout():
+    """The review half of the Tracking page.
+
+    Only that half: the setup half above it needs a real workspace to resolve a
+    session order from, and none of these cases is about session ordering.
+    ``tracking.layout()`` is what stitches the two together, and
+    ``test_tracking_setup.py`` covers the seam.
+    """
     with patch.object(cells, "get_app_state", return_value=_FakeState()), \
             patch.object(cells, "list_fovs", return_value=[]):
-        return cells.layout()
+        return cells._review_section()
 
 
 def test_layout_carries_the_stores_and_navigation_controls():
     assert {cells.SELECTED_ID, cells.VIEW_ID, cells.SHEET_ID, cells.STRIP_ID,
-            cells.LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
-            cells.DRAWER_ID, cells.RAIL_TOGGLE_ID} <= _ids(_layout())
+            cells.CELL_LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
+            cells.BOUNDARIES_ID, cells.DRAWER_ID,
+            cells.RAIL_TOGGLE_ID} <= _ids(_layout())
 
 
 def test_the_sheet_is_an_empty_mount_point_for_the_browser_to_fill():
@@ -204,6 +212,16 @@ def test_layout_carries_the_edit_controls():
             cells.EDIT_MSG_ID} <= _ids(_layout())
 
 
+def test_the_boundaries_switch_defaults_off():
+    """Disks are the canonical registry geometry (ADR-0003) and load first;
+    seeded boundaries (ADR-0005) are opt-in."""
+    with patch.object(cells, "get_app_state", return_value=_FakeState()), \
+            patch.object(cells, "list_fovs", return_value=[]):
+        switch = next(c for c in _walk(cells._toolbar())
+                     if getattr(c, "id", None) == cells.BOUNDARIES_ID)
+    assert switch.value is False
+
+
 def test_there_is_no_mode_picker_left():
     """Editing is modeless: click selects, drag moves, right-click deletes,
     shift-click links. A mode radio was most of the click count the page was
@@ -237,10 +255,16 @@ def test_without_a_workspace_the_page_asks_for_a_scan():
         assert "Scan a workspace" in _text(cells._fov_picker())
 
 
-def test_with_no_tracked_fovs_the_page_points_at_the_track_page():
+def test_with_no_tracked_fovs_the_page_points_at_the_setup_above_it():
+    """The way out is now on this page, not on another one.
+
+    Tracking and review were two pages, so the empty state had to name the
+    other one. They are two halves of one page now, and the setup half is
+    directly above.
+    """
     with patch.object(cells, "get_app_state", return_value=_FakeState()), \
             patch.object(cells, "list_fovs", return_value=[]):
-        assert "Track page" in _text(cells._fov_picker())
+        assert "run tracking above" in _text(cells._fov_picker())
 
 
 def test_a_registry_failure_is_reported_rather_than_blanking():
@@ -398,7 +422,7 @@ def test_the_sheet_is_told_about_every_control_it_reacts_to(callbacks):
     render = callbacks["_clientside"][0]
     inputs = [dep.component_id for dep in render[2:]]
     assert inputs == [cells.FOV_ID, cells.SELECTED_ID, cells.NUMBERS_ID,
-                      cells.EDIT_ID]
+                      cells.EDIT_ID, cells.BOUNDARIES_ID]
 
 
 def test_selection_and_the_switches_never_go_through_the_server(callbacks):

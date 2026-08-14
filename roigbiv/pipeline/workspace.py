@@ -445,6 +445,8 @@ def run_tracking(
             log("  NOTE: masks come from a full pipeline cascade — centroid "
                 "edits do not apply here (real segmentation outranks them)")
 
+        _write_seeded_boundaries(out_dir, cfg, log)
+
         try:
             result.registry = _register_tracked_session(
                 entry, out_dir, reg_cfg, log, force_fov_id=timeline_fov_id)
@@ -458,6 +460,44 @@ def run_tracking(
     _replay_tracking_edits(results, workspace, reg_cfg, log)
     _log_tracking_summary(results, reg_cfg, log)
     return results
+
+
+def _write_seeded_boundaries(out_dir: Path, cfg, log: LogCallback) -> None:
+    """Redraw this FOV's seeded boundaries from its effective centroids.
+
+    Best-effort and never fatal: boundaries are what a human looks at on the
+    /cells page, while ``merged_masks.tif`` is what the registry matches on. A
+    FOV with no flow cache (discovery predates it, ran with
+    ``centroid_persist_flows=False``, or used the cpsam backend) simply keeps
+    the disk stamps, which is the behavior that shipped before this existed.
+    """
+    from roigbiv.pipeline.boundaries import write_boundaries
+
+    try:
+        drawn = write_boundaries(out_dir, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  WARNING: seeded boundaries failed — {type(exc).__name__}: {exc}")
+        return
+
+    if drawn is None:
+        log("  boundaries skipped — no cached flow field for this FOV "
+            "(re-run centroid discovery to enable seeded boundaries)")
+        return
+    if not drawn.written:
+        return
+
+    log(f"  {len(drawn.present_labels)} boundary/-ies drawn "
+        f"(capture {drawn.capture_px:.0f}px)")
+    if drawn.n_disk_fallback:
+        # Not an error — the seed is still represented — but a high rate means
+        # capture_px is mis-sized for this FOV, which is otherwise invisible.
+        log(f"  NOTE: {drawn.n_disk_fallback} of {drawn.n_seeds} centroid(s) "
+            f"captured no flow basin and fell back to a disk")
+    if drawn.n_orphan_basin_px:
+        log(f"  {drawn.n_orphan_basin_px} cell-probability pixel(s) belonged to "
+            f"no confirmed centroid and were dropped")
+    for warning in drawn.warnings:
+        log(f"  WARNING: boundary {warning}")
 
 
 def _replay_tracking_edits(

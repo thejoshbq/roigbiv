@@ -15,7 +15,7 @@ from unittest.mock import patch
 import numpy as np
 import tifffile
 
-from roigbiv.ui.pages import track
+from roigbiv.ui.pages import tracking as track
 
 PRISM = [
     "052126_DS-Prism-3_VI15_D2_FOV2_pre-005",
@@ -426,6 +426,12 @@ def test_saving_an_order_persists_it():
                     captured[fn.__name__] = fn
                     return fn
                 return deco
+
+            def clientside_callback(self, *a, **k):
+                # The merged page also wires the contact sheet's browser-side
+                # handoffs; nothing to capture, but the fake app has to accept
+                # them or registration stops before the server callbacks.
+                return None
 
         track.register_callbacks(_App())
         with patch.object(track, "get_app_state",

@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from roigbiv.registry.anomalies import CellTimeline
-from roigbiv.ui.services.loaders import ROIRender
+from roigbiv.ui.services.loaders import ROIRender, label_shapes
 
 # A cell that is *absent* from a session still gets an outline, drawn at the
 # position it last held. It owns no label in this session's mask, so it is
@@ -128,7 +128,7 @@ class TrackedFOV:
 # ── loading ────────────────────────────────────────────────────────────────
 
 
-def load_tracked_fov(fov_id: str, cfg=None) -> TrackedFOV:
+def load_tracked_fov(fov_id: str, cfg=None, show_boundaries: bool = False) -> TrackedFOV:
     """Assemble every session of *fov_id* with its cross-session cell identities.
 
     Sessions come back in timeline order (``store.list_sessions`` honours the
@@ -136,6 +136,10 @@ def load_tracked_fov(fov_id: str, cfg=None) -> TrackedFOV:
     and "dropped out" mean anything. Sessions whose output directory has gone
     missing are skipped rather than raising, matching
     :func:`~roigbiv.ui.services.loaders.load_cross_session_bundle`.
+
+    *show_boundaries* selects which geometry track draws each session's ROIs —
+    see :func:`_render_geometry`. Defaults to the disk stamps: ADR-0003's
+    canonical registry geometry, not the seeded boundary outlines.
     """
     from roigbiv.registry import build_store
     from roigbiv.registry.anomalies import cell_timeline
@@ -151,7 +155,7 @@ def load_tracked_fov(fov_id: str, cfg=None) -> TrackedFOV:
     kept_positions = [s.sequence_index for s in slots]
 
     cells = _number_cells(report.cells, kept_positions)
-    sessions = _load_sessions(slots, records, cells, kept_positions)
+    sessions = _load_sessions(slots, records, cells, kept_positions, show_boundaries)
 
     return TrackedFOV(
         fov_id=fov_id,
@@ -203,7 +207,8 @@ def _number_cells(timelines, kept_positions: list[int]) -> list[TrackedCell]:
     ]
 
 
-def _load_sessions(slots, records, cells, kept_positions) -> list[TrackedSession]:
+def _load_sessions(slots, records, cells, kept_positions,
+                   show_boundaries: bool = False) -> list[TrackedSession]:
     """Decode each session's masks and attach cross-session status per ROI."""
     from roigbiv.registry.roicat_adapter import load_session_input
 
@@ -224,7 +229,7 @@ def _load_sessions(slots, records, cells, kept_positions) -> list[TrackedSession
         except (FileNotFoundError, ValueError):
             continue
 
-        shapes = _label_shapes(session_input.merged_masks)
+        shapes = label_shapes(_render_geometry(out_dir, session_input, show_boundaries))
         rois: list[ROIRender] = []
         for label_id, (centroid, contours, area) in sorted(shapes.items()):
             cell = cell_by_label[i].get(label_id)
@@ -283,33 +288,32 @@ def _ghosts(cells, i: int, last_known: dict) -> list[ROIRender]:
     return out
 
 
-def _label_shapes(merged_masks: np.ndarray) -> dict[int, tuple]:
-    """``{label_id: (centroid_yx, contours, area)}`` for one label image.
+def _render_geometry(out_dir: Path, session_input,
+                     show_boundaries: bool = False) -> np.ndarray:
+    """The label image to draw this session from.
 
-    Contours are traced inside each label's padded bounding box rather than the
-    full frame: a 1024x1024 FOV with 17 ROIs would otherwise trace 17 full-size
-    arrays for a few hundred pixels of actual footprint.
+    ``merged_masks.tif`` (the disk stamps) by default — ADR-0003's canonical
+    registry geometry, and what a reviewer expects to see first. Only when
+    *show_boundaries* is set does this reach for ``boundaries.tif``, the
+    seeded segmentation. The two carry the *same* label ids over the same
+    effective centroids (see ``roigbiv/pipeline/boundaries.py``), so switching
+    between them changes only each cell's outline — never which cell a label
+    resolves to, which is what ``cell_by_label`` and every edit gesture on
+    this page key on.
+
+    Shape is checked rather than assumed: a boundaries.tif left over from a
+    differently-sized run would otherwise silently misplace every contour.
     """
-    from scipy.ndimage import find_objects
-    from skimage.measure import find_contours
+    merged = np.asarray(session_input.merged_masks)
+    if not show_boundaries:
+        return merged
 
-    masks = np.asarray(merged_masks)
-    out: dict[int, tuple] = {}
-    for label_id, window in enumerate(find_objects(masks), start=1):
-        if window is None:
-            continue
-        y0, x0 = window[0].start, window[1].start
-        # Pad by one pixel so a footprint touching its own bbox edge still
-        # closes into a ring instead of being clipped open.
-        sub = np.pad((masks[window] == label_id).astype(float), 1)
-        ys, xs = np.nonzero(sub)
-        centroid = (float(ys.mean()) + y0 - 1.0, float(xs.mean()) + x0 - 1.0)
-        contours = [
-            ((ring[:, 0] + y0 - 1.0).tolist(), (ring[:, 1] + x0 - 1.0).tolist())
-            for ring in find_contours(sub, 0.5)
-        ]
-        out[int(label_id)] = (centroid, contours, int(ys.size))
-    return out
+    from roigbiv.pipeline.boundaries import load_boundary_labels
+
+    boundaries = load_boundary_labels(out_dir)
+    if boundaries is None or boundaries.shape != merged.shape:
+        return merged
+    return boundaries
 
 
 def _is_stale(output_dir: Path, session_id: str) -> bool:
@@ -336,7 +340,8 @@ _cache: dict[tuple, TrackedFOV] = {}
 _cache_lock = threading.Lock()
 
 
-def load_tracked_fov_cached(fov_id: str, cfg=None) -> TrackedFOV:
+def load_tracked_fov_cached(fov_id: str, cfg=None,
+                            show_boundaries: bool = False) -> TrackedFOV:
     """:func:`load_tracked_fov`, memoised until the registry or masks change.
 
     Every click on the /cells page needs the whole FOV again; re-tracing
@@ -344,26 +349,33 @@ def load_tracked_fov_cached(fov_id: str, cfg=None) -> TrackedFOV:
     broken. Invalidated by the registry DB's mtime plus each session's mask
     mtime, so a re-run or a re-ingest is picked up without a restart.
 
-    Only ever keeps *one* entry per ``(fov_id, dsn)``. Before instant-apply
-    edits, this cache only churned on a re-run, so an unbounded dict was
-    harmless. Under instant apply, every click writes a new mtime fingerprint
-    and adds another full ``TrackedFOV`` — traced contours for every
-    session — without ever dropping the one from before the click; a 30-edit
-    session would otherwise leak 30 of them.
+    ``show_boundaries`` is part of the cache key, not just an argument to
+    :func:`load_tracked_fov`: the two geometry tracks retrace different
+    contours, and without this a browser tab with boundaries on could be
+    handed the other tab's disks (or vice versa) purely because it lost the
+    race to populate the shared entry.
+
+    Keeps at most *two* entries per ``(fov_id, dsn)`` — one per geometry —
+    each capped to its latest fingerprint. Before instant-apply edits, this
+    cache only churned on a re-run, so an unbounded dict was harmless. Under
+    instant apply, every click writes a new mtime fingerprint and adds
+    another full ``TrackedFOV`` — traced contours for every session —
+    without ever dropping the one from before the click; a 30-edit session
+    would otherwise leak 30 of them.
     """
     dsn = getattr(cfg, "dsn", None)
-    key = (fov_id, dsn, _fingerprint(fov_id, cfg))
+    key = (fov_id, dsn, show_boundaries, _fingerprint(fov_id, cfg))
     cached = _cache.get(key)
     if cached is not None:
         return cached
-    loaded = load_tracked_fov(fov_id, cfg=cfg)
+    loaded = load_tracked_fov(fov_id, cfg=cfg, show_boundaries=show_boundaries)
     with _cache_lock:
-        _evict_other_fingerprints(fov_id, dsn, keep=key)
+        _evict_stale_fingerprints(fov_id, dsn, show_boundaries, keep=key)
         return _cache.setdefault(key, loaded)
 
 
 def invalidate_tracked_fov(fov_id: str, cfg=None) -> None:
-    """Drop every cached entry for ``(fov_id, this cfg's dsn)``.
+    """Drop every cached entry for ``(fov_id, this cfg's dsn)``, both geometries.
 
     ``apply_tracking_edits`` writes new masks and observations directly, and
     an edit's write and the next read can land inside the same mtime tick —
@@ -373,16 +385,22 @@ def invalidate_tracked_fov(fov_id: str, cfg=None) -> None:
     """
     dsn = getattr(cfg, "dsn", None)
     with _cache_lock:
-        _evict_other_fingerprints(fov_id, dsn, keep=None)
+        for stale_key in [k for k in _cache if k[0] == fov_id and k[1] == dsn]:
+            del _cache[stale_key]
 
 
-def _evict_other_fingerprints(fov_id: str, dsn, *, keep: Optional[tuple]) -> None:
-    """Remove every cached key for ``(fov_id, dsn)`` other than ``keep``.
+def _evict_stale_fingerprints(fov_id: str, dsn, show_boundaries: bool, *,
+                              keep: Optional[tuple]) -> None:
+    """Remove cached keys for ``(fov_id, dsn, show_boundaries)`` other than ``keep``.
 
-    Caller holds ``_cache_lock``.
+    Scoped to *this* geometry so refreshing one track's fingerprint does not
+    evict the other's still-current entry — that would make every toggle
+    between disks and boundaries pay a full reload. Caller holds
+    ``_cache_lock``.
     """
     for stale_key in [k for k in _cache
-                       if k[0] == fov_id and k[1] == dsn and k != keep]:
+                       if k[0] == fov_id and k[1] == dsn and k[2] == show_boundaries
+                       and k != keep]:
         del _cache[stale_key]
 
 
@@ -399,6 +417,10 @@ def _fingerprint(fov_id: str, cfg) -> tuple:
         store.ensure_schema()
         for row in store.list_sessions(fov_id):
             parts.append(_mtime(Path(row.output_dir) / "merged_masks.tif"))
+            # boundaries.tif is what _render_geometry actually draws when it
+            # exists, so a redraw after a centroid edit has to invalidate here
+            # too — otherwise the page keeps serving the previous outlines.
+            parts.append(_mtime(Path(row.output_dir) / "boundaries.tif"))
     except Exception:  # noqa: BLE001 — an unreadable store simply won't cache
         return (None,)
     return tuple(parts)
