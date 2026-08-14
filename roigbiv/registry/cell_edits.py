@@ -289,6 +289,31 @@ class EditApplyReport:
     warnings: list
 
 
+def _redraw_boundaries(output_dir: Path, cfg) -> list[str]:
+    """Redraw this session's seeded boundaries, returning any warnings.
+
+    The ``/cells`` sheet draws ``boundaries.tif`` in preference to the disks
+    (``tracked_cells._render_geometry``), so leaving it alone here would let an
+    added cell have no outline and a deleted one keep its old one. Redrawing is
+    pure numpy off the cached flow field — no GPU, no cellpose import — so it
+    rides the gesture round-trip that already re-stamped the disks.
+
+    Never raises: ``merged_masks.tif`` is what the registry matches on and is
+    already correct by this point, so a boundary failure must not fail an edit.
+    A FOV with no flow cache simply keeps its disks, which is what shipped
+    before boundaries existed.
+    """
+    from roigbiv.pipeline.boundaries import write_boundaries
+
+    try:
+        drawn = write_boundaries(output_dir, cfg)
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        return [f"boundaries not redrawn — {type(exc).__name__}: {exc}"]
+    if drawn is None or not drawn.written:
+        return []
+    return [f"boundary {w}" for w in drawn.warnings]
+
+
 def apply_tracking_edits(
     fov_id: str, input_root: Path, store, cfg=None,
 ) -> EditApplyReport:
@@ -301,6 +326,10 @@ def apply_tracking_edits(
     existing one (the label was already assigned a cell) or from a
     deterministic new cell, then the match log adjusts correspondences on
     top. That's what makes an edit apply in well under a second.
+
+    Each session's seeded boundaries are redrawn alongside its disks — see
+    :func:`_redraw_boundaries` — so the two geometry tracks can never disagree
+    about which cells exist.
 
     Labels are restricted to what ``write_merged_masks`` actually stamped for
     each session — never to what the ops *asked* for. A ``move`` can bury one
@@ -339,6 +368,8 @@ def apply_tracking_edits(
             list(stamped.present_labels) if stamped.written
             else list(_present_labels_on_disk(Path(sess.output_dir)))
         )
+        warnings.extend(
+            f"{stem}: {w}" for w in _redraw_boundaries(Path(sess.output_dir), cfg))
 
     # Assignment restricted to present labels; existing observations are
     # reused so their gcid (and the human's prior link decisions) carries

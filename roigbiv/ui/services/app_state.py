@@ -111,6 +111,21 @@ def get_app_state() -> AppState:
     return inst
 
 
+def current_workspace() -> Optional[WorkspacePaths]:
+    """This session's workspace, or ``None`` outside a request context.
+
+    The navbar is built by a callable ``app.layout``, which Dash evaluates per
+    request — but the same helpers are called directly by tests and, on the
+    very first import, before any request exists. Raising there would make
+    "no workspace yet" indistinguishable from "no browser session yet", and
+    both render the same way.
+    """
+    try:
+        return get_app_state().workspace
+    except RuntimeError:
+        return None
+
+
 def _get_preset_workspace() -> Optional[WorkspacePaths]:
     try:
         from flask import current_app

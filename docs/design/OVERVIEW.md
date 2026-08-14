@@ -177,7 +177,7 @@ Gate 4. Every backend exports `{stem}_mc.tif`.
 
 While registration runs, `roigbiv/pipeline/mc_preview.py::MCPreviewWriter` streams a
 downsampled **raw/corrected pair of the same frame** — plus a raw running-average pane —
-into `{output_dir}/mc_preview/`, roughly 2.5× a second. The Dash Pipeline page renders it
+into `{output_dir}/mc_preview/`, roughly 2.5× a second. The Dash Motion-correction page renders it
 as a live view of the FOV being corrected; after the run the retained records are a
 scrubbable timeline, which is what makes an A/B of two backends on one FOV possible
 after the fact.
@@ -233,7 +233,7 @@ the timeline uniform across the whole run at a fixed footprint. Disable with
 
 Consumers: `roigbiv/ui/services/mc_preview.py` (reading helpers),
 `roigbiv/ui/routes/mc_preview.py` (`/api/mc-preview/{list,state,image}`), and the
-Pipeline page's live card.
+Motion-correction page's live card.
 
 ### 3.2 Truncated-SVD low-rank / sparse (L+S) background split
 

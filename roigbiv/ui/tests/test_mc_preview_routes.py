@@ -208,7 +208,7 @@ def _ids(component):
 
 
 def test_live_card_renders_above_the_existing_preview():
-    from roigbiv.ui.pages.process import _live_mc_section, _mc_preview_section
+    from roigbiv.ui.pages.motion import _live_mc_section, _mc_preview_section
 
     ids = _ids(_live_mc_section())
     for expected in ("roigbiv-mc-live-tick", "roigbiv-mc-live-raw",
@@ -222,7 +222,7 @@ def test_live_card_renders_above_the_existing_preview():
 
 
 def test_fast_interval_starts_disabled():
-    from roigbiv.ui.pages.process import _live_mc_section
+    from roigbiv.ui.pages.motion import _live_mc_section
 
     stack = [_live_mc_section()]
     while stack:
@@ -245,14 +245,14 @@ def test_fast_interval_starts_disabled():
     ("degraded", False), ("aborted", False), ("skipped_resume", False),
 ])
 def test_live_tick_stops_on_terminal_phases(phase, active):
-    from roigbiv.ui.pages.process import _live_tick_active
+    from roigbiv.ui.pages.motion import _live_tick_active
 
     assert _live_tick_active({"phase": phase}) is active
     assert _live_tick_active(None) is False
 
 
 def test_status_text_explains_a_skipped_run():
-    from roigbiv.ui.pages.process import _live_status_text
+    from roigbiv.ui.pages.motion import _live_status_text
 
     text = _live_status_text({"stem": "fovA", "backend": "phasecorr",
                               "phase": "skipped_precorrected"})
@@ -264,7 +264,7 @@ def test_status_text_explains_a_skipped_run():
 
 
 def test_crop_overlay_style_hides_without_data():
-    from roigbiv.ui.pages.process import _crop_overlay_style
+    from roigbiv.ui.pages.motion import _crop_overlay_style
 
     assert _crop_overlay_style(None)["display"] == "none"
     assert _crop_overlay_style({"valid_crop_frac": None})["display"] == "none"

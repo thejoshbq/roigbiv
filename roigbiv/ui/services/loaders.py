@@ -281,6 +281,35 @@ def _is_precorrected_input(tif: Path) -> bool:
 _DEFAULT_CENTROID_RADIUS = 8  # px — matches PipelineConfig.roi_stamp_radius default
 
 
+def label_shapes(merged_masks: np.ndarray) -> dict[int, tuple]:
+    """``{label_id: (centroid_yx, contours, area)}`` for one label image.
+
+    Contours are traced inside each label's padded bounding box rather than the
+    full frame: a 1024x1024 FOV with 17 ROIs would otherwise trace 17 full-size
+    arrays for a few hundred pixels of actual footprint.
+    """
+    from scipy.ndimage import find_objects
+    from skimage.measure import find_contours
+
+    masks = np.asarray(merged_masks)
+    out: dict[int, tuple] = {}
+    for label_id, window in enumerate(find_objects(masks), start=1):
+        if window is None:
+            continue
+        y0, x0 = window[0].start, window[1].start
+        # Pad by one pixel so a footprint touching its own bbox edge still
+        # closes into a ring instead of being clipped open.
+        sub = np.pad((masks[window] == label_id).astype(float), 1)
+        ys, xs = np.nonzero(sub)
+        centroid = (float(ys.mean()) + y0 - 1.0, float(xs.mean()) + x0 - 1.0)
+        contours = [
+            ((ring[:, 0] + y0 - 1.0).tolist(), (ring[:, 1] + x0 - 1.0).tolist())
+            for ring in find_contours(sub, 0.5)
+        ]
+        out[int(label_id)] = (centroid, contours, int(ys.size))
+    return out
+
+
 def load_centroids(
     output_dir: Path,
     shape: tuple[int, int],

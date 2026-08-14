@@ -123,7 +123,7 @@ def test_banner_error_wins_over_stopped():
     # must surface the failure, not mask it as a clean "Run stopped."
     import time
 
-    from roigbiv.ui.pages.process import _render_banner
+    from roigbiv.ui.components.run_panel import render_banner as _render_banner
     from roigbiv.ui.services.pipeline_runner import RunSnapshot
 
     snap = RunSnapshot(

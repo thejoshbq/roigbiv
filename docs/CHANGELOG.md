@@ -4,7 +4,95 @@ All notable changes to roigbiv are documented here.
 
 ## Unreleased
 
+### Changed
+
+- **One UI page per operation, in the order the operations happen.** The Dash app was
+  three pages, one of which (`pages/process.py`, 1412 lines) did four unrelated jobs —
+  workspace scanning, motion-correction parameters, a live registration view, and
+  Cellpose calibration — with a run-mode radio deciding which of them its single Run
+  button meant. Now: **Motion correction** → **Centroids** → **Tracking** →
+  **Boundaries**, each owning its own run and nothing else. `/pipeline`, `/process`,
+  `/registry`, `/track`, `/cells` and `/viewer` redirect to their successors.
+
+  Tracking and cell review merged onto one page (`pages/tracking.py`): session order,
+  the tracking run and the anomaly report sit in a collapse that opens itself only when
+  the workspace has nothing tracked yet, with the contact sheet at full width below.
+  Split across two pages they were a loop with a navigation step in the middle.
+
+  Two things every page needs and none owns moved out: the **workspace scanner** is now
+  a disclosure in the navbar (`components/workspace_bar.py`), so no page's empty state
+  has to name a different page; and the **run status** is a shared panel
+  (`components/run_panel.py`), since there is one runner behind one GPU gate. Both
+  register their callbacks once, in `build_app`. Pages coordinate through a
+  `roigbiv-workspace-version` counter rather than writing into each other's controls —
+  the scan callback used to set another concern's `disabled` and `options` directly,
+  which only worked while all of them lived on the same page.
+
+  The banner now names which run is active ("Running centroid discovery · Stage 1"), and
+  the per-FOV results table drops columns the run did not produce, so a centroids-only
+  run no longer shows four em-dashed motion-correction metrics that read as failure.
+
+  **Removed:** the `mc` / `centroids` / `both` run-mode radio. A fresh workspace now
+  takes two runs where "both" took one — accepted deliberately, since motion correction
+  is the hours-long half and the split is what makes "did motion correction finish" and
+  "did detection work" separately answerable.
+
 ### Added
+
+- **A Boundaries page.** `boundary_capture_px` is the one real tuning knob seeded
+  boundaries have and had no surface at all. The page draws a FOV's seeded outlines over
+  its mean projection and recomputes them live as `capture_px` / `min_area` move, which
+  is only possible because the expensive half of the computation — Cellpose's pixel
+  dynamics, ~0.5–2 s on CPU at 512² — does not depend on either and is cached per FOV
+  (`ui/services/boundary_preview.py`). Seeds, disk fallbacks and orphan pixels are
+  reported next to the picture, along with the disk area each boundary replaces: a high
+  fallback rate means the detector never fired there, which `capture_px` cannot fix
+  (measured: sweeping it 6 → 45 px moved the fallback count only 419 → 393), and a page
+  showing only outlines would make a detection problem look like a tuning problem.
+
+  Saving writes `boundaries.tif` and pins the settings into a `settings` block in
+  `boundaries.json`, which later automatic redraws read back — so a tuned FOV stays
+  tuned, while a FOV nobody tuned keeps tracking its calibration.
+
+- **Boundaries follow centroid edits.** `apply_tracking_edits` now redraws each
+  session's `boundaries.tif` alongside re-stamping its disks. The `/cells` sheet draws
+  boundaries in preference to disks, so without this an added cell had no outline and a
+  deleted one kept its old one. The redraw is pure numpy off the cached flow field and
+  is guarded — `merged_masks.tif` is what the registry matches on and is already correct
+  by that point, so a boundary failure records a warning rather than failing the edit.
+
+- **Seeded cell boundaries from confirmed centroids.** Since ADR-0003 the project has
+  had no real cell boundary anywhere: `merged_masks.tif` stamps fixed-radius disks, and
+  centroid discovery computed Cellpose's masks only to throw everything away but their
+  centre of mass. `/cells` now renders a real boundary per confirmed cell, written to a
+  new `boundaries.tif` (+ `boundaries.json`) alongside — not instead of — the disks the
+  registry matches on. Both carry the same label ids over the same effective centroids,
+  so `CellObservation.local_label_id` resolves in either and the registry needed no
+  change.
+
+  The boundary is Cellpose's own flow field, re-clustered against the confirmed
+  centroids instead of its histogram peaks (`roigbiv/pipeline/seeded_masks.py`): the
+  flow decides which pixels are cell material, a watershed seeded on the centroids
+  decides which cell each one belongs to, and a seed that captures no basin falls back
+  to the canonical disk so a confirmed cell can never disappear. The two-step split
+  matters — where Cellpose merges two touching somata its flow field has a single
+  attractor equidistant from both, so a nearest-seed rule assigns nothing; the watershed
+  recovers both cells. Centroid discovery now caches `dP`/`cellprob` under `flows/` on
+  the same recompute key `centroids.json` uses, so a HITL centroid edit redraws
+  boundaries without re-running inference.
+
+  Measured against 782 hand-drawn ImageJ somata across 5 cranial-window FOVs
+  (`scripts/boundary_bakeoff/`): on the cells where a flow field exists, seeded
+  boundaries score mean IoU 0.668 against fixed disks' 0.640, while recall stays at
+  0.977 versus free Cellpose's 0.143 on the same data. The win is small because these
+  somata are near-circular at ~18 px and a disk is already close to ideal; the prism
+  FOVs this was built for have no boundary ground truth yet. See
+  `docs/adr/0005-seeded-boundaries-parallel-geometry-track.md` for the full numbers and
+  the traps in reading them.
+
+  New config: `centroid_persist_flows` (default on, ~6 MB/FOV at 512²),
+  `boundary_capture_px`, `boundary_min_area`, `boundary_max_area`.
+  `centroids.json` schema 4 → 5.
 
 - **Cross-session tracking HITL controls.** The `/cells` page gained an edit mode
   (off by default) for the errors that were previously visible but unfixable there: a

@@ -348,3 +348,75 @@ def test_invalidate_tracked_fov_does_not_touch_other_fovs(tracked):
 
     assert other_key in _cache
     del _cache[other_key]
+
+
+# ── which geometry the page draws ──────────────────────────────────────────
+
+
+def _write_boundaries(out_dir: Path, labels: dict[int, tuple[int, int]]) -> None:
+    """Seeded boundaries for the same labels, at a visibly different size.
+
+    Bigger than ``_write_session``'s 7x7 stamps so a test can tell which of the
+    two images was drawn without depending on their exact shapes.
+    """
+    masks = np.zeros((40, 40), dtype=np.uint16)
+    for label_id, (y, x) in labels.items():
+        masks[y - 5:y + 6, x - 5:x + 6] = label_id
+    tifffile.imwrite(str(out_dir / "boundaries.tif"), masks)
+
+
+def test_boundaries_are_drawn_when_present(tracked):
+    """Seeded boundaries replace the canonical disks on this page.
+
+    ``merged_masks.tif`` stays what the registry matched on (ADR-0003); it is
+    only what the *viewer* renders that changes.
+    """
+    cfg, fov_id, tmp_path, _gcids, _sids = tracked
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+
+    fov = load_tracked_fov(fov_id, cfg=cfg)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 11 * 11, "boundaries.tif should be the geometry source"
+    # A session without boundaries keeps the stamps.
+    other = {r.label_id: r.area for r in fov.sessions[1].rois if r.area}
+    assert other[1] == 7 * 7
+
+
+def test_label_to_cell_association_survives_the_geometry_swap(tracked):
+    """Both images carry the same label ids, so identity cannot shift."""
+    cfg, fov_id, tmp_path, gcids, _sids = tracked
+    before = load_tracked_fov(fov_id, cfg=cfg)
+    before_map = {r.label_id: r.global_cell_id for r in before.sessions[0].rois}
+
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+    after = load_tracked_fov(fov_id, cfg=cfg)
+
+    after_map = {r.label_id: r.global_cell_id for r in after.sessions[0].rois}
+    assert after_map == before_map
+    assert after_map[1] == gcids["A"]
+
+
+def test_boundaries_of_the_wrong_shape_are_ignored(tracked):
+    """A leftover from a differently-sized run would misplace every contour."""
+    cfg, fov_id, tmp_path, *_ = tracked
+    tifffile.imwrite(str(tmp_path / STEMS[0] / "boundaries.tif"),
+                     np.zeros((20, 20), dtype=np.uint16))
+
+    fov = load_tracked_fov(fov_id, cfg=cfg)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 7 * 7, "must fall back to merged_masks.tif"
+
+
+def test_redrawn_boundaries_invalidate_the_cache(tracked):
+    """A centroid edit redraws boundaries; the page must not serve the old ones."""
+    cfg, fov_id, tmp_path, *_ = tracked
+    load_tracked_fov_cached(fov_id, cfg=cfg)
+    assert len(_cache_keys(fov_id, cfg.dsn)) == 1
+
+    _write_boundaries(tmp_path / STEMS[0], SESSION_LABELS[0])
+    fov = load_tracked_fov_cached(fov_id, cfg=cfg)
+
+    areas = {r.label_id: r.area for r in fov.sessions[0].rois if r.area}
+    assert areas[1] == 11 * 11
