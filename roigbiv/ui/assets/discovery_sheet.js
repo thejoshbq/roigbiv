@@ -33,6 +33,7 @@
   var state = {
     stem: null,
     editOn: false,
+    editBoundaryOn: false,
     diameterPx: null,
     data: null,            // last /api/discovery/<stem> payload
     boundaries: null,      // last {contours: {label: {origin, rings}}} payload
@@ -40,8 +41,10 @@
     svg: null,
     centroidGroup: null,
     boundaryGroup: null,
+    drawGroup: null,       // in-progress hand-drawn ring, boundary-edit mode
     calibCircle: null,
     shapes: {},
+    draw: null,             // {label, points: [[y, x], ...]} while drawing
     generation: 0,          // bumped on every rebuild; stale async work checks it
     osdPromise: null,
   };
@@ -66,9 +69,20 @@
       "  stroke-dasharray: 4 3; }",
       ".roigbiv-discovery-boundary { fill: none; stroke-width: 2px;",
       "  vector-effect: non-scaling-stroke; pointer-events: none; }",
+      ".roigbiv-discovery-boundaries.is-boundary-editing .roigbiv-discovery-boundary.is-manual {",
+      "  pointer-events: auto; cursor: pointer; }",
+      ".roigbiv-discovery-boundaries.is-boundary-editing .roigbiv-discovery-boundary.is-manual:hover {",
+      "  stroke-width: 3px; }",
+      ".roigbiv-discovery-centroids.is-boundary-editing .roigbiv-discovery-centroid {",
+      "  pointer-events: auto; cursor: cell; }",
+      ".roigbiv-discovery-draw-ring { fill: rgba(179,136,255,0.12); stroke: #B388FF;",
+      "  stroke-width: 2px; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke;",
+      "  pointer-events: none; }",
+      ".roigbiv-discovery-draw-vertex { fill: #B388FF; stroke: none; pointer-events: none; }",
       ".roigbiv-discovery-calib-circle { fill: none; stroke: #FFD400; stroke-width: 2px;",
       "  stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; pointer-events: none; }",
       ".roigbiv-discovery-sheet.is-editing .roigbiv-discovery-view { cursor: crosshair; }",
+      ".roigbiv-discovery-sheet.is-boundary-editing .roigbiv-discovery-view { cursor: cell; }",
     ].join("\n");
     document.head.appendChild(style);
   }
@@ -129,6 +143,10 @@
         state.data = body.state;
         drawCentroids();
       }
+      if (body.ok && body.boundaries) {
+        state.boundaries = body.boundaries;
+        drawBoundaries();
+      }
     }).catch(function (err) {
       say("edit failed: " + err.message);
     });
@@ -175,9 +193,26 @@
     // markers stop propagation on pointerdown, so anything OSD sees here
     // missed every marker. `quick` is OSD's own click/pan discrimination.
     viewer.addHandler("canvas-click", function (event) {
-      if (!event.quick || !state.editOn) { return; }
+      if (!event.quick) { return; }
       var point = viewer.viewport.viewerElementToImageCoordinates(event.position);
+      if (state.editBoundaryOn && state.draw) {
+        addDrawVertex(point.y, point.x);
+        return;
+      }
+      if (!state.editOn) { return; }
       postGesture({ kind: "add", y: point.y, x: point.x });
+    });
+
+    // Closes the in-progress ring. Also drops one last vertex at the
+    // double-click point first — harmless if a preceding single click already
+    // placed a near-identical one, and means the ring always ends where the
+    // pointer actually is.
+    viewer.addHandler("canvas-double-click", function (event) {
+      if (!state.editBoundaryOn || !state.draw) { return; }
+      event.preventDefaultAction = true;
+      var point = viewer.viewport.viewerElementToImageCoordinates(event.position);
+      state.draw.points.push([point.y, point.x]);
+      closeDrawRing();
     });
   }
 
@@ -205,12 +240,31 @@
     svg.appendChild(boundaryGroup);
     state.boundaryGroup = boundaryGroup;
 
+    var drawGroup = document.createElementNS(SVG_NS, "g");
+    drawGroup.setAttribute("class", "roigbiv-discovery-draw");
+    svg.appendChild(drawGroup);
+    state.drawGroup = drawGroup;
+
     var centroidGroup = document.createElementNS(SVG_NS, "g");
     centroidGroup.setAttribute("class", "roigbiv-discovery-centroids");
     svg.appendChild(centroidGroup);
     state.centroidGroup = centroidGroup;
 
+    applyEditModeClasses(root);
+  }
+
+  function applyEditModeClasses(root) {
     root.classList.toggle("is-editing", state.editOn);
+    root.classList.toggle("is-boundary-editing", state.editBoundaryOn);
+    if (state.centroidGroup) {
+      state.centroidGroup.classList.toggle("is-editing", state.editOn);
+      state.centroidGroup.classList.toggle(
+        "is-boundary-editing", state.editBoundaryOn);
+    }
+    if (state.boundaryGroup) {
+      state.boundaryGroup.classList.toggle(
+        "is-boundary-editing", state.editBoundaryOn);
+    }
   }
 
   // ── centroid layer (editable) ────────────────────────────────────────────
@@ -233,16 +287,25 @@
       group.appendChild(circle);
       state.shapes[c.label_id] = circle;
     });
-    group.classList.toggle("is-editing", state.editOn);
     var sheet = document.getElementById(SHEET_ID);
-    if (sheet) { sheet.classList.toggle("is-editing", state.editOn); }
+    if (sheet) { applyEditModeClasses(sheet); }
   }
 
   function wireCentroid(circle, c) {
     circle.addEventListener("pointerdown", function (event) {
-      if (event.button !== 0 || !state.editOn) { return; }
+      if (event.button !== 0) { return; }
       // OSD's MouseTracker sits on the canvas this overlay lives inside;
-      // without this it would pan the image under the drag.
+      // without this it would pan the image under the drag/click.
+      if (state.editBoundaryOn) {
+        event.stopPropagation();
+        event.preventDefault();
+        // A click on a centroid marker in boundary-edit mode always (re)starts
+        // a draw session for that label — "edit an existing boundary" is just
+        // drawing a new one, which fully replaces it (see boundary_edits.py).
+        startDrawForLabel(c);
+        return;
+      }
+      if (!state.editOn) { return; }
       event.stopPropagation();
       event.preventDefault();
       beginDrag(circle, c, event);
@@ -333,7 +396,7 @@
     state.calibCircle = circle;
   }
 
-  // ── boundary preview layer (read-only) ───────────────────────────────────
+  // ── boundary layer (preview; manual outlines are delete-able) ────────────
 
   function drawBoundaries() {
     var group = state.boundaryGroup;
@@ -343,13 +406,27 @@
     if (!payload || !payload.contours) { return; }
     Object.keys(payload.contours).forEach(function (label) {
       var entry = payload.contours[label] || {};
-      var color = entry.origin === "disk_fallback" ? "#FF7A45" : "#3FC1C9";
+      var isManual = entry.origin === "manual";
+      var color = isManual ? "#B388FF"
+        : entry.origin === "disk_fallback" ? "#FF7A45" : "#3FC1C9";
       (entry.rings || []).forEach(function (ring) {
         if (!ring.length) { return; }
         var path = document.createElementNS(SVG_NS, "path");
         path.setAttribute("d", ringPath(ring));
-        path.setAttribute("class", "roigbiv-discovery-boundary");
+        path.setAttribute("class", "roigbiv-discovery-boundary"
+          + (isManual ? " is-manual" : ""));
         path.setAttribute("stroke", color);
+        if (isManual) {
+          // Right-click a hand-drawn outline to revert that label to its
+          // auto-computed shape. CSS gates pointer-events to boundary-edit
+          // mode; this check is the same defense-in-depth wireCentroid uses.
+          path.addEventListener("contextmenu", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!state.editBoundaryOn) { return; }
+            postGesture({ kind: "delete_boundary", label: Number(label) });
+          });
+        }
         group.appendChild(path);
       });
     });
@@ -363,10 +440,94 @@
     return d + "Z";
   }
 
+  // ── boundary drawing (hand-drawn ring, boundary-edit mode) ───────────────
+  //
+  // A draw session names its target the moment it starts — clicking a
+  // centroid marker (wireCentroid) — so, like every other Discovery gesture,
+  // there is nothing to select first. click-to-place-vertex, double-click or
+  // Enter to close, Escape to cancel.
+
+  function startDrawForLabel(c) {
+    if (state.draw) { cancelDraw(); }
+    state.draw = { label: c.label_id, points: [[c.y, c.x]] };
+    document.addEventListener("keydown", onDrawKeydown);
+    renderDrawPreview();
+    say("drawing a boundary for cell " + c.label_id
+      + " — click to add points, double-click or Enter to close, Escape to cancel");
+  }
+
+  function addDrawVertex(y, x) {
+    if (!state.draw) { return; }
+    state.draw.points.push([y, x]);
+    renderDrawPreview();
+  }
+
+  function onDrawKeydown(event) {
+    if (!state.draw) { return; }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelDraw();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      closeDrawRing();
+    }
+  }
+
+  function cancelDraw() {
+    if (!state.draw) { return; }
+    state.draw = null;
+    document.removeEventListener("keydown", onDrawKeydown);
+    renderDrawPreview();
+    say("boundary draw cancelled");
+  }
+
+  function closeDrawRing() {
+    if (!state.draw) { return; }
+    document.removeEventListener("keydown", onDrawKeydown);
+    if (state.draw.points.length < 3) {
+      say("need at least 3 points to close a boundary — draw cancelled");
+      state.draw = null;
+      renderDrawPreview();
+      return;
+    }
+    var label = state.draw.label;
+    var ring = state.draw.points.slice();
+    state.draw = null;
+    renderDrawPreview();
+    postGesture({ kind: "draw_boundary", label: label, ring: ring });
+  }
+
+  function renderDrawPreview() {
+    var group = state.drawGroup;
+    if (!group) { return; }
+    while (group.firstChild) { group.removeChild(group.firstChild); }
+    if (!state.draw || !state.draw.points.length) { return; }
+
+    var points = state.draw.points;
+    var path = document.createElementNS(SVG_NS, "path");
+    var d = "";
+    for (var i = 0; i < points.length; i++) {
+      d += (i === 0 ? "M" : "L") + points[i][1] + " " + points[i][0];
+    }
+    path.setAttribute("d", d);
+    path.setAttribute("class", "roigbiv-discovery-draw-ring");
+    group.appendChild(path);
+
+    points.forEach(function (p) {
+      var dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("cx", p[1]);
+      dot.setAttribute("cy", p[0]);
+      dot.setAttribute("r", 2.5);
+      dot.setAttribute("class", "roigbiv-discovery-draw-vertex");
+      group.appendChild(dot);
+    });
+  }
+
   // ── entry points ──────────────────────────────────────────────────────────
 
   function destroy() {
     state.generation += 1;
+    cancelDraw();
     if (state.viewer) {
       try { state.viewer.destroy(); } catch (e) { /* already gone */ }
     }
@@ -374,6 +535,7 @@
     state.svg = null;
     state.centroidGroup = null;
     state.boundaryGroup = null;
+    state.drawGroup = null;
     state.calibCircle = null;
     state.shapes = {};
   }
@@ -384,8 +546,11 @@
     if (!root) { return; }
     config = config || {};
 
+    var boundaryEditWas = state.editBoundaryOn;
     state.editOn = !!config.edit_on;
+    state.editBoundaryOn = !!config.edit_boundary_on;
     state.diameterPx = config.diameter_px || null;
+    if (boundaryEditWas && !state.editBoundaryOn) { cancelDraw(); }
 
     if (!config.stem) {
       destroy();
@@ -402,6 +567,8 @@
     if (config.stem === state.stem && state.data) {
       drawCentroids();
       drawCalibrationCircle();
+      var sheet = document.getElementById(SHEET_ID);
+      if (sheet) { applyEditModeClasses(sheet); }
       return;
     }
 

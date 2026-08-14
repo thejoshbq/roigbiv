@@ -20,8 +20,13 @@ from roigbiv.pipeline.boundaries import (
     load_boundary_labels,
     write_boundaries,
 )
+from roigbiv.pipeline.boundary_edits import BoundaryOp, append_boundary_op
 from roigbiv.pipeline.centroid_edits import CentroidOp, append_centroid_op
-from roigbiv.pipeline.seeded_masks import ORIGIN_DISK_FALLBACK, ORIGIN_FLOW
+from roigbiv.pipeline.seeded_masks import (
+    ORIGIN_DISK_FALLBACK,
+    ORIGIN_FLOW,
+    ORIGIN_MANUAL,
+)
 
 H = W = 96
 _PARAMS = {"detector": "cellpose", "diameter_px": 20.0,
@@ -316,3 +321,120 @@ def test_an_unreadable_boundaries_json_falls_back_rather_than_raising():
 
         assert resolve_capture_px(out, _Resolved()) == pytest.approx(45.0)
         assert resolve_min_area(out, _Resolved()) == 0
+
+
+# ── manual boundary overrides (roigbiv/pipeline/boundary_edits.py) ──────────
+#
+# compute_boundaries/write_boundaries layer corrections/boundaries.jsonl over
+# seeded_labels' output as their last step — see boundaries.py's module
+# docstring. These tests exercise that wiring end to end, through the real
+# flow-field path.
+
+
+def _manual_ring() -> list:
+    """A small ring; real assertions compare against a from-scratch auto
+    computation rather than assuming which pixels it does or doesn't claim —
+    the fixture's synthetic flow field partitions almost the whole frame by
+    nearest centroid, so "far from everything" is not a real place here."""
+    return [[2.0, 2.0], [2.0, 12.0], [12.0, 12.0], [12.0, 2.0]]
+
+
+def test_a_drawn_boundary_overrides_the_auto_shape_for_that_label_only():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        centroids = [(30.0, 30.0), (30.0, 66.0)]
+        baseline = write_boundaries(_fixture(td / "auto", centroids), _Cfg())
+
+        out = _fixture(td / "manual", centroids)
+        append_boundary_op(out, BoundaryOp.draw(1, _manual_ring()))
+        result = write_boundaries(out, _Cfg())
+
+        assert result.origins[1] == ORIGIN_MANUAL
+        # Label 2 is untouched by an op that only names label 1.
+        assert result.origins[2] == baseline.origins[2]
+        assert result.areas[2] == baseline.areas[2]
+        # Label 1's manual footprint is the small hand-drawn ring, not the
+        # auto computation's (much larger, in this fixture) basin.
+        assert result.areas[1] != baseline.areas[1]
+        assert result.areas[1] < 200   # the ring is a 10x10 square
+        # boundaries.json reports the manual origin too.
+        payload = json.loads((out / "boundaries.json").read_text())
+        entry = next(e for e in payload["labels"] if e["label"] == 1)
+        assert entry["origin"] == ORIGIN_MANUAL
+
+
+def test_deleting_a_manual_boundary_reverts_to_the_current_auto_shape():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        centroids = [(30.0, 30.0), (30.0, 66.0)]
+        baseline = write_boundaries(_fixture(td / "auto", centroids), _Cfg())
+
+        out = _fixture(td / "manual", centroids)
+        append_boundary_op(out, BoundaryOp.draw(1, _manual_ring()))
+        drawn = write_boundaries(out, _Cfg())
+        assert drawn.origins[1] == ORIGIN_MANUAL
+        assert drawn.areas[1] != baseline.areas[1]
+
+        append_boundary_op(out, BoundaryOp.delete(1))
+        reverted = write_boundaries(out, _Cfg())
+
+        assert reverted.origins[1] == baseline.origins[1]
+        assert reverted.areas[1] == baseline.areas[1]
+        assert np.array_equal(load_boundary_labels(out) == 1,
+                              load_boundary_labels(td / "auto") == 1)
+
+
+def test_undo_by_truncating_the_boundary_log():
+    from roigbiv.pipeline.boundary_edits import load_boundary_ops, write_boundary_ops
+
+    with tempfile.TemporaryDirectory() as td:
+        out = _fixture(Path(td), [(30.0, 30.0)])
+        auto = write_boundaries(out, _Cfg())
+        auto_area = auto.areas[1]
+
+        append_boundary_op(out, BoundaryOp.draw(1, _manual_ring()))
+        drawn = write_boundaries(out, _Cfg())
+        assert drawn.origins[1] == ORIGIN_MANUAL
+        assert drawn.areas[1] != auto_area
+
+        ops = load_boundary_ops(out)
+        write_boundary_ops(out, ops[:-1])   # undo the draw
+        reverted = write_boundaries(out, _Cfg())
+
+        assert reverted.origins[1] == ORIGIN_FLOW
+        assert reverted.areas[1] == auto_area
+
+
+def test_a_manual_boundary_survives_a_min_area_change():
+    """The precedence rule end to end: retuning ``min_area`` must not touch
+    label 1's manual shape, while label 2 (no override) tracks the retune
+    normally — here, dropping below the bound and falling back to a disk."""
+    with tempfile.TemporaryDirectory() as td:
+        out = _fixture(Path(td), [(30.0, 30.0), (30.0, 66.0)])
+        append_boundary_op(out, BoundaryOp.draw(1, _manual_ring()))
+
+        loose = write_boundaries(out, _Cfg(), min_area=0)
+        assert loose.origins[2] == ORIGIN_FLOW
+
+        strict = write_boundaries(out, _Cfg(), min_area=loose.areas[2] + 500)
+
+        assert loose.origins[1] == strict.origins[1] == ORIGIN_MANUAL
+        assert loose.areas[1] == strict.areas[1], "the manual footprint must not move"
+        # Label 2 (no override) is free to change with the stricter bound.
+        assert strict.origins[2] == ORIGIN_DISK_FALLBACK
+        assert strict.areas[2] != loose.areas[2]
+
+
+def test_a_gesture_that_targets_a_nonexistent_label_still_replays_with_a_warning():
+    """boundary_edits.apply_boundary_ops is permissive; UI-level validation
+    (discovery_edit_ops.py) is what actually refuses this before it is ever
+    written — this just documents that a stray op on disk degrades safely."""
+    with tempfile.TemporaryDirectory() as td:
+        out = _fixture(Path(td), [(30.0, 30.0)])
+        append_boundary_op(out, BoundaryOp.draw(99, _manual_ring()))
+
+        result = write_boundaries(out, _Cfg())
+
+        assert result is not None
+        assert 99 in result.origins
+        assert result.origins[99] == ORIGIN_MANUAL

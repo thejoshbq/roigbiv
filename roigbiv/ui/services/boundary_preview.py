@@ -82,7 +82,10 @@ def preview(output_dir: Path, cfg, *, capture_px: float,
         max_area=getattr(cfg, "boundary_max_area", None),
     )
     result.warnings = list(warnings) + result.warnings
-    return result
+
+    from roigbiv.pipeline.boundary_edits import layer_boundary_ops
+
+    return layer_boundary_ops(result, output_dir)
 
 
 def _converged(output_dir: Path, cfg):
