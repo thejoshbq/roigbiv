@@ -149,7 +149,8 @@ def _layout():
 def test_layout_carries_the_stores_and_navigation_controls():
     assert {cells.SELECTED_ID, cells.VIEW_ID, cells.SHEET_ID, cells.STRIP_ID,
             cells.CELL_LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
-            cells.DRAWER_ID, cells.RAIL_TOGGLE_ID} <= _ids(_layout())
+            cells.BOUNDARIES_ID, cells.DRAWER_ID,
+            cells.RAIL_TOGGLE_ID} <= _ids(_layout())
 
 
 def test_the_sheet_is_an_empty_mount_point_for_the_browser_to_fill():
@@ -209,6 +210,16 @@ def test_one_class_on_the_body_drives_the_whole_split():
 def test_layout_carries_the_edit_controls():
     assert {cells.EDIT_ID, cells.EDIT_ROW_ID, cells.UNDO_ID,
             cells.EDIT_MSG_ID} <= _ids(_layout())
+
+
+def test_the_boundaries_switch_defaults_off():
+    """Disks are the canonical registry geometry (ADR-0003) and load first;
+    seeded boundaries (ADR-0005) are opt-in."""
+    with patch.object(cells, "get_app_state", return_value=_FakeState()), \
+            patch.object(cells, "list_fovs", return_value=[]):
+        switch = next(c for c in _walk(cells._toolbar())
+                     if getattr(c, "id", None) == cells.BOUNDARIES_ID)
+    assert switch.value is False
 
 
 def test_there_is_no_mode_picker_left():
@@ -411,7 +422,7 @@ def test_the_sheet_is_told_about_every_control_it_reacts_to(callbacks):
     render = callbacks["_clientside"][0]
     inputs = [dep.component_id for dep in render[2:]]
     assert inputs == [cells.FOV_ID, cells.SELECTED_ID, cells.NUMBERS_ID,
-                      cells.EDIT_ID]
+                      cells.EDIT_ID, cells.BOUNDARIES_ID]
 
 
 def test_selection_and_the_switches_never_go_through_the_server(callbacks):

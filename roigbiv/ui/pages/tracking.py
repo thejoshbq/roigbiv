@@ -43,6 +43,13 @@ Color carries outcome, not identity: matched / new here / not detected, three
 hues total. Identity is revealed on demand — click any cell and it thickens and
 shows its ``#N`` in every panel at once.
 
+The **boundaries** switch is a display choice, not a data source. Off (the
+default), each panel outlines ADR-0003's canonical disk stamps — what the
+registry actually matched on. On, it draws ADR-0005's seeded segmentation
+instead — closer to the real soma, useful for judging a match by eye, but
+never what identity is decided from. Both tracks carry the same label ids, so
+toggling never changes which cell a click resolves to.
+
 Where the sheet actually lives
 ------------------------------
 Not here. The panels are OpenSeadragon viewers built by
@@ -118,6 +125,7 @@ HEADER_ID = "roigbiv-cells-header"
 PREV_ID = "roigbiv-cells-prev"
 NEXT_ID = "roigbiv-cells-next"
 NUMBERS_ID = "roigbiv-cells-numbers"
+BOUNDARIES_ID = "roigbiv-cells-boundaries"
 DRAWER_ID = "roigbiv-cells-drawer"
 RAIL_TOGGLE_ID = "roigbiv-cells-rail-toggle"
 RAIL_TAB_ID = "roigbiv-cells-rail-tab"
@@ -533,6 +541,8 @@ def _toolbar() -> dbc.Row:
     return dbc.Row([
         dbc.Col(_fov_picker(), md=4),
         dbc.Col(dbc.Switch(id=NUMBERS_ID, label="numbers", value=True,
+                           className="mb-0 mt-3"), width="auto"),
+        dbc.Col(dbc.Switch(id=BOUNDARIES_ID, label="boundaries", value=False,
                            className="mb-0 mt-3"), width="auto"),
         dbc.Col(dbc.ButtonGroup([
             dbc.Button("◀", id=PREV_ID, size="sm", color="secondary",
@@ -970,12 +980,13 @@ def _register_clientside(app: dash.Dash) -> None:
     # Every control the sheet reacts to, folded into one render call.
     app.clientside_callback(
         """
-        function(fovId, selected, showNumbers, editOn) {
+        function(fovId, selected, showNumbers, editOn, showBoundaries) {
             const config = {
                 fov_id: fovId || null,
                 selected_gcid: selected || null,
                 show_numbers: showNumbers !== false,
                 edit_on: !!editOn,
+                show_boundaries: !!showBoundaries,
             };
             // The first render fires as the page mounts, which can beat the
             // asset that answers it; without the retry the sheet would stay
@@ -995,6 +1006,7 @@ def _register_clientside(app: dash.Dash) -> None:
         Input(SELECTED_ID, "data"),
         Input(NUMBERS_ID, "value"),
         Input(EDIT_ID, "value"),
+        Input(BOUNDARIES_ID, "value"),
     )
 
     app.clientside_callback(

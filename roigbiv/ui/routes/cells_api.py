@@ -6,6 +6,11 @@ GET  /api/cells/<fov_id>                  — sessions + cells + ROI geometry as
 GET  /api/cells/<fov_id>/image/<stem>.png — one session's mean projection
 POST /api/cells/<fov_id>/gesture          — apply one edit gesture, return fresh state
 
+Both the GET and the POST take an optional ``show_boundaries`` flag (a query
+param on the GET, a JSON field on the POST) selecting which geometry track to
+draw — disk stamps by default, seeded boundary outlines when set. See
+:func:`roigbiv.ui.services.tracked_cells._render_geometry`.
+
 Why the sheet is fetched rather than pushed through Dash
 --------------------------------------------------------
 The page used to ship each panel's mean projection as a Plotly heatmap: a
@@ -44,6 +49,21 @@ _write_locks_meta = threading.Lock()
 def _write_lock(fov_id: str) -> threading.Lock:
     with _write_locks_meta:
         return _write_locks.setdefault(fov_id, threading.Lock())
+
+
+def _truthy(value) -> bool:
+    """Parse a query-string value or a JSON field into a bool.
+
+    Query args arrive as strings (``"1"``, ``"true"``, or absent); a JSON POST
+    body already hands back a real bool. Both need to collapse to the same
+    thing so a GET and the POST that follows it agree on which geometry is on
+    screen.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 # ── serialisation ──────────────────────────────────────────────────────────
@@ -191,13 +211,14 @@ def _projection_etag(output_dir: Path) -> Optional[str]:
 def register_flask_routes(server: Flask) -> None:
     """Register the /cells data + gesture routes on the Dash Flask server."""
 
-    def _load(fov_id: str):
+    def _load(fov_id: str, *, show_boundaries: bool = False):
         """``(fov, state)`` for *fov_id*, or ``(None, error_response)``."""
         state = get_app_state()
         if state.workspace is None:
             return None, (jsonify({"error": "no workspace selected"}), 409)
         try:
-            fov = load_tracked_fov_cached(fov_id, cfg=state.registry_config)
+            fov = load_tracked_fov_cached(fov_id, cfg=state.registry_config,
+                                          show_boundaries=show_boundaries)
         except Exception as exc:  # noqa: BLE001 — store or disk, both the user's
             return None, (jsonify({"error": str(exc)}), 404)
         if not fov.sessions:
@@ -207,7 +228,8 @@ def register_flask_routes(server: Flask) -> None:
 
     @server.route("/api/cells/<fov_id>")
     def cells_state(fov_id: str):
-        loaded, err = _load(fov_id)
+        show_boundaries = _truthy(request.args.get("show_boundaries"))
+        loaded, err = _load(fov_id, show_boundaries=show_boundaries)
         if err is not None:
             return err
         fov, _state = loaded
@@ -242,13 +264,15 @@ def register_flask_routes(server: Flask) -> None:
 
     @server.route("/api/cells/<fov_id>/gesture", methods=["POST"])
     def cells_gesture(fov_id: str):
-        loaded, err = _load(fov_id)
+        payload = request.get_json(silent=True) or {}
+        show_boundaries = _truthy(payload.get("show_boundaries"))
+        loaded, err = _load(fov_id, show_boundaries=show_boundaries)
         if err is not None:
             return err
         fov, state = loaded
 
         try:
-            gesture = Gesture.from_payload(request.get_json(silent=True) or {})
+            gesture = Gesture.from_payload(payload)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
@@ -273,5 +297,13 @@ def register_flask_routes(server: Flask) -> None:
         # Only a gesture that wrote something carries fresh state; a refusal
         # leaves the sheet exactly as the browser already has it.
         if result.fov is not None:
-            body["state"] = serialize_fov(result.fov)
+            # apply_gesture's own reload (roigbiv/ui/services/cell_edit_ops.py)
+            # always re-fetches through the disk-geometry cache entry, since it
+            # has no notion of which track this request is viewing. Re-fetch
+            # here with the request's own show_boundaries so the response
+            # matches what the browser has on screen — this is a cheap cache
+            # hit unless the write itself just invalidated it.
+            fresh = load_tracked_fov_cached(fov_id, cfg=state.registry_config,
+                                            show_boundaries=show_boundaries)
+            body["state"] = serialize_fov(fresh)
         return jsonify(body), result.status
