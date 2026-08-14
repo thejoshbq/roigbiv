@@ -15,6 +15,12 @@ Both are stamped from the *same* effective centroids — ``centroids.json``
 replayed through ``corrections/centroids.jsonl`` — and carry the *same* label
 ids, so ``CellObservation.local_label_id`` addresses a cell in either image and
 the registry needs no knowledge that this file exists.
+
+``compute_boundaries`` layers one more thing on top of ``seeded_labels``'s
+output: any hand-drawn overrides from ``corrections/boundaries.jsonl`` (see
+``roigbiv.pipeline.boundary_edits``). A label with an active manual override
+keeps its hand-drawn shape regardless of what this module's own computation
+says for it; every other label reflects the computation as usual.
 """
 from __future__ import annotations
 
@@ -162,7 +168,10 @@ def compute_boundaries(
         max_area=getattr(cfg, "boundary_max_area", None),
     )
     result.warnings = list(warnings) + result.warnings
-    return result
+
+    from roigbiv.pipeline.boundary_edits import layer_boundary_ops
+
+    return layer_boundary_ops(result, output_dir)
 
 
 def write_boundaries(

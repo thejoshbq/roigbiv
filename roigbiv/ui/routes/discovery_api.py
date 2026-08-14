@@ -9,7 +9,9 @@ Routes
 ------
 GET  /api/discovery/<stem>              — centroid geometry + image URL
 GET  /api/discovery/<stem>/image.png    — mean projection as PNG
-POST /api/discovery/<stem>/gesture      — apply one add/delete/move/undo op
+POST /api/discovery/<stem>/gesture      — apply one centroid (add/delete/move/
+                                          undo) or boundary (draw_boundary/
+                                          delete_boundary/undo_boundary) op
 
 No route takes a filesystem path. *stem* resolves against the session's
 ``AppState.workspace.output_root`` and must name an existing, direct child of
@@ -53,6 +55,53 @@ def _resolve_output_dir(stem: str) -> Optional[Path]:
     if candidate.parent != root or not candidate.is_dir():
         return None
     return candidate
+
+
+def _boundary_cfg():
+    """A config carrying no boundary overrides — mirrors ``discovery._cfg()``.
+
+    Kept as its own copy rather than imported from :mod:`roigbiv.ui.pages.discovery`
+    so this route module never depends on a Dash page module; both build the
+    same trivial ``PipelineConfig``.
+    """
+    from roigbiv.pipeline.types import PipelineConfig
+
+    cfg = PipelineConfig(no_viewer=True)
+    cfg.boundary_capture_px = None
+    cfg.boundary_min_area = None
+    return cfg
+
+
+def _boundary_contours(output_dir: Path) -> dict:
+    """This FOV's current seeded boundaries, ``{}`` when they can't be drawn.
+
+    Used to refresh the viewer's boundary layer after a ``draw_boundary`` /
+    ``delete_boundary`` / ``undo_boundary`` gesture, at whatever
+    ``capture_px``/``min_area`` this FOV was last drawn or saved with — the
+    same settings :func:`~roigbiv.pipeline.boundaries.compute_boundaries`
+    resolves by default. A live, unsaved slider position on the page is not
+    read here; that stays the boundary-tuning section's own concern.
+    """
+    from roigbiv.pipeline.boundaries import compute_boundaries
+    from roigbiv.ui.services.loaders import label_shapes
+
+    try:
+        result = compute_boundaries(output_dir, _boundary_cfg())
+    except Exception:  # noqa: BLE001 — a redraw failure must not fail the gesture
+        return {}
+    if result is None:
+        return {}
+
+    contours = {}
+    for label_id, (_centroid, rings, _area) in label_shapes(result.labels).items():
+        contours[str(label_id)] = {
+            "origin": result.origins.get(label_id, "flow"),
+            "rings": [
+                [[round(float(x), 1), round(float(y), 1)] for y, x in zip(ys, xs)]
+                for ys, xs in rings if ys
+            ],
+        }
+    return contours
 
 
 def _radius(output_dir: Path) -> float:
@@ -206,4 +255,6 @@ def register_flask_routes(server: Flask) -> None:
                 "warnings": result.warnings}
         if result.ok:
             body["state"] = serialize_fov(stem, output_dir)
+            if gesture.kind in ("draw_boundary", "delete_boundary", "undo_boundary"):
+                body["boundaries"] = {"contours": _boundary_contours(output_dir)}
         return jsonify(body), result.status

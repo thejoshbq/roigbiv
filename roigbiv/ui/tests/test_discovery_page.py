@@ -414,10 +414,85 @@ def test_pipeline_output_is_never_mutated_by_an_edit(tmp_path):
     ({"kind": "levitate"}, "unknown gesture kind"),
     ({"kind": "move"}, "requires a label"),
     ({"kind": "add", "label": 1}, "requires y and x"),
+    ({"kind": "draw_boundary", "ring": [[0, 0], [0, 5], [5, 5]]},
+     "requires a label"),
+    ({"kind": "draw_boundary", "label": 1}, "requires a ring"),
+    ({"kind": "draw_boundary", "label": 1, "ring": [[0, 0], [0, 5]]},
+     "requires a ring"),
+    ({"kind": "delete_boundary"}, "requires a label"),
 ])
 def test_a_malformed_gesture_payload_is_rejected(payload, message):
     with pytest.raises(ValueError, match=message):
         edit_ops.Gesture.from_payload(payload)
+
+
+# ── discovery_edit_ops: boundary gestures ───────────────────────────────────
+
+_RING = [(2.0, 2.0), (2.0, 12.0), (12.0, 12.0), (12.0, 2.0)]
+
+
+def test_draw_boundary_appends_an_op_and_leaves_centroids_untouched(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    result = edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="draw_boundary", label=1, ring=_RING))
+    assert result.ok
+    assert [c[0] for c in result.centroids] == [1]
+    assert (out / "corrections" / "boundaries.jsonl").exists()
+
+
+def test_draw_boundary_for_an_unknown_label_is_refused(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    result = edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="draw_boundary", label=99, ring=_RING))
+    assert not result.ok
+    assert result.status == 400
+
+
+def test_delete_boundary_with_no_active_manual_boundary_is_refused(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    result = edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="delete_boundary", label=1))
+    assert not result.ok
+    assert result.status == 400
+
+
+def test_delete_boundary_after_a_draw_succeeds(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="draw_boundary", label=1, ring=_RING))
+    result = edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="delete_boundary", label=1))
+    assert result.ok
+
+    from roigbiv.pipeline.boundary_edits import active_manual_labels, load_boundary_ops
+    assert active_manual_labels(load_boundary_ops(out)) == set()
+
+
+def test_undo_boundary_reverses_the_last_boundary_op(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="draw_boundary", label=1, ring=_RING))
+    result = edit_ops.apply_gesture(out, edit_ops.Gesture(kind="undo_boundary"))
+    assert result.ok
+
+    from roigbiv.pipeline.boundary_edits import active_manual_labels, load_boundary_ops
+    assert active_manual_labels(load_boundary_ops(out)) == set()
+
+
+def test_undo_boundary_with_nothing_written_says_so(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    result = edit_ops.apply_gesture(out, edit_ops.Gesture(kind="undo_boundary"))
+    assert not result.ok
+    assert result.message == "nothing to undo"
+
+
+def test_boundary_gestures_never_mutate_centroids_json(tmp_path):
+    out = _centroids_only(tmp_path / "sess01", [(10.0, 10.0)])
+    frozen = (out / "centroids.json").read_text()
+    edit_ops.apply_gesture(
+        out, edit_ops.Gesture(kind="draw_boundary", label=1, ring=_RING))
+    edit_ops.apply_gesture(out, edit_ops.Gesture(kind="delete_boundary", label=1))
+    assert (out / "centroids.json").read_text() == frozen
 
 
 # ── discovery_api: the Flask surface the viewer talks to ───────────────────
@@ -509,6 +584,73 @@ def test_a_malformed_gesture_is_a_400(api_client):
     resp = api_client.post("/api/discovery/sess01/gesture",
                            json={"kind": "levitate"})
     assert resp.status_code == 400
+
+
+# ── discovery_api: boundary gestures ────────────────────────────────────────
+
+
+def test_drawing_a_boundary_returns_fresh_contours(api_client, api_workspace):
+    label = api_client.get("/api/discovery/sess01").get_json()["centroids"][0]["label_id"]
+    resp = api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "draw_boundary", "label": label, "ring": _RING,
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"]
+    assert "boundaries" in body
+    entry = body["boundaries"]["contours"][str(label)]
+    assert entry["origin"] == "manual"
+    assert (api_workspace.out_dir / "corrections" / "boundaries.jsonl").exists()
+
+
+def test_drawing_a_boundary_for_an_unknown_label_is_a_400(api_client):
+    resp = api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "draw_boundary", "label": 999, "ring": _RING,
+    })
+    assert resp.status_code == 400
+
+
+def test_deleting_a_drawn_boundary_reverts_its_origin(api_client):
+    label = api_client.get("/api/discovery/sess01").get_json()["centroids"][0]["label_id"]
+    api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "draw_boundary", "label": label, "ring": _RING,
+    })
+    resp = api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "delete_boundary", "label": label,
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"]
+    entry = body["boundaries"]["contours"].get(str(label))
+    if entry is not None:   # still present, just no longer manual
+        assert entry["origin"] != "manual"
+
+
+def test_deleting_a_never_drawn_boundary_is_a_400(api_client):
+    label = api_client.get("/api/discovery/sess01").get_json()["centroids"][0]["label_id"]
+    resp = api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "delete_boundary", "label": label,
+    })
+    assert resp.status_code == 400
+
+
+def test_undo_boundary_via_the_api(api_client):
+    label = api_client.get("/api/discovery/sess01").get_json()["centroids"][0]["label_id"]
+    api_client.post("/api/discovery/sess01/gesture", json={
+        "kind": "draw_boundary", "label": label, "ring": _RING,
+    })
+    resp = api_client.post("/api/discovery/sess01/gesture",
+                           json={"kind": "undo_boundary"})
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"]
+
+
+def test_a_centroid_gesture_does_not_recompute_boundary_contours(api_client):
+    """Boundary contours are only recomputed for boundary-kind gestures — a
+    plain centroid add/move/delete does not pay for a redraw it didn't ask for."""
+    resp = api_client.post("/api/discovery/sess01/gesture",
+                           json={"kind": "add", "y": 55.0, "x": 12.0})
+    assert "boundaries" not in resp.get_json()
 
 
 if __name__ == "__main__":

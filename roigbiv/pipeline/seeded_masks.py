@@ -44,6 +44,7 @@ from roigbiv.pipeline.roi_stamp import disk_mask
 # Where a label's pixels came from, recorded per label in boundaries.json.
 ORIGIN_FLOW = "flow"                    # basin + watershed, the intended path
 ORIGIN_DISK_FALLBACK = "disk_fallback"  # seed captured nothing; canonical disk
+ORIGIN_MANUAL = "manual"                # hand-drawn; see pipeline/boundary_edits.py
 
 
 @dataclass

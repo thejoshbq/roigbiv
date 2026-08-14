@@ -89,6 +89,7 @@ BOUNDARY_STATUS_ID = "roigbiv-discovery-boundary-status"
 
 SHEET_ID = "roigbiv-discovery-sheet"
 EDIT_ID = "roigbiv-discovery-edit"
+EDIT_BOUNDARY_ID = "roigbiv-discovery-edit-boundary"
 EDIT_MSG_ID = "roigbiv-discovery-edit-msg"
 VIEW_ID = "roigbiv-discovery-view"
 BOUNDARY_STORE_ID = "roigbiv-discovery-boundary-store"
@@ -221,10 +222,18 @@ def _right_column() -> html.Div:
         html.Div([
             html.H5("Preview", className="mb-0 me-3"),
             dbc.Switch(id=EDIT_ID, label="Edit centroids", value=False,
+                       className="mb-0 me-3"),
+            dbc.Switch(id=EDIT_BOUNDARY_ID, label="Edit boundaries", value=False,
                        className="mb-0"),
         ], className="d-flex align-items-center mb-2"),
         html.Small(
-            "drag to move · right-click to delete · click empty space to add",
+            "centroids: drag to move · right-click to delete · click empty "
+            "space to add",
+            className="text-muted small d-block mb-1"),
+        html.Small(
+            "boundaries: click a cell to start a hand-drawn outline · click "
+            "to add a point · double-click or Enter to close · Escape to "
+            "cancel · right-click a hand-drawn outline to revert it to auto",
             className="text-muted small d-block mb-1"),
         # Filled by assets/discovery_sheet.js — see the module docstring.
         html.Div(id=SHEET_ID),
@@ -597,7 +606,7 @@ def _register_clientside(app: dash.Dash) -> None:
     """
     app.clientside_callback(
         """
-        function(value, editOn, diameter) {
+        function(value, editOn, editBoundaryOn, diameter) {
             var stem = null;
             if (value && typeof value === "string"
                 && value.indexOf("summary:") === 0) {
@@ -608,7 +617,9 @@ def _register_clientside(app: dash.Dash) -> None:
                 stem = parts.length ? parts[parts.length - 1] : null;
             }
             var config = {
-                stem: stem, edit_on: !!editOn, diameter_px: diameter || null,
+                stem: stem, edit_on: !!editOn,
+                edit_boundary_on: !!editBoundaryOn,
+                diameter_px: diameter || null,
             };
             // The first render fires as the page mounts, which can beat the
             // asset that answers it; without the retry the viewer would stay
@@ -626,7 +637,36 @@ def _register_clientside(app: dash.Dash) -> None:
         Output(VIEW_ID, "data"),
         Input(FOV_SELECT_ID, "value"),
         Input(EDIT_ID, "value"),
+        Input(EDIT_BOUNDARY_ID, "value"),
         Input(DIAMETER_ID, "value"),
+    )
+
+    # The two edit switches are mutually exclusive — a centroid drag and a
+    # boundary-ring click would otherwise contend for the same pointerdown on
+    # a centroid marker. Turning one on turns the other off.
+    app.clientside_callback(
+        """
+        function(boundaryOn, centroidOn) {
+            if (boundaryOn && centroidOn) { return false; }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output(EDIT_ID, "value"),
+        Input(EDIT_BOUNDARY_ID, "value"),
+        State(EDIT_ID, "value"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(centroidOn, boundaryOn) {
+            if (centroidOn && boundaryOn) { return false; }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output(EDIT_BOUNDARY_ID, "value"),
+        Input(EDIT_ID, "value"),
+        State(EDIT_BOUNDARY_ID, "value"),
+        prevent_initial_call=True,
     )
 
     app.clientside_callback(
