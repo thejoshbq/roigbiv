@@ -591,6 +591,10 @@ hr {
 }
 .roigbiv-roi.is-selected .roigbiv-cells-badge { font-size: 15px; }
 .roigbiv-roi.hide-badge .roigbiv-cells-badge { display: none; }
+.roigbiv-cells-centroid-dot {
+    vector-effect: non-scaling-stroke;
+    pointer-events: none;
+}
 /* Edit mode is a mode for *writes*, so it has to be visible without reading
    the toolbar — the whole sheet picks up a crosshair. */
 .roigbiv-cells-panel-editing .roigbiv-cells-panel-view { cursor: crosshair; }
@@ -639,19 +643,9 @@ hr {
     min-height: 22rem;
     overflow-y: auto;
 }
-.roigbiv-cells-drawer {
-    height: auto !important;
-    max-height: 60vh;
-}
 .roigbiv-cells-row { cursor: pointer; }
 .roigbiv-cells-row:hover { background: rgba(0, 229, 255, 0.06); }
 .roigbiv-cells-row-active {
     background: rgba(0, 229, 255, 0.12);
     box-shadow: inset 2px 0 0 var(--roigbiv-accent);
-}
-/* The border carries the cell's cross-session status, so it is set inline
-   per card and must not be overridden here. */
-.roigbiv-cell-crop {
-    border-width: 2px;
-    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
 }

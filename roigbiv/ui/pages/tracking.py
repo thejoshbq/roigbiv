@@ -27,27 +27,21 @@ and reviewing is done every time.
 Review — the contact sheet
 --------------------------
 Tracking assigns each cell a ``global_cell_id`` that survives from session to
-session, but that only ever surfaced as a count: *13 matched*. A count cannot be
-checked. The sheet shows **which** 13.
+session. The contact sheet shows all tracked cells overlaid on each session's
+mean projection in timeline order, with color indicating match status: matched,
+new, or not detected. Click any cell to highlight it across all panels and see
+its index.
 
-One panel per session, in timeline order, each showing that session's own mean
-projection with its ROIs outlined. Sessions are *not* warped into a shared
-frame: ROICaT computes an alignment transform during matching and discards it,
-so nothing on disk could place two sessions in one coordinate system without
-re-running the matcher. Separate frames are the honest rendering, and
-cross-session identity is carried by annotation instead. Below it, a filmstrip
-(:mod:`roigbiv.ui.components.cell_strip`) crops the selected cell out of every
-session at one fixed scale — that is the evidence; the sheet is the index.
-
-Color carries outcome, not identity: matched / new here / not detected, three
-hues total. Identity is revealed on demand — click any cell and it thickens and
-shows its ``#N`` in every panel at once.
+Sessions are not warped into a shared frame — ROICaT computes an alignment
+transform during matching and discards it, so nothing on disk could place two
+sessions in one coordinate system without re-running the matcher. Separate
+frames are the honest rendering, and cross-session identity is carried by
+annotation.
 
 The **boundaries** switch is a display choice, not a data source. Off (the
 default), each panel outlines ADR-0003's canonical disk stamps — what the
 registry actually matched on. On, it draws ADR-0005's seeded segmentation
-instead — closer to the real soma, useful for judging a match by eye, but
-never what identity is decided from. Both tracks carry the same label ids, so
+instead — closer to the real soma. Both tracks carry the same label ids, so
 toggling never changes which cell a click resolves to.
 
 Where the sheet actually lives
@@ -95,7 +89,6 @@ from roigbiv.pipeline.session_order import (
     save_order,
 )
 from roigbiv.ui.components import workspace_bar
-from roigbiv.ui.components.cell_strip import cell_strip
 from roigbiv.ui.components.errors import user_error
 from roigbiv.ui.components.log_stream import log_stream
 from roigbiv.ui.services.app_state import get_app_state
@@ -119,14 +112,12 @@ SETUP_SUMMARY_ID = "roigbiv-track-setup-summary"
 FOV_ID = "roigbiv-cells-fov"
 SELECTED_ID = "roigbiv-cells-selected"
 SHEET_ID = "roigbiv-cells-sheet"
-STRIP_ID = "roigbiv-cells-strip"
 CELL_LIST_ID = "roigbiv-cells-list"
 HEADER_ID = "roigbiv-cells-header"
 PREV_ID = "roigbiv-cells-prev"
 NEXT_ID = "roigbiv-cells-next"
 NUMBERS_ID = "roigbiv-cells-numbers"
 BOUNDARIES_ID = "roigbiv-cells-boundaries"
-DRAWER_ID = "roigbiv-cells-drawer"
 RAIL_TOGGLE_ID = "roigbiv-cells-rail-toggle"
 RAIL_TAB_ID = "roigbiv-cells-rail-tab"
 RAIL_COL_ID = "roigbiv-cells-rail-col"
@@ -527,17 +518,11 @@ def _review_section() -> html.Div:
             html.Div(_rail(), id=RAIL_COL_ID, className="roigbiv-cells-rail-col"),
             _rail_tab(),
         ], id=BODY_ID, className="roigbiv-cells-body"),
-        _drawer(),
     ])
 
 
 def _toolbar() -> dbc.Row:
-    """One compact row — every control that must be reachable without a selection.
-
-    Prev/next live here rather than in the drawer: the drawer only opens once a
-    cell is selected, so controls inside it could never make the first
-    selection.
-    """
+    """One compact row — controls for FOV selection, display options, and navigation."""
     return dbc.Row([
         dbc.Col(_fov_picker(), md=4),
         dbc.Col(dbc.Switch(id=NUMBERS_ID, label="numbers", value=True,
@@ -617,24 +602,6 @@ def _rail_tab() -> html.Div:
         className="roigbiv-cells-rail-tab")
 
 
-def _drawer() -> dbc.Offcanvas:
-    """The filmstrip, raised from the bottom when a cell is selected.
-
-    ``backdrop=False`` deliberately: the sheet stays live underneath, so
-    picking a different cell just re-fills the drawer instead of forcing a
-    dismiss-then-click round trip.
-    """
-    return dbc.Offcanvas(
-        html.Div(id=STRIP_ID),
-        id=DRAWER_ID,
-        placement="bottom",
-        backdrop=False,
-        scrollable=True,
-        is_open=False,
-        className="roigbiv-cells-drawer",
-    )
-
-
 def _fov_picker() -> html.Div:
     state = get_app_state()
     if state.workspace is None:
@@ -706,19 +673,6 @@ def _header(fov: TrackedFOV) -> list:
         out.append(dbc.Badge("session order not confirmed", color="warning",
                              className="ms-2"))
     return out
-
-
-def _strip_header(fov: TrackedFOV, selected: Optional[str]) -> html.Div:
-    cell = fov.cell_by_gcid(selected)
-    if cell is None:
-        return html.Div()
-    return html.Div([
-        html.Span(f"Cell #{cell.index}", className="fw-bold me-2"),
-        html.Span("".join("●" if p else "○" for p in cell.present),
-                  className="font-monospace me-2"),
-        html.Span(", ".join(cell.anomalies), className="small text-warning me-3"),
-        html.Span(cell.global_cell_id, className="font-monospace small text-muted"),
-    ], className="mb-2 d-flex align-items-center flex-wrap")
 
 
 def _load(fov_id: str) -> TrackedFOV:
@@ -886,31 +840,20 @@ def _register_review_callbacks(app: dash.Dash) -> None:
         return _cell_list(fov, None), _header(fov), None
 
     @app.callback(
-        Output(STRIP_ID, "children"),
         Output(CELL_LIST_ID, "children", allow_duplicate=True),
-        Output(DRAWER_ID, "is_open"),
         Input(SELECTED_ID, "data"),
         State(FOV_ID, "value"),
         prevent_initial_call=True,
     )
     def _on_select(selected: Optional[str], fov_id: Optional[str]):
-        """The filmstrip and the rail follow the selection, wherever it came from.
-
-        "Wherever" includes the browser: a click on a panel writes ``SELECTED_ID``
-        through ``dash_clientside.set_props``, which lands here exactly as a rail
-        click does.
-        """
+        """Update the cell list highlighting when a cell is selected."""
         if not fov_id:
-            return html.Div(), no_update, False
+            return no_update
         try:
             fov = _load(fov_id)
-        except Exception as exc:  # noqa: BLE001
-            return (user_error(exc, "loading this FOV's tracked cells"),
-                    no_update, False)
-
-        cell = fov.cell_by_gcid(selected)
-        strip = html.Div([_strip_header(fov, selected), cell_strip(fov, cell)])
-        return strip, _cell_list(fov, selected), cell is not None
+        except Exception:
+            return no_update
+        return _cell_list(fov, selected)
 
     @app.callback(
         Output(SELECTED_ID, "data", allow_duplicate=True),
@@ -946,25 +889,6 @@ def _register_review_callbacks(app: dash.Dash) -> None:
         if selected not in gcids:
             return gcids[0] if step > 0 else gcids[-1]
         return gcids[(gcids.index(selected) + step) % len(gcids)]
-
-    @app.callback(
-        Output(SELECTED_ID, "data", allow_duplicate=True),
-        Input(DRAWER_ID, "is_open"),
-        State(SELECTED_ID, "data"),
-        prevent_initial_call=True,
-    )
-    def _on_drawer_closed(is_open: bool, selected: Optional[str]):
-        """Dismissing the drawer clears the selection.
-
-        Otherwise the two disagree: the drawer is shut but a cell is still
-        selected, so clicking that same cell again writes an unchanged value
-        and nothing reopens. Keeping "drawer open" and "cell selected" as one
-        state makes every click do what it looks like it does.
-        """
-        if is_open or selected is None:
-            return no_update
-        return None
-
 
 # ── clientside ─────────────────────────────────────────────────────────────
 

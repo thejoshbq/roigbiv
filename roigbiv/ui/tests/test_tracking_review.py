@@ -4,12 +4,8 @@ The sheet itself is not here. It is OpenSeadragon viewers built by
 ``assets/cells_sheet.js`` against ``roigbiv/ui/routes/cells_api.py``, and what
 it draws is guarded by ``test_cells_api.py``; what a gesture *means* is guarded
 by ``test_cell_edit_ops.py``. What this module still owns is the frame around
-it: the picker, the header, the cell rail, the filmstrip drawer, and the
-handoff that tells the browser what to render.
-
-The interaction being guarded is the one the page exists for: selecting a cell
-— from the rail, from the stepper, or from the browser — has to reach the
-filmstrip, because the filmstrip is the evidence the page is for.
+it: the picker, the header, the cell rail, and the handoff that tells the
+browser what to render.
 """
 from __future__ import annotations
 
@@ -147,9 +143,9 @@ def _layout():
 
 
 def test_layout_carries_the_stores_and_navigation_controls():
-    assert {cells.SELECTED_ID, cells.VIEW_ID, cells.SHEET_ID, cells.STRIP_ID,
+    assert {cells.SELECTED_ID, cells.VIEW_ID, cells.SHEET_ID,
             cells.CELL_LIST_ID, cells.PREV_ID, cells.NEXT_ID, cells.NUMBERS_ID,
-            cells.BOUNDARIES_ID, cells.DRAWER_ID,
+            cells.BOUNDARIES_ID,
             cells.RAIL_TOGGLE_ID} <= _ids(_layout())
 
 
@@ -160,15 +156,6 @@ def test_the_sheet_is_an_empty_mount_point_for_the_browser_to_fill():
     sheet = next(c for c in _walk(_layout())
                  if getattr(c, "id", None) == cells.SHEET_ID)
     assert not getattr(sheet, "children", None)
-
-
-def test_the_cell_controls_sit_outside_the_drawer():
-    """The drawer only opens once a cell is selected, so a control inside it
-    could never make the first selection."""
-    drawer = next(c for c in _walk(_layout())
-                  if getattr(c, "id", None) == cells.DRAWER_ID)
-    assert cells.PREV_ID not in _ids(drawer)
-    assert cells.NEXT_ID not in _ids(drawer)
 
 
 def test_the_sheet_and_the_cell_rail_are_separately_addressable():
@@ -358,21 +345,20 @@ def test_a_failure_loading_a_fov_is_reported_in_place(callbacks):
     assert "masks missing" in _text(header)
 
 
-def test_selecting_a_cell_raises_the_drawer_with_its_filmstrip(callbacks):
+def test_selecting_a_cell_highlights_it_in_the_rail(callbacks):
     with patch.object(cells, "_load", return_value=_fov()):
-        strip, cell_list, is_open = callbacks["_on_select"]("gcid-B", "fov-1")
-    assert is_open is True
-    assert "Cell #2" in _text(strip)
-    assert "gcid-B" in _text(strip)
+        cell_list = callbacks["_on_select"]("gcid-B", "fov-1")
     assert "roigbiv-cells-row-active" in " ".join(
         c.className for c in _walk(cell_list)
         if isinstance(getattr(c, "id", None), dict))
 
 
-def test_clearing_the_selection_shuts_the_drawer(callbacks):
+def test_clearing_the_selection_removes_highlighting(callbacks):
     with patch.object(cells, "_load", return_value=_fov()):
-        _strip, _list, is_open = callbacks["_on_select"](None, "fov-1")
-    assert is_open is False
+        cell_list = callbacks["_on_select"](None, "fov-1")
+    # No row should have the active class
+    assert not any("roigbiv-cells-row-active" in getattr(c, "className", "")
+                   for c in _walk(cell_list))
 
 
 def test_clicking_a_row_selects_that_cell(callbacks):
@@ -399,18 +385,6 @@ def test_stepping_walks_the_cells_and_wraps_at_the_end(callbacks):
     assert _step(cells.NEXT_ID, "gcid-B") == "gcid-A"     # wraps forward
     assert _step(cells.PREV_ID, "gcid-A") == "gcid-B"     # wraps backward
     assert _step(cells.NEXT_ID, None) == "gcid-A"         # nothing selected yet
-
-
-def test_dismissing_the_drawer_clears_the_selection(callbacks):
-    """Otherwise the two disagree: the drawer is shut but a cell is still
-    selected, so clicking that same cell writes an unchanged value and nothing
-    reopens."""
-    assert callbacks["_on_drawer_closed"](False, "gcid-A") is None
-
-
-def test_the_drawer_closing_itself_does_not_loop(callbacks):
-    assert callbacks["_on_drawer_closed"](False, None) is cells.no_update
-    assert callbacks["_on_drawer_closed"](True, "gcid-A") is cells.no_update
 
 
 # ── the browser handoff ────────────────────────────────────────────────────
