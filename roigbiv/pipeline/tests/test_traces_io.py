@@ -232,3 +232,47 @@ def test_finalize_fov_bundle_produces_subdir(tmp_path: Path):
     assert (out / "traces_raw.npy").exists()
     assert (out / "traces_neuropil.npy").exists()
     assert (out / "traces_meta.json").exists()
+
+
+def test_extra_stats_additive_and_default_path_unchanged(tmp_path: Path):
+    """extra_stats=None (every pre-existing caller) must keep writing exactly
+    the original three files and sidecar shape — the hard constraint this
+    parameter was designed under."""
+    rois = [_roi(1, _rect_mask(0, 0, 3, 3)), _roi(2, _rect_mask(4, 4, 7, 7))]
+    F_raw, F_neu, F_corr = _fake_bundle(2, 6)
+    cfg = PipelineConfig(fs=7.5, frame_averaging=4)
+
+    default_dir = write_traces_bundle(
+        rois, F_raw, F_neu, F_corr, tmp_path / "default", cfg, source="pipeline",
+    )
+    default_meta = json.loads((default_dir / "traces_meta.json").read_text())
+    assert default_meta["files"] == {
+        "primary": "traces.npy", "raw": "traces_raw.npy",
+        "neuropil": "traces_neuropil.npy",
+    }
+    assert "stats" not in default_meta
+
+    median_raw, median_neu, median_corr = _fake_bundle(2, 6)
+    mode_raw, mode_neu, mode_corr = _fake_bundle(2, 6)
+    extra_dir = write_traces_bundle(
+        rois, F_raw, F_neu, F_corr, tmp_path / "extra", cfg, source="discovery",
+        extra_stats={
+            "median": (median_raw, median_neu, median_corr),
+            "mode": (mode_raw, mode_neu, mode_corr),
+        },
+    )
+    for fname in ("traces_median.npy", "traces_median_raw.npy",
+                  "traces_median_neuropil.npy", "traces_mode.npy",
+                  "traces_mode_raw.npy", "traces_mode_neuropil.npy"):
+        assert (extra_dir / fname).exists(), f"missing {fname}"
+
+    extra_meta = json.loads((extra_dir / "traces_meta.json").read_text())
+    assert extra_meta["stats"] == ["mean", "median", "mode"]
+    assert extra_meta["files"]["median"] == "traces_median.npy"
+    assert extra_meta["files"]["median_raw"] == "traces_median_raw.npy"
+    assert extra_meta["files"]["mode_neuropil"] == "traces_mode_neuropil.npy"
+    # The mean triad's keys are untouched by the extension.
+    assert extra_meta["files"]["primary"] == "traces.npy"
+
+    np.testing.assert_array_equal(
+        np.load(extra_dir / "traces_median.npy"), median_corr)

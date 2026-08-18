@@ -307,6 +307,21 @@
         group.appendChild(path);
       });
 
+      // A small fixed-size location marker, independent of the outline above
+      // (disk stamp or seeded boundary, whichever `boundaries` has picked) —
+      // that outline stays exactly what it was, this just says "here". Ghosts
+      // are skipped: they own no footprint here, and a solid dot would claim
+      // a detection that does not exist.
+      if (!roi.ghost) {
+        var dot = document.createElementNS(SVG_NS, "circle");
+        dot.setAttribute("cx", roi.centroid[1]);
+        dot.setAttribute("cy", roi.centroid[0]);
+        dot.setAttribute("r", 5);
+        dot.setAttribute("fill", color);
+        dot.setAttribute("class", "roigbiv-cells-centroid-dot");
+        group.appendChild(dot);
+      }
+
       if (roi.cell_index != null) {
         var text = document.createElementNS(SVG_NS, "text");
         text.setAttribute("x", roi.centroid[1]);

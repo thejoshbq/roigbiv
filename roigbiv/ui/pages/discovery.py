@@ -48,6 +48,23 @@ JSONL, never touching ``centroids.json`` itself. This is deliberately not the
 Tracking page's ``cell_edit_ops``: that module's ``apply_gesture`` is coupled
 to cross-session ``TrackedFOV`` state a single-FOV, single-session page has no
 business dragging in.
+
+Trace extraction
+-----------------
+A third section, below boundary tuning, appears once this FOV has a
+``merged_masks.tif`` — the one label image the registry actually matches
+against, produced either by a full pipeline cascade or by the Tracking
+page stamping this page's saved centroids. It is deliberately NOT keyed off
+the live boundary preview above it: that preview's label_ids are not yet
+registry-stable. "Extract traces" runs
+:func:`roigbiv.pipeline.discovery_extract.extract_from_merged_masks` via
+:mod:`roigbiv.ui.services.extraction_runner` (mean always, median/mode
+opt-in), producing a ``traces/`` bundle whose rows are keyed by
+``local_label_id`` — the same numbers now drawn on the centroid markers
+above — and by ``global_cell_id`` wherever this FOV has already gone through
+Tracking. This replaces the old ad hoc ``.npy``-plus-manual-alignment
+workflow with the structured bundle :mod:`roigbiv.pipeline.traces_io` already
+established for the cascade's own automatic extraction.
 """
 from __future__ import annotations
 
@@ -65,6 +82,7 @@ from roigbiv.ui.components import fov_select, run_panel, workspace_bar
 from roigbiv.ui.components.errors import user_error
 from roigbiv.ui.services import boundary_preview
 from roigbiv.ui.services.app_state import get_app_state
+from roigbiv.ui.services.extraction_runner import get_extraction_runner
 from roigbiv.ui.services.pipeline_runner import get_pipeline_runner
 
 RUN_ID = "roigbiv-discovery-run-btn"
@@ -87,9 +105,16 @@ SAVE_BOUNDARY_ID = "roigbiv-discovery-save-boundary"
 SAVE_ALL_BOUNDARY_ID = "roigbiv-discovery-save-boundary-all"
 BOUNDARY_STATUS_ID = "roigbiv-discovery-boundary-status"
 
+EXTRACT_SECTION_ID = "roigbiv-discovery-extract-section"
+EXTRACT_STATS_ID = "roigbiv-discovery-extract-stats"
+EXTRACT_BTN_ID = "roigbiv-discovery-extract-btn"
+EXTRACT_STATUS_ID = "roigbiv-discovery-extract-status"
+
 SHEET_ID = "roigbiv-discovery-sheet"
 EDIT_ID = "roigbiv-discovery-edit"
 EDIT_BOUNDARY_ID = "roigbiv-discovery-edit-boundary"
+SHOW_CENTROIDS_ID = "roigbiv-discovery-show-centroids"
+SHOW_BOUNDARIES_ID = "roigbiv-discovery-show-boundaries"
 EDIT_MSG_ID = "roigbiv-discovery-edit-msg"
 VIEW_ID = "roigbiv-discovery-view"
 BOUNDARY_STORE_ID = "roigbiv-discovery-boundary-store"
@@ -180,6 +205,10 @@ def _left_column() -> html.Div:
         html.Div(_boundary_section(out_dir, capture, min_area, stats),
                  id=BOUNDARY_SECTION_ID,
                  style=_boundary_style(out_dir)),
+
+        html.Div(_extraction_section(out_dir),
+                 id=EXTRACT_SECTION_ID,
+                 style=_extraction_style(out_dir)),
     ])
 
 
@@ -217,15 +246,83 @@ def _boundary_section(out_dir, capture, min_area, stats) -> list:
     ]
 
 
+def _extraction_section(out_dir: Optional[Path]) -> list:
+    return [
+        html.Hr(),
+        html.H5("Trace extraction", className="mb-2"),
+        html.Small(
+            "Extracts every ROI's fluorescence trace for the whole session "
+            "from this FOV's current merged_masks.tif. Mean is always "
+            "extracted; median and mode are additional per-frame spatial "
+            "statistics over the same masked pixels, each neuropil-corrected "
+            "the same way as mean.",
+            className="text-muted d-block mb-2"),
+        dbc.Checklist(
+            id=EXTRACT_STATS_ID,
+            options=[{"label": "median", "value": "median"},
+                     {"label": "mode", "value": "mode"}],
+            value=[], inline=True, className="mb-2"),
+        dbc.Button("Extract traces", id=EXTRACT_BTN_ID, color="primary",
+                   outline=True, size="sm"),
+        html.Div(_extraction_status(out_dir), id=EXTRACT_STATUS_ID,
+                 className="mt-2"),
+    ]
+
+
+def _has_merged_masks(out_dir: Optional[Path]) -> bool:
+    return out_dir is not None and (out_dir / "merged_masks.tif").exists()
+
+
+def _extraction_style(out_dir: Optional[Path]) -> dict:
+    return {} if _has_merged_masks(out_dir) else {"display": "none"}
+
+
+def _extraction_status(out_dir: Optional[Path]):
+    """A per-ROI table (label_id, global_cell_id) from the freshest bundle —
+    the "no more manual row-to-cell alignment" payoff. ``None``/absent
+    ``traces/`` reads as "not extracted yet", not an error.
+    """
+    if out_dir is None:
+        return None
+    from roigbiv.ui.services.trace_viz import list_local_rois_for_session
+
+    rows = list_local_rois_for_session(out_dir)
+    if not rows:
+        return html.Div("No trace bundle for this FOV yet.",
+                        className="text-muted small")
+    n_linked = sum(1 for r in rows if r.get("global_cell_id"))
+    header = html.Div([
+        html.Span(
+            f"{len(rows)} ROI(s) extracted — {n_linked} linked to a "
+            f"cross-session cell. "),
+        html.A("Download traces (.h5)",
+               href=f"/api/discovery/{out_dir.name}/traces.h5",
+               className="small"),
+    ], className="small mb-1")
+    table = dbc.Table(
+        [html.Thead(html.Tr([html.Th("label_id"), html.Th("global_cell_id")])),
+         html.Tbody([
+             html.Tr([html.Td(r["local_label_id"]),
+                     html.Td(r.get("global_cell_id") or "—")])
+             for r in rows[:200]  # guard against a very large ROI count
+         ])],
+        size="sm", striped=True, className="mb-0")
+    return html.Div([header, table])
+
+
 def _right_column() -> html.Div:
     return html.Div([
         html.Div([
             html.H5("Preview", className="mb-0 me-3"),
+            dbc.Switch(id=SHOW_CENTROIDS_ID, label="Show centroids", value=True,
+                       className="mb-0 me-3"),
+            dbc.Switch(id=SHOW_BOUNDARIES_ID, label="Show boundaries", value=True,
+                       className="mb-0 me-3"),
             dbc.Switch(id=EDIT_ID, label="Edit centroids", value=False,
                        className="mb-0 me-3"),
             dbc.Switch(id=EDIT_BOUNDARY_ID, label="Edit boundaries", value=False,
                        className="mb-0"),
-        ], className="d-flex align-items-center mb-2"),
+        ], className="d-flex align-items-center flex-wrap mb-2"),
         html.Small(
             "centroids: drag to move · right-click to delete · click empty "
             "space to add",
@@ -489,6 +586,8 @@ def register_callbacks(app: dash.Dash) -> None:
         Output(BOUNDARY_SECTION_ID, "style"),
         Output(CAPTURE_ID, "value"),
         Output(MIN_AREA_ID, "value"),
+        Output(EXTRACT_SECTION_ID, "style"),
+        Output(EXTRACT_STATUS_ID, "children"),
         Input(FOV_SELECT_ID, "value"),
         prevent_initial_call=True,
     )
@@ -499,7 +598,7 @@ def register_callbacks(app: dash.Dash) -> None:
         out_dir = fov_select.resolve_output_dir(value)
         if out_dir is None:
             return (DEFAULT_DIAMETER_PX, DEFAULT_CELLPROB_THRESHOLD, "", "",
-                    {"display": "none"}, 12.0, 0)
+                    {"display": "none"}, 12.0, 0, {"display": "none"}, None)
         calib = load_calibration(out_dir)
         capture, min_area = _boundary_settings_for(out_dir)
         return (
@@ -509,6 +608,7 @@ def register_callbacks(app: dash.Dash) -> None:
             _readout_text(calib, out_dir),
             _boundary_style(out_dir),
             capture, min_area,
+            _extraction_style(out_dir), _extraction_status(out_dir),
         )
 
     @app.callback(
@@ -593,6 +693,50 @@ def register_callbacks(app: dash.Dash) -> None:
 
         return _save_report(written, skipped, failed)
 
+    @app.callback(
+        Output(EXTRACT_STATUS_ID, "children", allow_duplicate=True),
+        Input(EXTRACT_BTN_ID, "n_clicks"),
+        State(FOV_SELECT_ID, "value"),
+        State(EXTRACT_STATS_ID, "value"),
+        prevent_initial_call=True,
+    )
+    def _on_extract(_n, value, stats):
+        out_dir = fov_select.resolve_output_dir(value)
+        if out_dir is None:
+            return dbc.Alert("Select a FOV first.", color="warning",
+                             className="py-2 mb-0")
+        if not _has_merged_masks(out_dir):
+            return dbc.Alert(
+                "No merged_masks.tif for this FOV yet — save boundaries and "
+                "run Tracking first.", color="warning", className="py-2 mb-0")
+        started = get_extraction_runner().start(
+            out_dir, out_dir.name, tuple(stats or []))
+        if not started:
+            return dbc.Alert("Extraction already running for this session.",
+                             color="warning", className="py-2 mb-0")
+        return dbc.Alert("Extraction started…", color="info",
+                         className="py-2 mb-0")
+
+    @app.callback(
+        Output(EXTRACT_STATUS_ID, "children", allow_duplicate=True),
+        Output(EXTRACT_BTN_ID, "disabled"),
+        Input(TICK_ID, "n_intervals"),
+        State(FOV_SELECT_ID, "value"),
+        prevent_initial_call=True,
+    )
+    def _on_extract_tick(_n, value):
+        snap = get_extraction_runner().snapshot()
+        if snap.active:
+            return (html.Div([html.Div(line, className="small font-monospace")
+                              for line in snap.logs[-5:]]), True)
+        out_dir = fov_select.resolve_output_dir(value)
+        if snap.error and snap.stem == (out_dir.name if out_dir else None):
+            return (dbc.Alert(f"Extraction failed: {snap.error}",
+                              color="danger", className="py-2 mb-0"), False)
+        if out_dir is None:
+            return dash.no_update, False
+        return _extraction_status(out_dir), False
+
     _register_clientside(app)
 
 
@@ -606,7 +750,8 @@ def _register_clientside(app: dash.Dash) -> None:
     """
     app.clientside_callback(
         """
-        function(value, editOn, editBoundaryOn, diameter) {
+        function(value, editOn, editBoundaryOn, diameter, showCentroids,
+                  showBoundaries) {
             var stem = null;
             if (value && typeof value === "string"
                 && value.indexOf("summary:") === 0) {
@@ -620,6 +765,8 @@ def _register_clientside(app: dash.Dash) -> None:
                 stem: stem, edit_on: !!editOn,
                 edit_boundary_on: !!editBoundaryOn,
                 diameter_px: diameter || null,
+                show_centroids: showCentroids !== false,
+                show_boundaries: showBoundaries !== false,
             };
             // The first render fires as the page mounts, which can beat the
             // asset that answers it; without the retry the viewer would stay
@@ -639,6 +786,8 @@ def _register_clientside(app: dash.Dash) -> None:
         Input(EDIT_ID, "value"),
         Input(EDIT_BOUNDARY_ID, "value"),
         Input(DIAMETER_ID, "value"),
+        Input(SHOW_CENTROIDS_ID, "value"),
+        Input(SHOW_BOUNDARIES_ID, "value"),
     )
 
     # The two edit switches are mutually exclusive — a centroid drag and a

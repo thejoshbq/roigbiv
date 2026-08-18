@@ -34,6 +34,8 @@
     stem: null,
     editOn: false,
     editBoundaryOn: false,
+    showCentroids: true,
+    showBoundaries: true,
     diameterPx: null,
     data: null,            // last /api/discovery/<stem> payload
     boundaries: null,      // last {contours: {label: {origin, rings}}} payload
@@ -61,8 +63,8 @@
       "  border-radius: 4px; overflow: hidden; min-height: 420px; }",
       ".roigbiv-discovery-overlay-holder { width: 100%; height: 100%; pointer-events: none; }",
       ".roigbiv-discovery-overlay { width: 100%; height: 100%; overflow: visible; }",
-      ".roigbiv-discovery-centroid { fill: rgba(0,229,255,0.16); stroke: #00e5ff;",
-      "  stroke-width: 2px; vector-effect: non-scaling-stroke; pointer-events: none; }",
+      ".roigbiv-discovery-centroid { fill: rgba(0,229,255,0.5); stroke: #00e5ff;",
+      "  stroke-width: 1.5px; vector-effect: non-scaling-stroke; pointer-events: none; }",
       ".roigbiv-discovery-centroids.is-editing .roigbiv-discovery-centroid {",
       "  pointer-events: auto; cursor: grab; }",
       ".roigbiv-discovery-centroid.is-dragging { cursor: grabbing; stroke-width: 3px;",
@@ -83,6 +85,15 @@
       "  stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; pointer-events: none; }",
       ".roigbiv-discovery-sheet.is-editing .roigbiv-discovery-view { cursor: crosshair; }",
       ".roigbiv-discovery-sheet.is-boundary-editing .roigbiv-discovery-view { cursor: cell; }",
+      ".roigbiv-discovery-centroids.is-hidden, .roigbiv-discovery-boundaries.is-hidden {",
+      "  display: none; }",
+      // Per-FOV label_id, plain (no "#") — cells_sheet.js's "#"+cell_index
+      // badge means something else (a cross-session number this page has no
+      // way to know yet), so this stays visually distinct from it.
+      ".roigbiv-discovery-badge { font-family: var(--roigbiv-font-mono, monospace);",
+      "  font-size: 10px; text-anchor: middle; dominant-baseline: middle;",
+      "  pointer-events: none; paint-order: stroke; stroke: rgba(0,0,0,0.75);",
+      "  stroke-width: 2.5px; vector-effect: non-scaling-stroke; fill: #00e5ff; }",
     ].join("\n");
     document.head.appendChild(style);
   }
@@ -260,10 +271,12 @@
       state.centroidGroup.classList.toggle("is-editing", state.editOn);
       state.centroidGroup.classList.toggle(
         "is-boundary-editing", state.editBoundaryOn);
+      state.centroidGroup.classList.toggle("is-hidden", !state.showCentroids);
     }
     if (state.boundaryGroup) {
       state.boundaryGroup.classList.toggle(
         "is-boundary-editing", state.editBoundaryOn);
+      state.boundaryGroup.classList.toggle("is-hidden", !state.showBoundaries);
     }
   }
 
@@ -286,6 +299,13 @@
       wireCentroid(circle, c);
       group.appendChild(circle);
       state.shapes[c.label_id] = circle;
+
+      var badge = document.createElementNS(SVG_NS, "text");
+      badge.setAttribute("x", c.x);
+      badge.setAttribute("y", c.y - radius - 4);
+      badge.setAttribute("class", "roigbiv-discovery-badge");
+      badge.textContent = String(c.label_id);
+      group.appendChild(badge);
     });
     var sheet = document.getElementById(SHEET_ID);
     if (sheet) { applyEditModeClasses(sheet); }
@@ -550,6 +570,8 @@
     state.editOn = !!config.edit_on;
     state.editBoundaryOn = !!config.edit_boundary_on;
     state.diameterPx = config.diameter_px || null;
+    state.showCentroids = config.show_centroids !== false;
+    state.showBoundaries = config.show_boundaries !== false;
     if (boundaryEditWas && !state.editBoundaryOn) { cancelDraw(); }
 
     if (!config.stem) {

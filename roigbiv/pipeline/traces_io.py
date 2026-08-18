@@ -15,12 +15,22 @@ Layout::
 
 When HITL corrections are applied, `reextract_from_corrections` writes a
 sibling ``corrections-{hash12}/`` subdir with the same four files. The
-primary ``traces.npy`` is never mutated.
+primary ``traces.npy`` is never mutated. `roigbiv.pipeline.discovery_extract`
+writes a sibling ``discovery-{hash12}/`` subdir the same way, for extraction
+triggered from the Discovery page against ``merged_masks.tif``.
 
 The sidecar is **byte-deterministic** across reruns of the same inputs and
 registry state: ``sort_keys=True``, no wall-clock fields, ROI order locked
 by ``label_id``, corrections_rev computed from the replayed ROI set (not
 the JSONL bytes, which change under undo/redo).
+
+Median and mode are an additive, opt-in extension: pass ``extra_stats`` to
+`write_traces_bundle` / `build_sidecar` as ``{"median": (raw, neu,
+corrected), "mode": (...)}`` and each gets its own
+``traces_{stat}[.npy|_raw.npy|_neuropil.npy]`` triad plus matching
+``sidecar["files"]`` entries and a ``sidecar["stats"]`` list. ``extra_stats``
+defaults to ``None`` for every existing caller, which writes exactly the
+same three files and sidecar shape as before this was added.
 """
 from __future__ import annotations
 
@@ -74,6 +84,7 @@ def build_sidecar(
     fov_shape: Optional[tuple[int, int, int]] = None,
     corrections_log: Optional[Path] = None,
     workspace_root: Optional[Path] = None,
+    extra_stats: Optional[tuple[str, ...]] = None,
 ) -> dict:
     """Build the ``traces_meta.json`` payload.
 
@@ -86,7 +97,7 @@ def build_sidecar(
     cfg
         Carries ``fs`` (effective Hz in roigbiv convention) and ``frame_averaging``.
     source
-        ``"pipeline"`` | ``"corrections"``.
+        ``"pipeline"`` | ``"corrections"`` | ``"discovery"``.
     registry_report
         The dict returned by ``register_or_match``, or ``None`` when the
         pipeline ran without registry or the decision was ``"review"``.
@@ -96,6 +107,13 @@ def build_sidecar(
         Provenance — so re-extract can find ``data.bin`` on future runs.
         If ``workspace_root`` is given and ``data_bin_path`` is inside it,
         we record a relative path. Absolute path is always recorded.
+    extra_stats
+        Names of additional statistics written alongside mean (e.g.
+        ``("median", "mode")``) — ``None`` for the default mean-only path,
+        which leaves ``files``/``rois`` byte-identical to before this
+        parameter existed. When given, adds a ``{name}``/``{name}_raw``/
+        ``{name}_neuropil`` entry per stat to ``files`` and a top-level
+        ``stats`` list.
     """
     n_rois, n_frames = int(F_corrected.shape[0]), int(F_corrected.shape[1])
 
@@ -160,7 +178,12 @@ def build_sidecar(
     fs = float(cfg.fs)
     frame_averaging = int(cfg.frame_averaging)
 
-    return {
+    files = {
+        "primary": "traces.npy",
+        "raw": "traces_raw.npy",
+        "neuropil": "traces_neuropil.npy",
+    }
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "source": source,
         "fs": fs,
@@ -177,12 +200,15 @@ def build_sidecar(
         "neuropil": neuropil,
         "provenance": provenance,
         "rois": rois_payload,
-        "files": {
-            "primary": "traces.npy",
-            "raw": "traces_raw.npy",
-            "neuropil": "traces_neuropil.npy",
-        },
+        "files": files,
     }
+    if extra_stats:
+        for name in extra_stats:
+            files[name] = f"traces_{name}.npy"
+            files[f"{name}_raw"] = f"traces_{name}_raw.npy"
+            files[f"{name}_neuropil"] = f"traces_{name}_neuropil.npy"
+        payload["stats"] = ["mean", *extra_stats]
+    return payload
 
 
 # ── bundle writer ──────────────────────────────────────────────────────────
@@ -204,9 +230,16 @@ def write_traces_bundle(
     corrections_log: Optional[Path] = None,
     workspace_root: Optional[Path] = None,
     subdir: str = "traces",
+    extra_stats: Optional[dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]] = None,
 ) -> Path:
     """Write ``traces.npy`` / ``traces_raw.npy`` / ``traces_neuropil.npy`` /
     ``traces_meta.json`` into ``{output_dir}/{subdir}/``.
+
+    ``extra_stats``, e.g. ``{"median": (F_raw, F_neu, F_corrected), "mode":
+    (...)}``, additionally writes a ``traces_{name}[.npy|_raw.npy|
+    _neuropil.npy]`` triad per statistic and records it in the sidecar.
+    ``None`` (every caller before this parameter existed) writes exactly the
+    original three files.
 
     Returns the bundle directory path. Idempotent — overwrites existing files.
     """
@@ -221,6 +254,15 @@ def write_traces_bundle(
     np.save(str(bundle_dir / "traces_raw.npy"), F_raw)
     np.save(str(bundle_dir / "traces_neuropil.npy"), F_neu)
 
+    if extra_stats:
+        for name, (stat_raw, stat_neu, stat_corrected) in extra_stats.items():
+            np.save(str(bundle_dir / f"traces_{name}.npy"),
+                    np.ascontiguousarray(stat_corrected, dtype=np.float32))
+            np.save(str(bundle_dir / f"traces_{name}_raw.npy"),
+                    np.ascontiguousarray(stat_raw, dtype=np.float32))
+            np.save(str(bundle_dir / f"traces_{name}_neuropil.npy"),
+                    np.ascontiguousarray(stat_neu, dtype=np.float32))
+
     sidecar = build_sidecar(
         rois_sorted,
         F_corrected,
@@ -232,6 +274,7 @@ def write_traces_bundle(
         fov_shape=fov_shape,
         corrections_log=corrections_log,
         workspace_root=workspace_root,
+        extra_stats=tuple(extra_stats.keys()) if extra_stats else None,
     )
     # Neuropil presence: all-zero output signals an empty-annulus degenerate run.
     sidecar["neuropil"]["present"] = bool(F_neu.size and np.any(F_neu != 0.0))

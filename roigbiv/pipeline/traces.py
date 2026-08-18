@@ -14,6 +14,18 @@ Pipeline:
 
 Reads from fov.data_bin_path (Suite2p-format int16 (T, Ly, Lx) memmap). Casts
 to float32 per chunk so the full 18 GB movie never lives in RAM.
+
+Median and mode (extract_median_mode_traces_chunked / extract_all_traces_full)
+are a separate, opt-in extraction path — mean's per-frame spatial average is a
+linear operator (a matmul against a dense mask matrix), but median and mode
+are not, so they cannot reuse that trick and instead gather each mask's pixels
+directly out of every chunk. They get the same neuropil-correction treatment
+as mean (stat_corrected = stat(ROI px) - α·stat(neuropil px), using that
+statistic's own aggregate), but NOT overlap correction
+(roigbiv.pipeline.overlap_correction is a linear least-squares demixing
+solver — meaningful only for the mean). This path is only invoked from the
+Discovery page's on-demand extraction (roigbiv.pipeline.discovery_extract);
+the automatic per-FOV pipeline run stays mean-only.
 """
 from __future__ import annotations
 
@@ -144,6 +156,193 @@ def correct_neuropil(
 ) -> np.ndarray:
     """F_corrected = F_raw - α × F_neuropil (spec §13.2)."""
     return (F_raw - alpha * F_neu).astype(np.float32)
+
+
+# ── median / mode (opt-in, Discovery-triggered) ────────────────────────────
+
+_MAX_MODE_BINS = 8192
+
+
+def _estimate_value_range(
+    memmap_path: Path,
+    shape: tuple,
+    dtype: np.dtype,
+    *,
+    sample_stride: int = 50,
+    pad: int = 4,
+) -> tuple[int, int]:
+    """Cheap strided sample of data.bin's value range, for mode's bincount sizing.
+
+    Reads every ``sample_stride``-th frame only — a full scan would double
+    the cost of an already two-pass (median + mode) extraction. ``pad``
+    guards against the sample missing the true extremes; the caller still
+    clips to this band, so an under-estimate only costs accuracy on rare
+    outlier pixels, never correctness.
+    """
+    T, H, W = shape
+    mm = np.memmap(str(memmap_path), dtype=dtype, mode="r", shape=(T, H, W))
+    sample = np.asarray(mm[::sample_stride])
+    del mm
+    if sample.size == 0:
+        return 0, 1
+    return int(sample.min()) - pad, int(sample.max()) + pad
+
+
+def _mode_via_bincount(sub: np.ndarray, vmin: int, nbins: int) -> np.ndarray:
+    """Per-row (per-frame) mode of ``sub`` (frames × pixels), vectorized.
+
+    Pixel intensities are native int16 — an exact integer mode, no
+    continuous-data binning ambiguity. Encodes (frame, clipped value) pairs
+    into one flat key so a single ``np.bincount`` produces every frame's
+    histogram at once; ``scipy.stats.mode`` would need one call per
+    (mask, chunk) pair and is not fast enough at that call count.
+    """
+    cs, k = sub.shape
+    if k == 0:
+        return np.zeros(cs, dtype=np.float32)
+    clipped = np.clip(sub, vmin, vmin + nbins - 1) - vmin
+    keys = (np.arange(cs, dtype=np.int64)[:, None] * nbins + clipped).ravel()
+    counts = np.bincount(keys, minlength=cs * nbins).reshape(cs, nbins)
+    return (counts.argmax(axis=1) + vmin).astype(np.float32)
+
+
+def extract_median_mode_traces_chunked(
+    memmap_path: Path,
+    shape: tuple,
+    dtype: np.dtype,
+    masks: list[np.ndarray],
+    *,
+    stats: tuple[str, ...] = ("median", "mode"),
+    chunk: int = 500,
+    value_range: Optional[tuple[int, int]] = None,
+) -> dict[str, np.ndarray]:
+    """Stream a (T, H, W) memmap in temporal chunks, returning per-mask
+    median and/or mode traces (whichever ``stats`` names).
+
+    Unlike ``extract_mean_trace_chunked``, mean is a linear operator; median
+    and mode are not, so each mask's pixels are gathered directly out of
+    every chunk instead of via a dense matmul. Each mask's flat pixel-index
+    array is precomputed once, keeping this a single pass over the memmap.
+
+    Only requested ``stats`` do work: the mode's value-range sample and
+    bincount pass are skipped entirely when only ``"median"`` is asked for.
+
+    Assumes integer-valued input (int16 Suite2p data.bin) when ``"mode"`` is
+    requested — mode's bincount encoding does not support float movies.
+
+    Returns
+    -------
+    dict with ``"median"`` and/or ``"mode"`` keys, each (N, T) float32.
+    """
+    T, H, W = shape
+    N = len(masks)
+    want_median = "median" in stats
+    want_mode = "mode" in stats
+
+    if N == 0:
+        empty = np.zeros((0, T), dtype=np.float32)
+        out: dict[str, np.ndarray] = {}
+        if want_median:
+            out["median"] = empty
+        if want_mode:
+            out["mode"] = empty.copy()
+        return out
+
+    idx_by_mask = [np.flatnonzero(m.ravel()) for m in masks]
+
+    vmin = nbins = 0
+    if want_mode:
+        vmin, vmax = (value_range if value_range is not None
+                       else _estimate_value_range(memmap_path, shape, dtype))
+        nbins = max(1, min(int(vmax - vmin + 1), _MAX_MODE_BINS))
+
+    median_traces = np.empty((N, T), dtype=np.float32) if want_median else None
+    mode_traces = np.empty((N, T), dtype=np.float32) if want_mode else None
+
+    mm = np.memmap(str(memmap_path), dtype=dtype, mode="r", shape=(T, H, W))
+    for t0 in range(0, T, chunk):
+        t1 = min(t0 + chunk, T)
+        flat_chunk = np.asarray(mm[t0:t1], dtype=np.int32).reshape(t1 - t0, H * W)
+        for i, idx in enumerate(idx_by_mask):
+            if idx.size == 0:
+                if want_median:
+                    median_traces[i, t0:t1] = 0.0
+                if want_mode:
+                    mode_traces[i, t0:t1] = 0.0
+                continue
+            sub = flat_chunk[:, idx]
+            if want_median:
+                median_traces[i, t0:t1] = np.median(sub, axis=1)
+            if want_mode:
+                mode_traces[i, t0:t1] = _mode_via_bincount(sub, vmin, nbins)
+    del mm
+
+    out = {}
+    if want_median:
+        out["median"] = median_traces
+    if want_mode:
+        out["mode"] = mode_traces
+    return out
+
+
+def extract_all_traces_full(
+    fov: FOVData,
+    rois: list[ROI],
+    cfg: PipelineConfig,
+    *,
+    stats: tuple[str, ...] = ("median", "mode"),
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Extract mean plus optional median/mode statistics, each independently
+    neuropil-corrected.
+
+    Mean is always included via the existing ``extract_all_traces`` (does not
+    mutate ``rois`` any differently than that function already does).
+    Requested extra ``stats`` get their own correction pass — see the module
+    docstring for why overlap correction does not apply to them.
+
+    ``stats`` may contain ``"median"``, ``"mode"``, or both; ``"mean"`` is
+    implicit and does not need to be named.
+
+    Returns
+    -------
+    dict keyed by statistic name → ``(F_raw, F_neu, F_corrected)``, each
+    ``(N_rois, T)`` float32. Always contains ``"mean"``.
+    """
+    extra_stats = tuple(s for s in stats if s != "mean")
+    for name in extra_stats:
+        if name not in ("median", "mode"):
+            raise ValueError(
+                f"unknown trace statistic {name!r}; expected 'median' or 'mode'")
+
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
+        "mean": extract_all_traces(fov, rois, cfg),
+    }
+    if not extra_stats:
+        return result
+
+    T, H, W = fov.shape
+    n = len(rois)
+    if n == 0:
+        empty = np.zeros((0, T), dtype=np.float32)
+        for name in extra_stats:
+            result[name] = (empty, empty.copy(), empty.copy())
+        return result
+
+    roi_masks = [r.mask for r in rois]
+    neuropil_masks = build_neuropil_masks(
+        roi_masks, (H, W), cfg.neuropil_inner_buffer, cfg.neuropil_outer_radius)
+    all_masks = roi_masks + neuropil_masks
+
+    traces_by_stat = extract_median_mode_traces_chunked(
+        fov.data_bin_path, fov.shape, np.int16, all_masks, stats=extra_stats,
+    )
+    for name in extra_stats:
+        stat_raw = traces_by_stat[name][:n]
+        stat_neu = traces_by_stat[name][n:]
+        stat_corrected = correct_neuropil(stat_raw, stat_neu, cfg.neuropil_coeff)
+        result[name] = (stat_raw, stat_neu, stat_corrected)
+
+    return result
 
 
 def extract_all_traces(
