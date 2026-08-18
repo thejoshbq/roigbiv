@@ -16,6 +16,7 @@ import sys
 import tarfile
 import warnings
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -24,6 +25,25 @@ import numpy as np
 import tifffile
 
 _tifffile_log = logging.getLogger("tifffile")
+
+
+@contextmanager
+def _quiet_tifffile_uic_chatter():
+    """Suppress tifffile's UIC-tag parser warnings for the duration of a read.
+
+    STK-format raw acquisitions in this lab (Prairie View / MetaMorph) embed a
+    ``CreateTime``/``LastSavedTime`` UIC tag with a zeroed timestamp; tifffile
+    catches the resulting ``ValueError`` internally and logs a warning per
+    occurrence rather than raising — cosmetic, not a read failure. Any function
+    that opens a raw acquisition TIF directly (as opposed to a pipeline-written
+    one, which never carries UIC tags) should wrap the open in this.
+    """
+    saved_level = _tifffile_log.level
+    _tifffile_log.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        _tifffile_log.setLevel(saved_level)
 
 # TIFF Software tag (305) value stamped onto every motion-corrected ``{stem}_mc.tif``
 # the pipeline writes (registration.py / legacy_mc.py). Lets a corrected movie be
@@ -476,7 +496,7 @@ def detect_motion_corrected(path) -> tuple:
     """
     path = Path(path)
     try:
-        with tifffile.TiffFile(str(path)) as tif:
+        with _quiet_tifffile_uic_chatter(), tifffile.TiffFile(str(path)) as tif:
             tag = tif.pages[0].tags.get("Software")
             value = tag.value if tag is not None else None
         if isinstance(value, bytes):
@@ -508,7 +528,7 @@ def validate_tif(path) -> tuple:
     """
     path = Path(path)
     try:
-        with tifffile.TiffFile(str(path)) as tif:
+        with _quiet_tifffile_uic_chatter(), tifffile.TiffFile(str(path)) as tif:
             series = tif.series
             if not series:
                 raise ValueError("TIF contains no image series")
@@ -554,7 +574,7 @@ def read_tiff_optics_metadata(path) -> dict:
     """
     path = Path(path)
     try:
-        with tifffile.TiffFile(str(path)) as tif:
+        with _quiet_tifffile_uic_chatter(), tifffile.TiffFile(str(path)) as tif:
             # 1) OME-XML PhysicalSizeX (µm by default).
             ome = getattr(tif, "ome_metadata", None)
             if ome:

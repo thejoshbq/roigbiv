@@ -12,6 +12,13 @@ GET  /api/discovery/<stem>/image.png    — mean projection as PNG
 POST /api/discovery/<stem>/gesture      — apply one centroid (add/delete/move/
                                           undo) or boundary (draw_boundary/
                                           delete_boundary/undo_boundary) op
+GET  /api/discovery/<stem>/traces.h5    — download the freshest traces/
+                                          bundle as a self-contained HDF5
+                                          file (roigbiv.pipeline.export_io) —
+                                          the only route in this module whose
+                                          response leaves the server, since a
+                                          Dash callback's return value never
+                                          does
 
 No route takes a filesystem path. *stem* resolves against the session's
 ``AppState.workspace.output_root`` and must name an existing, direct child of
@@ -27,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.discovery_edit_ops import Gesture, apply_gesture
@@ -104,14 +111,10 @@ def _boundary_contours(output_dir: Path) -> dict:
     return contours
 
 
-def _radius(output_dir: Path) -> float:
-    """The marker radius to draw centroids at — a measurement when there is one."""
-    from roigbiv.pipeline.calibration import load_calibration
-
-    calib = load_calibration(output_dir)
-    if calib is not None and calib.diameter_px > 0:
-        return float(calib.diameter_px) / 2.0
-    return 8.0  # PipelineConfig.roi_stamp_radius default
+# A centroid marker is a location, not a measurement — sizing it to the
+# calibrated diameter made it a second, redundant boundary drawing that
+# occluded the real one. Fixed and small: just big enough to grab.
+CENTROID_MARKER_RADIUS_PX = 5.0
 
 
 # ── serialisation ──────────────────────────────────────────────────────────
@@ -146,7 +149,7 @@ def serialize_fov(stem: str, output_dir: Path) -> dict:
         "width": width,
         "height": height,
         "image_url": f"/api/discovery/{stem}/image.png",
-        "radius": _radius(output_dir),
+        "radius": CENTROID_MARKER_RADIUS_PX,
         "centroids": centroids,
         "warnings": warnings,
     }
@@ -231,6 +234,38 @@ def register_flask_routes(server: Flask) -> None:
         else:
             resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @server.route("/api/discovery/<stem>/traces.h5")
+    def discovery_traces_download(stem: str):
+        output_dir, err = _load(stem)
+        if err is not None:
+            return err
+
+        from roigbiv.pipeline.export_io import export_fov_traces_to_tempfile
+
+        # Every kind export_io knows about — missing files (e.g. dFF.npy on a
+        # Discovery-extracted bundle, which never computes dF/F) are dropped
+        # silently by export_fov_traces, so this is "whatever's actually in
+        # the bundle" rather than a fixed subset the caller has to guess at.
+        kinds = ("dff", "f", "raw", "neuropil", "median", "mode")
+        try:
+            tmp_path = export_fov_traces_to_tempfile(output_dir, kinds=kinds)
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user as-is
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+        try:
+            data = tmp_path.read_bytes()
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        return send_file(
+            io.BytesIO(data),
+            mimetype="application/x-hdf5",
+            as_attachment=True,
+            download_name=f"{stem}_traces.h5",
+        )
 
     @server.route("/api/discovery/<stem>/gesture", methods=["POST"])
     def discovery_gesture(stem: str):

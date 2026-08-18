@@ -82,12 +82,16 @@ Y_LABELS: dict[SignalKind, str] = {
 # ── primary bundle selection ──────────────────────────────────────────────
 
 
+_REVISION_PREFIXES = ("corrections-", "discovery-")
+
+
 def _select_bundle_dir(output_dir: Path) -> tuple[Optional[Path], str]:
     """Return (bundle_dir, source_label) for the freshest available bundle.
 
-    Prefers ``traces/corrections-*/`` when its sidecar is newer than the
-    primary ``traces/``. Falls back to the primary. Returns ``(None, "")``
-    when neither exists.
+    Prefers ``traces/corrections-*/`` or ``traces/discovery-*/`` (HITL
+    re-extraction and Discovery-page extraction, respectively) when its
+    sidecar is newer than the primary ``traces/``. Falls back to the
+    primary. Returns ``(None, "")`` when neither exists.
     """
     traces_root = output_dir / "traces"
     primary_meta = traces_root / "traces_meta.json"
@@ -96,7 +100,7 @@ def _select_bundle_dir(output_dir: Path) -> tuple[Optional[Path], str]:
     newest_corr_mtime = -1.0
     if traces_root.is_dir():
         for sub in traces_root.iterdir():
-            if sub.is_dir() and sub.name.startswith("corrections-"):
+            if sub.is_dir() and sub.name.startswith(_REVISION_PREFIXES):
                 meta = sub / "traces_meta.json"
                 if meta.exists() and meta.stat().st_mtime > newest_corr_mtime:
                     newest_corr = sub

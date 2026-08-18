@@ -140,6 +140,50 @@ def test_the_boundary_section_is_hidden_without_centroids(monkeypatch, tmp_path)
     assert section.style == {"display": "none"}
 
 
+# ── the extraction section ──────────────────────────────────────────────────
+
+
+def test_the_extraction_section_is_hidden_without_merged_masks(monkeypatch, tmp_path):
+    monkeypatch.setattr(discovery, "get_app_state",
+                        lambda: _FakeState(output_root=tmp_path))
+    section = find_by_id(discovery.layout(), discovery.EXTRACT_SECTION_ID)
+    assert section.style == {"display": "none"}
+
+
+def test_has_merged_masks_is_false_without_the_file(tmp_path):
+    out = tmp_path / "sess01"
+    out.mkdir()
+    assert discovery._has_merged_masks(out) is False
+    assert discovery._extraction_style(out) == {"display": "none"}
+
+
+def test_has_merged_masks_is_true_once_written(tmp_path):
+    out = tmp_path / "sess01"
+    out.mkdir()
+    tifffile.imwrite(out / "merged_masks.tif", np.zeros((8, 8), np.uint16))
+    assert discovery._has_merged_masks(out) is True
+    assert discovery._extraction_style(out) == {}
+
+
+def test_extraction_status_without_a_bundle_says_so(tmp_path):
+    out = tmp_path / "sess01"
+    out.mkdir()
+    status = discovery._extraction_status(out)
+    assert "No trace bundle" in text(status)
+
+
+def test_extraction_status_without_a_fov_is_none():
+    assert discovery._extraction_status(None) is None
+
+
+def test_extraction_section_carries_the_stats_checklist_and_button(monkeypatch):
+    monkeypatch.setattr(discovery, "get_app_state", lambda: _FakeState())
+    present = ids(discovery.layout())
+    for cid in (discovery.EXTRACT_STATS_ID, discovery.EXTRACT_BTN_ID,
+                discovery.EXTRACT_STATUS_ID):
+        assert cid in present
+
+
 # ── the boundary preview (ported from test_boundaries_page) ────────────────
 
 H = W = 96
@@ -651,6 +695,60 @@ def test_a_centroid_gesture_does_not_recompute_boundary_contours(api_client):
     resp = api_client.post("/api/discovery/sess01/gesture",
                            json={"kind": "add", "y": 55.0, "x": 12.0})
     assert "boundaries" not in resp.get_json()
+
+
+# ── discovery_api: traces.h5 download ───────────────────────────────────────
+
+
+def test_traces_download_404s_without_a_bundle(api_client):
+    resp = api_client.get("/api/discovery/sess01/traces.h5")
+    assert resp.status_code == 404
+
+
+def test_traces_download_404s_for_an_unknown_stem(api_client):
+    resp = api_client.get("/api/discovery/nope/traces.h5")
+    assert resp.status_code == 404
+
+
+def test_traces_download_serves_the_freshest_bundle(api_client, api_workspace):
+    import pandas as pd
+
+    from roigbiv.pipeline.traces_io import write_traces_bundle
+    from roigbiv.pipeline.types import PipelineConfig, ROI
+
+    out = api_workspace.out_dir
+    mask = np.zeros((96, 96), dtype=bool)
+    mask[0:4, 0:4] = True
+    roi = ROI(mask=mask, label_id=1, source_stage=1, confidence="high",
+              gate_outcome="accept", area=int(mask.sum()))
+    F = np.ones((1, 5), dtype=np.float32)
+    write_traces_bundle(
+        [roi], F, np.zeros_like(F), F, out, PipelineConfig(fs=7.5),
+        source="discovery",
+    )
+
+    resp = api_client.get("/api/discovery/sess01/traces.h5")
+    assert resp.status_code == 200
+    assert resp.headers["Content-Type"] == "application/x-hdf5"
+    assert "sess01_traces.h5" in resp.headers["Content-Disposition"]
+
+    tmp = tmp_path_for_response(resp)
+    with pd.HDFStore(str(tmp), "r") as store:
+        assert "/f" in store
+        meta = store["/meta"]
+        assert list(meta.index) == ["lcl:1"]
+
+
+def tmp_path_for_response(resp) -> Path:
+    """Write a test-client response's bytes to a scratch file so pandas'
+    ``HDFStore`` (which needs a real path, not a file-like object) can read
+    it back."""
+    import tempfile
+
+    fd, name = tempfile.mkstemp(suffix=".h5")
+    with open(fd, "wb") as f:
+        f.write(resp.get_data())
+    return Path(name)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,13 @@ _KIND_FILES: dict[str, str] = {
     "f":        "traces.npy",
     "raw":      "traces_raw.npy",
     "neuropil": "traces_neuropil.npy",
+    # Present only in bundles a Discovery-triggered extraction wrote with
+    # extra_stats (roigbiv.pipeline.discovery_extract) — corrected only for
+    # now, raw/neuropil variants exist on disk but aren't exported as their
+    # own kinds yet. _load_kind already returns None silently when a bundle
+    # predates these, so requesting them against an older bundle is a no-op.
+    "median":   "traces_median.npy",
+    "mode":     "traces_mode.npy",
 }
 
 
