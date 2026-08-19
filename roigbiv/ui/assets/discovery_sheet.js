@@ -49,6 +49,9 @@
     draw: null,             // {label, points: [[y, x], ...]} while drawing
     generation: 0,          // bumped on every rebuild; stale async work checks it
     osdPromise: null,
+    movieOn: false,
+    frameCanvas: null,
+    frameHolder: null,
   };
 
   // ── styles ────────────────────────────────────────────────────────────────
@@ -231,6 +234,9 @@
     var width = state.data.width || 1;
     var height = state.data.height || 1;
 
+    // Added before the SVG so DOM order puts the movie underneath the markers.
+    attachFrameCanvas(viewer);
+
     var svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("viewBox", "0 0 " + width + " " + height);
     svg.setAttribute("preserveAspectRatio", "none");
@@ -278,6 +284,111 @@
         "is-boundary-editing", state.editBoundaryOn);
       state.boundaryGroup.classList.toggle("is-hidden", !state.showBoundaries);
     }
+  }
+
+  // ── movie layer (read-only, under the markers) ───────────────────────────
+  //
+  // The movie is painted into an OSD overlay rather than swapped into the tile
+  // source. OSD keeps owning zoom and pan, the SVG above keeps owning
+  // gestures, and this canvas only ever receives pixels — which is why editing
+  // and zooming keep working during playback without either knowing about it.
+  //
+  // Transport, buffering and the controls live in assets/discovery_player.js;
+  // everything here is the OSD-coordinate half it deliberately does not know.
+
+  // Extra image pixels fetched beyond the visible rect, so a small pan is
+  // served from the buffer instead of invalidating it.
+  var RECT_PAD_PX = 24;
+
+  function attachFrameCanvas(viewer) {
+    var canvas = document.createElement("canvas");
+    canvas.className = "roigbiv-player-canvas is-hidden";
+
+    var holder = document.createElement("div");
+    holder.className = "roigbiv-discovery-overlay-holder";
+    holder.appendChild(canvas);
+
+    // Placed over the whole image to start; visibleRect() re-places it on the
+    // crop as soon as the player asks for one.
+    viewer.addOverlay({
+      element: holder,
+      location: new window.OpenSeadragon.Rect(
+        0, 0, 1, (state.data.height || 1) / (state.data.width || 1)),
+    });
+
+    state.frameCanvas = canvas;
+    state.frameHolder = holder;
+
+    if (!window.roigbivDiscoveryPlayer) { return; }
+    window.roigbivDiscoveryPlayer.mount({
+      canvas: canvas,
+      controlsMount: document.getElementById(SHEET_ID),
+      getRect: visibleRect,
+      // The player must not take Escape/Enter/arrows out from under an
+      // in-progress boundary ring.
+      isDrawing: function () { return !!state.draw; },
+      onRectApplied: placeFrameOverlay,
+    });
+    window.roigbivDiscoveryPlayer.setStem(state.stem).then(function () {
+      window.roigbivDiscoveryPlayer.setEnabled(state.movieOn);
+    });
+
+    viewer.addHandler("animation-finish", onViewportSettled);
+    viewer.addHandler("resize", onViewportSettled);
+  }
+
+  function onViewportSettled() {
+    if (window.roigbivDiscoveryPlayer) {
+      window.roigbivDiscoveryPlayer.setRect();
+    }
+  }
+
+  /* The image rectangle currently on screen, padded, plus the decimation the
+   * screen can actually resolve. Returned to the player, which turns it into a
+   * crop request — this is what makes playback while zoomed in cost a fraction
+   * of a full frame. */
+  function visibleRect() {
+    var viewer = state.viewer;
+    if (!viewer || !viewer.isOpen() || !state.data) { return null; }
+    var imgW = state.data.width || 1;
+    var imgH = state.data.height || 1;
+
+    var bounds = viewer.viewport.getBounds(true);
+    var tl = viewer.viewport.viewportToImageCoordinates(bounds.getTopLeft());
+    var br = viewer.viewport.viewportToImageCoordinates(bounds.getBottomRight());
+
+    var x0 = clamp(Math.floor(tl.x) - RECT_PAD_PX, 0, imgW - 1);
+    var y0 = clamp(Math.floor(tl.y) - RECT_PAD_PX, 0, imgH - 1);
+    var x1 = clamp(Math.ceil(br.x) + RECT_PAD_PX, x0 + 1, imgW);
+    var y1 = clamp(Math.ceil(br.y) + RECT_PAD_PX, y0 + 1, imgH);
+    var rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+
+    // How many image pixels each screen pixel covers, snapped down to a power
+    // of two: a continuous stride would re-key the buffer on every small zoom
+    // nudge, and the visible difference between ds=3 and ds=4 is nil.
+    var containerW = viewer.viewport.getContainerSize().x || 1;
+    var screenPerImage = (containerW * viewer.viewport.getZoom(true)) / imgW;
+    var imagePerScreen = screenPerImage > 0 ? 1 / screenPerImage : 1;
+    var ds = Math.pow(2, Math.floor(Math.log2(Math.max(1, imagePerScreen))));
+    rect.ds = clamp(ds, 1, 8);
+
+    return rect;
+  }
+
+  /* Move the canvas overlay onto a crop, in OSD's normalized coordinates (both
+   * axes divided by image *width* — see attachOverlay). Called by the player
+   * once it has actually painted a frame of that crop, never when the crop is
+   * merely chosen: repositioning first would stretch the previous crop's
+   * pixels over the new rectangle for as long as the fetch takes. */
+  function placeFrameOverlay(rect) {
+    if (!state.viewer || !state.frameHolder || !state.data) { return; }
+    var imgW = state.data.width || 1;
+    state.viewer.updateOverlay(state.frameHolder, new window.OpenSeadragon.Rect(
+      rect.x / imgW, rect.y / imgW, rect.w / imgW, rect.h / imgW));
+  }
+
+  function clamp(value, lo, hi) {
+    return Math.max(lo, Math.min(value, hi));
   }
 
   // ── centroid layer (editable) ────────────────────────────────────────────
@@ -548,6 +659,11 @@
   function destroy() {
     state.generation += 1;
     cancelDraw();
+    if (window.roigbivDiscoveryPlayer) {
+      window.roigbivDiscoveryPlayer.destroy();
+    }
+    state.frameCanvas = null;
+    state.frameHolder = null;
     if (state.viewer) {
       try { state.viewer.destroy(); } catch (e) { /* already gone */ }
     }
@@ -572,6 +688,7 @@
     state.diameterPx = config.diameter_px || null;
     state.showCentroids = config.show_centroids !== false;
     state.showBoundaries = config.show_boundaries !== false;
+    state.movieOn = !!config.movie_on;
     if (boundaryEditWas && !state.editBoundaryOn) { cancelDraw(); }
 
     if (!config.stem) {
@@ -589,6 +706,11 @@
     if (config.stem === state.stem && state.data) {
       drawCentroids();
       drawCalibrationCircle();
+      // Toggling the movie is a visibility change on a live player, never a
+      // rebuild — same reason the edit switches take this path.
+      if (window.roigbivDiscoveryPlayer) {
+        window.roigbivDiscoveryPlayer.setEnabled(state.movieOn);
+      }
       var sheet = document.getElementById(SHEET_ID);
       if (sheet) { applyEditModeClasses(sheet); }
       return;

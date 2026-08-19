@@ -7,7 +7,10 @@ One page per operation, in the order the operations happen:
 2. **Discovery** — per-FOV Cellpose calibration, the detection run, and
    tuning the seeded boundaries detection produces
    (``pages/discovery.py``). Was two pages (Centroids, Boundaries); merged
-   because they are one workflow on one FOV, not two.
+   because they are one workflow on one FOV, not two. Its viewer can also
+   play the registered movie under the markers (**Live movie**), so the Fiji
+   habit of scrubbing for a transient before drawing around it has an
+   equivalent here — see ``services/movie_source.py``.
 3. **Tracking** — session order, cross-session registration, and the contact
    sheet where cells are reviewed and corrected (``pages/tracking.py``).
 
