@@ -210,6 +210,35 @@ body::before {
     border-left: 2px solid var(--roigbiv-accent) !important;
 }
 
+/* ── Tooltips (hover-help info cards) ─────────────────────────────────────
+ * Bootstrap's stock tooltip is unstyled here otherwise: black bg, centered
+ * text, 200px max-width — on this theme's pure-black page it barely reads
+ * as a distinct surface. The --bs-tooltip-* custom properties alone weren't
+ * enough to retint it (same issue .card hit above), so force literal
+ * values with !important rather than relying on CYBORG threading the vars
+ * through cleanly.
+ */
+.tooltip {
+    --bs-tooltip-max-width: 320px;
+    --bs-tooltip-padding-x: 0.65rem;
+    --bs-tooltip-padding-y: 0.5rem;
+    font-family: var(--roigbiv-font-body);
+    font-size: 0.8rem !important;
+    opacity: 1 !important;
+}
+.tooltip .tooltip-arrow::before {
+    border-top-color: var(--roigbiv-border) !important;
+    border-bottom-color: var(--roigbiv-border) !important;
+}
+.tooltip-inner {
+    background-color: var(--roigbiv-panel) !important;
+    color: var(--roigbiv-text-primary) !important;
+    text-align: left !important;
+    border: 1px solid var(--roigbiv-border) !important;
+    border-radius: var(--roigbiv-radius) !important;
+    box-shadow: 0 0 12px var(--roigbiv-cyan-glow);
+}
+
 /* ── Buttons ───────────────────────────────────────────────────────────── */
 .btn {
     font-family: var(--roigbiv-font-body);

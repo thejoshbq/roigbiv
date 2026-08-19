@@ -99,13 +99,10 @@ def test_mc_backend_values_match_cli_choices():
 
 
 def test_mc_backend_legacy_option_has_help_text():
-    # A help note must accompany the selector so users know legacy needs the
-    # sidecar env and is slow.
-    help_small = find_by_id(_params_form(), "roigbiv-param-mc-backend-help")
-    body = "".join(str(c) for c in
-                   (help_small.children if isinstance(help_small.children, (list, tuple))
-                    else [help_small.children]))
-    assert "sima-legacy" in body and "slow" in body.lower()
+    # The field's hover-help tooltip must cover legacy needing the sidecar
+    # env and being slow — this used to be a separate always-visible note.
+    text = HELP_TEXT[MC_BACKEND_ID]
+    assert "sima-legacy" in text and "slow" in text.lower()
 
 
 # ── the params form ────────────────────────────────────────────────────────
