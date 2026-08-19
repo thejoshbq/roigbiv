@@ -34,6 +34,17 @@ def help_icon(target_id: str, help_text: str) -> list:
     ]
 
 
+def button_tooltip(target_id: str, help_text: str) -> dbc.Tooltip:
+    """A ``dbc.Tooltip`` triggered by hovering ``target_id`` directly.
+
+    For buttons: the button's own label is already the hover target, so a
+    separate info icon next to it is redundant clutter. Unlike a number
+    input, a button doesn't flicker its hover state from an adjacent
+    element gaining focus, so targeting it directly is safe here.
+    """
+    return dbc.Tooltip(help_text, target=target_id, placement="top")
+
+
 def labeled_with_help(
     label_text: str,
     target_id: str,
@@ -88,8 +99,10 @@ HELP_TEXT: dict[str, str] = {
         "default — Suite2p rigid/non-rigid phase correlation, tuned to "
         "legacy-SIMA parity on dim Prism FOVs; rowwise-pcc is the opt-in GPU "
         "row-wise non-rigid fast path (can haze/band low-SNR FOVs); legacy is "
-        "the original SIMA HMM2D (CPU-only, slow, needs the sima-legacy env). "
-        "Skipped for pre-corrected _mc stacks.",
+        "the genuine SIMA HiddenMarkov2D from the original notebook — CPU-"
+        "only and slow (~16 min/session), needs the 'sima-legacy' conda env "
+        "(build once with envs/build_sima_legacy.sh). Skipped for pre-"
+        "corrected _mc stacks.",
     "roigbiv-param-mc-strip-height":
         "Height in rows of the horizontal strips the row-wise motion correction "
         "registers independently. Larger = steadier but coarser non-rigid "
@@ -186,9 +199,56 @@ HELP_TEXT: dict[str, str] = {
     # Pipeline · Notifications
     "roigbiv-param-slack-channel":
         "Posts a run summary and overlay PNGs to this Slack channel when the "
-        "run finishes. Leave blank to disable. Requires ROIGBIV_SLACK_TOKEN in "
-        "the environment that launched roigbiv-ui. See "
+        "run finishes (foundation-only runs have no ROI overlays to attach). "
+        "Leave blank to disable. Requires ROIGBIV_SLACK_TOKEN in the "
+        "environment that launched roigbiv-ui. See "
         "docs/slack-notifications.md.",
+    # Pipeline · Motion page-level
+    "roigbiv-motion-run-btn":
+        "Runs Foundation only — motion correction, background separation "
+        "and summary images. Centroid detection is on its own page.",
+    # Discovery · calibration & detection
+    "roigbiv-discovery-diameter":
+        "Per-FOV — a measured soma size, not a global setting.",
+    "roigbiv-discovery-persist-flows":
+        "The cached flow field is what boundary tuning below draws from. "
+        "Turning it off saves ~6 MB per 512² FOV and makes seeded boundaries "
+        "impossible for that FOV.",
+    "roigbiv-discovery-run-btn":
+        "Requires an already motion-corrected stack — a pre-corrected input, "
+        "or a prior motion-correction run's output. It does not run motion "
+        "correction first.",
+    # Discovery · boundary tuning & extraction
+    "roigbiv-discovery-capture":
+        "How far a flow trajectory may land from a seed and still be that "
+        "cell. Recomputes instantly against a cached flow field — nothing "
+        "here touches the GPU.",
+    "roigbiv-discovery-extract-stats":
+        "Extracts every ROI's fluorescence trace for the whole session from "
+        "this FOV's current merged_masks.tif. Mean is always extracted; "
+        "median and mode are additional per-frame spatial statistics over "
+        "the same masked pixels, each neuropil-corrected the same way as "
+        "mean.",
+    # Discovery · preview canvas gestures
+    "roigbiv-discovery-edit":
+        "drag to move · right-click to delete · click empty space to add",
+    "roigbiv-discovery-edit-boundary":
+        "click a cell to start a hand-drawn outline · click to add a point · "
+        "double-click or Enter to close · Escape to cancel · right-click a "
+        "hand-drawn outline to revert it to auto",
+    # Tracking · setup
+    "roigbiv-track-setup-toggle":
+        "Drag sessions into the order they were recorded. This order decides "
+        "which session owns each cell's identity, so it is worth getting "
+        "right.",
+    # Tracking · contact sheet
+    "roigbiv-cells-edit":
+        "drag to move · right-click to delete · click empty space to add · "
+        "ctrl-click a dashed outline to confirm the cell is there · shift-"
+        "click to link to the selected cell · Ctrl+Z to undo",
+    "roigbiv-cells-list-heading":
+        "Numbers are for reading this page only — they follow the session "
+        "order and are not the cell's registry id.",
     # Review · view controls
     "roigbiv-review-kind":
         "Trace normalization. F corrected (neuropil-subtracted fluorescence) "

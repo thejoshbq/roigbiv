@@ -27,7 +27,9 @@ from dash import Input, Output, State, dcc, html, no_update
 
 from roigbiv.ui.components import fov_select, run_panel, workspace_bar
 from roigbiv.ui.components.figure import build_roi_figure
-from roigbiv.ui.components.forms import HELP_TEXT, help_icon, labeled_with_help
+from roigbiv.ui.components.forms import (
+    HELP_TEXT, button_tooltip, help_icon, labeled_with_help,
+)
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.pipeline_runner import get_pipeline_runner
 
@@ -58,11 +60,7 @@ def _left_column() -> html.Div:
         dbc.Button("Run motion correction", id=RUN_ID,
                    color="primary", className="mt-3 w-100", n_clicks=0,
                    disabled=run_panel.run_disabled()),
-        html.Small(
-            "Runs Foundation only — motion correction, background separation "
-            "and summary images. Centroid detection is on its own page.",
-            className="text-muted d-block mt-2",
-        ),
+        button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
     ])
 
 
@@ -120,14 +118,6 @@ def _params_form() -> html.Div:
                        ],
                        value="phasecorr",
                    )),
-        html.Small(
-            "Legacy = genuine SIMA HiddenMarkov2D from the original "
-            "notebook. CPU-only and slow (~16 min/session); requires "
-            "the 'sima-legacy' conda env (build once with "
-            "envs/build_sima_legacy.sh).",
-            id="roigbiv-param-mc-backend-help",
-            className="text-muted d-block mt-1",
-        ),
         _switch_row(
             dbc.Switch(id="roigbiv-param-force-cpu",
                        label="Force CPU", value=False),
@@ -236,14 +226,6 @@ def _params_form() -> html.Div:
         _field_row("Slack channel ID", "roigbiv-param-slack-channel",
                    dbc.Input(id="roigbiv-param-slack-channel", type="text",
                              placeholder="C0123ABCD (optional)")),
-        html.Small(
-            "Posts a run summary to this Slack channel when the run "
-            "finishes (foundation-only runs have no ROI overlays to attach). "
-            "Requires ROIGBIV_SLACK_TOKEN exported in the environment that "
-            "launched roigbiv-ui. See docs/slack-notifications.md.",
-            id="roigbiv-param-slack-channel-help",
-            className="text-muted d-block mt-1",
-        ),
     ])
     form = html.Div([foundation, rowwise, legacy, phasecorr, notifications])
     _persist_param_controls(form)

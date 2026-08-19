@@ -80,6 +80,7 @@ from roigbiv.pipeline.calibration import load_calibration, write_calibration
 from roigbiv.pipeline.centroids import clear_centroid_output
 from roigbiv.ui.components import fov_select, run_panel, workspace_bar
 from roigbiv.ui.components.errors import user_error
+from roigbiv.ui.components.forms import HELP_TEXT, button_tooltip, help_icon
 from roigbiv.ui.services import boundary_preview
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.extraction_runner import get_extraction_runner
@@ -158,14 +159,13 @@ def _left_column() -> html.Div:
     stats, _contours = _boundary_preview_payload(out_dir, capture, min_area)
     return html.Div([
         html.H4("Calibration", className="mb-3"),
-        html.Small("Per-FOV — a measured soma size, not a global setting.",
-                   className="text-muted d-block mb-3"),
         fov_select.select(FOV_SELECT_ID, workspace, className="mb-3"),
         dbc.Card(dbc.CardBody([
             _field("Cell diameter (px)",
                    dbc.Input(id=DIAMETER_ID, type="number", min=1, step=0.5,
                              value=(calib.diameter_px if calib
-                                    else DEFAULT_DIAMETER_PX))),
+                                    else DEFAULT_DIAMETER_PX)),
+                   help_id=DIAMETER_ID),
             _field("cellprob_threshold",
                    dbc.Input(id=THRESHOLD_ID, type="number", min=-6, max=6,
                              step=0.5,
@@ -186,21 +186,15 @@ def _left_column() -> html.Div:
 
         html.H5("Detection run", className="mb-2"),
         dbc.Switch(id=FORCE_CPU_ID, label="Force CPU", value=False),
-        dbc.Switch(id=PERSIST_FLOWS_ID, label="Cache the flow field",
-                   value=True),
-        html.Small(
-            "The cached flow field is what boundary tuning below draws from. "
-            "Turning it off saves ~6 MB per 512² FOV and makes seeded "
-            "boundaries impossible for that FOV.",
-            className="text-muted d-block mb-2"),
+        html.Div([
+            dbc.Switch(id=PERSIST_FLOWS_ID, label="Cache the flow field",
+                       value=True, className="mb-0"),
+            *help_icon(PERSIST_FLOWS_ID, HELP_TEXT[PERSIST_FLOWS_ID]),
+        ], className="d-flex align-items-center mb-2"),
         dbc.Button("Run centroid discovery", id=RUN_ID, color="primary",
                    className="mt-2 w-100", n_clicks=0,
                    disabled=run_panel.run_disabled()),
-        html.Small(
-            "Requires an already motion-corrected stack — a pre-corrected "
-            "input, or a prior motion-correction run's output. It does not "
-            "run motion correction first.",
-            className="text-muted d-block mt-2"),
+        button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
 
         html.Div(_boundary_section(out_dir, capture, min_area, stats),
                  id=BOUNDARY_SECTION_ID,
@@ -216,15 +210,11 @@ def _boundary_section(out_dir, capture, min_area, stats) -> list:
     return [
         html.Hr(),
         html.H5("Boundary tuning", className="mb-2"),
-        html.Small(
-            "How far a flow trajectory may land from a seed and still be "
-            "that cell. Recomputes instantly against a cached flow field — "
-            "nothing here touches the GPU.",
-            className="text-muted d-block mb-2"),
         dbc.Card(dbc.CardBody([
             html.Div([
                 html.Span("capture_px", className="small me-2"),
-            ], className="mb-1"),
+                *help_icon(CAPTURE_ID, HELP_TEXT[CAPTURE_ID]),
+            ], className="mb-1 d-flex align-items-center"),
             dcc.Slider(id=CAPTURE_ID, min=2, max=60, step=1,
                        value=capture, marks=None,
                        tooltip={"placement": "bottom", "always_visible": True}),
@@ -250,13 +240,10 @@ def _extraction_section(out_dir: Optional[Path]) -> list:
     return [
         html.Hr(),
         html.H5("Trace extraction", className="mb-2"),
-        html.Small(
-            "Extracts every ROI's fluorescence trace for the whole session "
-            "from this FOV's current merged_masks.tif. Mean is always "
-            "extracted; median and mode are additional per-frame spatial "
-            "statistics over the same masked pixels, each neuropil-corrected "
-            "the same way as mean.",
-            className="text-muted d-block mb-2"),
+        html.Div([
+            html.Span("additional stats", className="small text-muted me-2"),
+            *help_icon(EXTRACT_STATS_ID, HELP_TEXT[EXTRACT_STATS_ID]),
+        ], className="d-flex align-items-center mb-1"),
         dbc.Checklist(
             id=EXTRACT_STATS_ID,
             options=[{"label": "median", "value": "median"},
@@ -318,20 +305,17 @@ def _right_column() -> html.Div:
                        className="mb-0 me-3"),
             dbc.Switch(id=SHOW_BOUNDARIES_ID, label="Show boundaries", value=True,
                        className="mb-0 me-3"),
-            dbc.Switch(id=EDIT_ID, label="Edit centroids", value=False,
-                       className="mb-0 me-3"),
-            dbc.Switch(id=EDIT_BOUNDARY_ID, label="Edit boundaries", value=False,
-                       className="mb-0"),
+            html.Span([
+                dbc.Switch(id=EDIT_ID, label="Edit centroids", value=False,
+                           className="mb-0"),
+                *help_icon(EDIT_ID, HELP_TEXT[EDIT_ID]),
+            ], className="d-flex align-items-center me-3"),
+            html.Span([
+                dbc.Switch(id=EDIT_BOUNDARY_ID, label="Edit boundaries",
+                           value=False, className="mb-0"),
+                *help_icon(EDIT_BOUNDARY_ID, HELP_TEXT[EDIT_BOUNDARY_ID]),
+            ], className="d-flex align-items-center"),
         ], className="d-flex align-items-center flex-wrap mb-2"),
-        html.Small(
-            "centroids: drag to move · right-click to delete · click empty "
-            "space to add",
-            className="text-muted small d-block mb-1"),
-        html.Small(
-            "boundaries: click a cell to start a hand-drawn outline · click "
-            "to add a point · double-click or Enter to close · Escape to "
-            "cancel · right-click a hand-drawn outline to revert it to auto",
-            className="text-muted small d-block mb-1"),
         # Filled by assets/discovery_sheet.js — see the module docstring.
         html.Div(id=SHEET_ID),
         html.Div(id=EDIT_MSG_ID, className="text-muted small mt-1"),
@@ -343,9 +327,12 @@ def _right_column() -> html.Div:
     ])
 
 
-def _field(label: str, control) -> dbc.Row:
+def _field(label: str, control, help_id: Optional[str] = None) -> dbc.Row:
+    label_children = [label]
+    if help_id is not None:
+        label_children += help_icon(help_id, HELP_TEXT[help_id])
     return dbc.Row([
-        dbc.Col(html.Span(label, className="small"), md=6,
+        dbc.Col(html.Span(label_children, className="small"), md=6,
                 className="d-flex align-items-center"),
         dbc.Col(control, md=6),
     ], className="mb-2")

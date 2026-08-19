@@ -90,6 +90,7 @@ from roigbiv.pipeline.session_order import (
 )
 from roigbiv.ui.components import workspace_bar
 from roigbiv.ui.components.errors import user_error
+from roigbiv.ui.components.forms import HELP_TEXT, button_tooltip, help_icon
 from roigbiv.ui.components.log_stream import log_stream
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.colors import MATCH_STATUS_LABELS, MATCH_STATUS_PALETTE
@@ -200,17 +201,13 @@ def _setup_section(snap: TrackingSnapshot, tracked: list) -> html.Div:
                  html.Span("Session order & tracking run")],
                 id=SETUP_TOGGLE_ID, color="link", size="sm", n_clicks=0,
                 className="text-decoration-none px-0"),
+            button_tooltip(SETUP_TOGGLE_ID, HELP_TEXT[SETUP_TOGGLE_ID]),
             html.Span(_setup_summary(tracked), id=SETUP_SUMMARY_ID,
                       className="text-muted small ms-3"),
         ], className="d-flex align-items-center"),
         dbc.Collapse(
             dbc.Row([
                 dbc.Col([
-                    html.P(
-                        "Drag sessions into the order they were recorded. This "
-                        "order decides which session owns each cell's identity, "
-                        "so it is worth getting right.",
-                        className="text-muted small"),
                     html.Div(id="roigbiv-track-list-wrap",
                              children=_session_list()),
                     html.Div([
@@ -535,32 +532,28 @@ def _toolbar() -> dbc.Row:
             dbc.Button("▶", id=NEXT_ID, size="sm", color="secondary",
                        outline=True, title="next cell"),
         ], className="mt-3"), width="auto"),
-        dbc.Col(dbc.Switch(id=EDIT_ID, label="edit", value=False,
-                           className="mb-0 mt-3"), width="auto"),
+        dbc.Col(html.Div([
+            dbc.Switch(id=EDIT_ID, label="edit", value=False,
+                       className="mb-0 mt-3"),
+            *help_icon(EDIT_ID, HELP_TEXT[EDIT_ID]),
+        ], className="d-flex align-items-center"), width="auto"),
         dbc.Col(_legend(), className="text-md-end"),
     ], className="align-items-center g-2")
 
 
 def _edit_row() -> html.Div:
-    """Undo, the last gesture's outcome, and the gesture reference.
+    """Undo and the last gesture's outcome.
 
     Hidden (``d-none``) rather than left unmounted while the Edit switch is
     off, so ``_on_edit_toggle`` only has to flip a className.
 
-    The cheat sheet is permanent rather than a tooltip: these are direct
-    manipulations with no on-screen controls to discover them from, and a
-    researcher who edits once a fortnight should not have to remember that
-    shift-click is the link.
+    The gesture reference used to live here as a permanent cheat sheet; it's
+    now the Edit switch's hover-help tooltip (``HELP_TEXT[EDIT_ID]``).
     """
     return html.Div([
         dbc.Button("Undo last", id=UNDO_ID, size="sm", color="secondary",
                    outline=True, className="me-3"),
         html.Span(id=EDIT_MSG_ID, className="text-muted small me-3"),
-        html.Span(
-            "drag to move · right-click to delete · click empty space to add "
-            "· ctrl-click a dashed outline to confirm the cell is there "
-            "· shift-click to link to the selected cell · Ctrl+Z to undo",
-            className="text-muted small font-monospace"),
     ], id=EDIT_ROW_ID,
         className="d-none align-items-center g-2 mb-2 flex-wrap")
 
@@ -575,15 +568,14 @@ def _rail() -> html.Div:
     return html.Div([
         html.Div([
             html.Span("cells", className="small text-muted"),
+            *help_icon("roigbiv-cells-list-heading",
+                       HELP_TEXT["roigbiv-cells-list-heading"]),
             # ›, because the rail is on the right and collapsing pushes it that
             # way. The tab that brings it back points the other way.
             dbc.Button("›", id=RAIL_TOGGLE_ID, size="sm", color="link",
                        n_clicks=0, className="ms-auto py-0 px-2 lh-1",
                        title="hide the cell list  ["),
         ], className="d-flex align-items-center mb-1"),
-        html.Div("Numbers are for reading this page only — they follow the "
-                 "session order and are not the cell's registry id.",
-                 className="text-muted small mb-2"),
         html.Div(id=CELL_LIST_ID, className="roigbiv-cells-list"),
     ])
 
