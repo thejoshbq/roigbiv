@@ -39,6 +39,27 @@ All notable changes to roigbiv are documented here.
 
 ### Added
 
+- **Movie playback on the Discovery page.** The viewer drew only the mean projection, so
+  the half of the lab's Fiji workflow that finds a cell — scrub the stack, watch for a
+  transient, then draw around what flashed — had no equivalent and users left the app for
+  it. A **Live movie** switch now plays the registered movie under the existing markers:
+  space to play/pause, arrows to step (shift for ten), a scrubber, 0.25–8× speed, and
+  brightness/contrast that cost no refetch.
+
+  It streams the *visible rectangle* at a zoom-matched decimation as raw uint8
+  (`ui/services/movie_source.py`, `/api/discovery/<stem>/movie/{meta,chunk}`), not whole
+  frames as PNGs. On a 1024² FOV that is 16 KB/frame zoomed into a 128² region against
+  1 MB/frame for the full field — the crop is what makes playback responsive at exactly
+  the zoom where someone is deciding whether a blob is a cell. Frames land in a
+  ring buffer around the playhead, so the scrubber lands on the frame it points at and
+  playback stalls rather than skipping when the buffer runs dry.
+
+  The movie is painted into a canvas stacked *under* the SVG overlay, so OpenSeadragon
+  keeps owning zoom and pan and the marker layer keeps owning gestures: every centroid
+  and boundary edit works unchanged while the movie runs. Needs Motion Correction to have
+  run; falls back from Suite2p's `data.bin` to the `{stem}_mc.tif` export, and says which
+  is missing when neither is there.
+
 - **A Boundaries page.** `boundary_capture_px` is the one real tuning knob seeded
   boundaries have and had no surface at all. The page draws a FOV's seeded outlines over
   its mean projection and recomputes them live as `capture_px` / `min_area` move, which

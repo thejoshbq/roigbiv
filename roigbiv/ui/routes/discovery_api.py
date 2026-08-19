@@ -12,6 +12,11 @@ GET  /api/discovery/<stem>/image.png    — mean projection as PNG
 POST /api/discovery/<stem>/gesture      — apply one centroid (add/delete/move/
                                           undo) or boundary (draw_boundary/
                                           delete_boundary/undo_boundary) op
+GET  /api/discovery/<stem>/movie/meta   — registered-movie shape/fps/window,
+                                          or why there isn't one
+GET  /api/discovery/<stem>/movie/chunk  — a block of movie frames, cropped
+                                          to the viewport and decimated to
+                                          the zoom, as raw uint8
 GET  /api/discovery/<stem>/traces.h5    — download the freshest traces/
                                           bundle as a self-contained HDF5
                                           file (roigbiv.pipeline.export_io) —
@@ -36,6 +41,7 @@ from typing import Optional
 import numpy as np
 from flask import Flask, Response, jsonify, request, send_file
 
+from roigbiv.ui.services import movie_source
 from roigbiv.ui.services.app_state import get_app_state
 from roigbiv.ui.services.discovery_edit_ops import Gesture, apply_gesture
 
@@ -46,6 +52,25 @@ _write_locks_meta = threading.Lock()
 def _write_lock(stem: str) -> threading.Lock:
     with _write_locks_meta:
         return _write_locks.setdefault(stem, threading.Lock())
+
+
+# ── query parameters ───────────────────────────────────────────────────────
+
+
+def _arg_int(name: str, default: int) -> int:
+    """One query parameter as an int. Missing is fine; malformed is not.
+
+    A blank or absent parameter takes the default, but a client sending ``ds=x``
+    has a bug, and silently substituting a default would hide it behind
+    playback that is merely wrong-looking.
+    """
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
 
 
 # ── FOV resolution ─────────────────────────────────────────────────────────
@@ -266,6 +291,71 @@ def register_flask_routes(server: Flask) -> None:
             as_attachment=True,
             download_name=f"{stem}_traces.h5",
         )
+
+    @server.route("/api/discovery/<stem>/movie/meta")
+    def discovery_movie_meta(stem: str):
+        output_dir, err = _load(stem)
+        if err is not None:
+            return err
+
+        src = movie_source.resolve_movie(output_dir)
+        if src is None:
+            return jsonify({
+                "available": False,
+                "reason": "no registered movie for this FOV \u2014 run Motion "
+                          "Correction first",
+            })
+        lo, hi = movie_source.display_window(src)
+        return jsonify({
+            "available": True,
+            "kind": src.kind,
+            "n_frames": src.n_frames,
+            "height": src.height,
+            "width": src.width,
+            "fps": src.fps,
+            "window": [lo, hi],
+            "max_count": movie_source.MAX_COUNT,
+        })
+
+    @server.route("/api/discovery/<stem>/movie/chunk")
+    def discovery_movie_chunk(stem: str):
+        output_dir, err = _load(stem)
+        if err is not None:
+            return err
+
+        src = movie_source.resolve_movie(output_dir)
+        if src is None:
+            return jsonify({"error": "no registered movie for this FOV"}), 404
+
+        try:
+            req = movie_source.clamp_request(
+                src,
+                start=_arg_int("start", 0), count=_arg_int("count", 1),
+                x=_arg_int("x", 0), y=_arg_int("y", 0),
+                w=_arg_int("w", src.width), h=_arg_int("h", src.height),
+                ds=_arg_int("ds", 1),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            block = movie_source.read_block(src, req)
+        except (OSError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 500
+
+        resp = Response(block.tobytes(), mimetype="application/octet-stream")
+        # The client echoes these back into its ring buffer rather than trusting
+        # what it asked for, so a clamped request still lands as valid data.
+        resp.headers["X-Movie-Start"] = str(req.start)
+        resp.headers["X-Movie-Count"] = str(req.count)
+        resp.headers["X-Movie-Rect"] = f"{req.x},{req.y},{req.w},{req.h}"
+        resp.headers["X-Movie-Ds"] = str(req.ds)
+        resp.headers["X-Movie-Cols"] = str(req.cols)
+        resp.headers["X-Movie-Rows"] = str(req.rows)
+        # Rect and stride move with the viewport, so an HTTP cache would hold
+        # near-misses and never hit. The ring buffer is the cache.
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @server.route("/api/discovery/<stem>/gesture", methods=["POST"])
     def discovery_gesture(stem: str):

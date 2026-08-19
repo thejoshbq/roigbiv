@@ -81,7 +81,7 @@ def extract_from_merged_masks(
         The FOV's pipeline output directory (must contain ``merged_masks.tif``
         and a Suite2p ``plane0/{ops.npy,data.bin}`` pair, at either
         ``suite2p/plane0/`` or ``{stem}/suite2p/plane0/`` — see
-        ``_resolve_suite2p``).
+        ``resolve_suite2p``).
     cfg
         Optional override. Defaults to a ``PipelineConfig`` built from
         ``suite2p/plane0/ops.npy``'s ``fs`` (roigbiv-default neuropil params).
@@ -115,7 +115,7 @@ def extract_from_merged_masks(
             "save boundaries, and run Tracking first."
         )
 
-    data_bin_path, fov_shape, ops_fs = _resolve_suite2p(fov_output_dir)
+    data_bin_path, fov_shape, ops_fs = resolve_suite2p(fov_output_dir)
 
     if cfg is None:
         cfg = PipelineConfig(output_dir=fov_output_dir, no_viewer=True,
@@ -184,7 +184,7 @@ def extract_from_merged_masks(
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def _resolve_suite2p(fov_output_dir: Path) -> tuple[Path, tuple[int, int, int], float]:
+def resolve_suite2p(fov_output_dir: Path) -> tuple[Path, tuple[int, int, int], float]:
     """``(data_bin_path, (T, Ly, Lx), fs)`` from Suite2p's own ``ops.npy``.
 
     Motion Correction writes this before Discovery or Tracking can produce a

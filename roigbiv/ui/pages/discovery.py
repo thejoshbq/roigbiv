@@ -116,6 +116,7 @@ EDIT_ID = "roigbiv-discovery-edit"
 EDIT_BOUNDARY_ID = "roigbiv-discovery-edit-boundary"
 SHOW_CENTROIDS_ID = "roigbiv-discovery-show-centroids"
 SHOW_BOUNDARIES_ID = "roigbiv-discovery-show-boundaries"
+PLAY_ID = "roigbiv-discovery-play"
 EDIT_MSG_ID = "roigbiv-discovery-edit-msg"
 VIEW_ID = "roigbiv-discovery-view"
 BOUNDARY_STORE_ID = "roigbiv-discovery-boundary-store"
@@ -314,6 +315,11 @@ def _right_column() -> html.Div:
                 dbc.Switch(id=EDIT_BOUNDARY_ID, label="Edit boundaries",
                            value=False, className="mb-0"),
                 *help_icon(EDIT_BOUNDARY_ID, HELP_TEXT[EDIT_BOUNDARY_ID]),
+            ], className="d-flex align-items-center me-3"),
+            html.Span([
+                dbc.Switch(id=PLAY_ID, label="Live movie", value=False,
+                           className="mb-0"),
+                *help_icon(PLAY_ID, HELP_TEXT[PLAY_ID]),
             ], className="d-flex align-items-center"),
         ], className="d-flex align-items-center flex-wrap mb-2"),
         # Filled by assets/discovery_sheet.js — see the module docstring.
@@ -738,7 +744,7 @@ def _register_clientside(app: dash.Dash) -> None:
     app.clientside_callback(
         """
         function(value, editOn, editBoundaryOn, diameter, showCentroids,
-                  showBoundaries) {
+                  showBoundaries, movieOn) {
             var stem = null;
             if (value && typeof value === "string"
                 && value.indexOf("summary:") === 0) {
@@ -754,6 +760,7 @@ def _register_clientside(app: dash.Dash) -> None:
                 diameter_px: diameter || null,
                 show_centroids: showCentroids !== false,
                 show_boundaries: showBoundaries !== false,
+                movie_on: !!movieOn,
             };
             // The first render fires as the page mounts, which can beat the
             // asset that answers it; without the retry the viewer would stay
@@ -775,6 +782,7 @@ def _register_clientside(app: dash.Dash) -> None:
         Input(DIAMETER_ID, "value"),
         Input(SHOW_CENTROIDS_ID, "value"),
         Input(SHOW_BOUNDARIES_ID, "value"),
+        Input(PLAY_ID, "value"),
     )
 
     # The two edit switches are mutually exclusive — a centroid drag and a

@@ -236,6 +236,12 @@ HELP_TEXT: dict[str, str] = {
         "click a cell to start a hand-drawn outline · click to add a point · "
         "double-click or Enter to close · Escape to cancel · right-click a "
         "hand-drawn outline to revert it to auto",
+    "roigbiv-discovery-play":
+        "Play the motion-corrected movie under the markers, the way you would "
+        "scrub a stack in Fiji to spot a transient. Space plays/pauses, arrows "
+        "step a frame (Shift for ten). Zoom and pan while it runs — only the "
+        "visible region is streamed — and every edit gesture keeps working. "
+        "Needs Motion Correction to have run on this FOV.",
     # Tracking · setup
     "roigbiv-track-setup-toggle":
         "Drag sessions into the order they were recorded. This order decides "
