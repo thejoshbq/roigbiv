@@ -69,12 +69,24 @@ from roigbiv.ui.pages.review import (
 )
 
 
+#: The three families the Phoxel template names: mono for UI and data, a sans
+#: for running prose, a display face for the wordmark.
 _GOOGLE_FONTS = (
     "https://fonts.googleapis.com/css2?"
-    "family=Rajdhani:wght@400;500;600;700"
-    "&family=Share+Tech+Mono"
-    "&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400"
+    "family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400"
+    "&family=IBM+Plex+Sans:wght@400;500;600"
+    "&family=Chakra+Petch:wght@600;700"
     "&display=swap"
+)
+
+#: Served from the installed ``phoxel_tokens`` package rather than copied into
+#: ``assets/`` — ``pt.install_assets()`` would write into the package directory
+#: on every boot, which a non-editable install cannot do. Same Flask-static
+#: pattern as the ROI editor's ``/roi-assets/`` route.
+_PHOXEL_ROUTE = "/phoxel-assets"
+_PHOXEL_STYLESHEETS = (
+    f"{_PHOXEL_ROUTE}/phoxel-tokens.css",
+    f"{_PHOXEL_ROUTE}/phoxel-bootstrap-bridge.css",
 )
 
 THEME_STORE_ID = "roigbiv-theme"
@@ -139,7 +151,14 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
         __name__,
         title="ROIGBIV",
         update_title=None,
-        external_stylesheets=[dbc.themes.CYBORG, dbc.icons.BOOTSTRAP, _GOOGLE_FONTS],
+        external_stylesheets=[
+            dbc.themes.CYBORG,
+            dbc.icons.BOOTSTRAP,
+            _GOOGLE_FONTS,
+            # After CYBORG so the tokens win; before assets/roigbiv.css, which
+            # Dash appends and which aliases these onto its --roigbiv-* names.
+            *_PHOXEL_STYLESHEETS,
+        ],
         suppress_callback_exceptions=True,
         assets_folder="assets",
     )
@@ -162,6 +181,7 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     # built once at import time could not know about.
     app.layout = _build_layout
     _wire_routes(app)
+    _register_phoxel_assets(app.server)
     from roigbiv.ui.routes.roi_editor import register_flask_routes
     register_flask_routes(app.server)
     from roigbiv.ui.routes.mc_preview import (
@@ -183,6 +203,18 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
     for _, _, page in PAGES:
         page.register_callbacks(app)
     return app
+
+
+def _register_phoxel_assets(server) -> None:  # noqa: ANN001
+    """Serve the shared token stylesheets straight out of ``phoxel_tokens``."""
+    import phoxel_tokens as pt
+    from flask import send_from_directory
+
+    assets = pt.assets_dir()
+
+    @server.route(f"{_PHOXEL_ROUTE}/<path:filename>")
+    def phoxel_assets(filename: str):  # noqa: ANN202
+        return send_from_directory(assets, filename)
 
 
 def _build_layout() -> html.Div:
@@ -217,7 +249,10 @@ def _build_layout() -> html.Div:
             fluid=True,
         ),
         sticky="top",
-        className="roigbiv-navbar mb-2",
+        # `crt` is the Phoxel scanline layer, opt-in and chrome-only. The navbar
+        # is the one surface in this app that qualifies — it carries no body
+        # text, no table and no plot.
+        className="roigbiv-navbar crt mb-2",
     )
     return html.Div([
         dcc.Location(id="roigbiv-url", refresh=False),

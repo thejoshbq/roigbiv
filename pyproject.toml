@@ -43,6 +43,9 @@ ui = [
     "dash-bootstrap-components>=1.5",
     "dash-bootstrap-templates>=1.0",
     "plotly>=5.22",
+    # Shared Phoxel Workbench design tokens. Local path until the remote exists;
+    # then: "phoxel-tokens @ git+ssh://git@github.com/Otis-Lab-MUSC/phoxel-tokens@v1.0.0"
+    "phoxel-tokens @ file:///home/thejoshbq/code/otis-lab/phoxel-tokens",
 ]
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]

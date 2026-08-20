@@ -62,8 +62,8 @@
     style.id = "roigbiv-discovery-styles";
     style.textContent = [
       ".roigbiv-discovery-view { width: 100%; aspect-ratio: 1 / 1;",
-      "  background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.12);",
-      "  border-radius: 4px; overflow: hidden; min-height: 420px; }",
+      "  background: var(--surface-black); border: 1px solid var(--border);",
+      "  border-radius: var(--radius); overflow: hidden; min-height: 420px; }",
       ".roigbiv-discovery-overlay-holder { width: 100%; height: 100%; pointer-events: none; }",
       ".roigbiv-discovery-overlay { width: 100%; height: 100%; overflow: visible; }",
       ".roigbiv-discovery-centroid { fill: rgba(0,229,255,0.5); stroke: #00e5ff;",
@@ -94,7 +94,7 @@
       // badge means something else (a cross-session number this page has no
       // way to know yet), so this stays visually distinct from it.
       ".roigbiv-discovery-badge { font-family: var(--roigbiv-font-mono, monospace);",
-      "  font-size: 10px; text-anchor: middle; dominant-baseline: middle;",
+      "  font-size: 12px; text-anchor: middle; dominant-baseline: middle;",
       "  pointer-events: none; paint-order: stroke; stroke: rgba(0,0,0,0.75);",
       "  stroke-width: 2.5px; vector-effect: non-scaling-stroke; fill: #00e5ff; }",
     ].join("\n");

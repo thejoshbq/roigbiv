@@ -1,5 +1,9 @@
 """Theme constants shared by the app shell and figure builders.
 
+Colour comes from ``phoxel_tokens`` — the shared Phoxel Workbench design
+system — not from values held here.  The Plotly template is the package's
+layout template with one deliberate departure, described below.
+
 The runtime toggle in :mod:`roigbiv.ui.app` flips ``data-bs-theme`` on
 the document root and writes the chosen theme name to a ``dcc.Store``.
 Pages thread that store value into figure callbacks; figure builders call
@@ -12,7 +16,10 @@ compatibility but ignore it.
 """
 from __future__ import annotations
 
+import copy
 from typing import Optional
+
+import phoxel_tokens as pt
 
 LIGHT = "light"
 DARK = "dark"
@@ -21,7 +28,7 @@ _TEMPLATE = "roigbiv-reacher"
 
 
 def _register_roigbiv_template() -> None:
-    """Register the custom REACHER Plotly template, idempotent."""
+    """Register the custom ROIGBIV Plotly template, idempotent."""
     try:
         import plotly.graph_objects as go
         import plotly.io as pio
@@ -29,39 +36,17 @@ def _register_roigbiv_template() -> None:
         return
     if _TEMPLATE in pio.templates:
         return
-    tmpl = go.layout.Template()
-    tmpl.layout = go.Layout(
-        paper_bgcolor="#000000",
-        plot_bgcolor="#000000",
-        font=dict(family="Rajdhani, system-ui, sans-serif", color="#C8E8E8", size=12),
-        colorway=["#00E5FF", "#3498db", "#e67e22", "#9b59b6", "#f1c40f", "#2ecc71", "#e74c3c"],
-        xaxis=dict(
-            gridcolor="#0D2626",
-            zerolinecolor="#0D2626",
-            linecolor="#4A7070",
-            tickcolor="#4A7070",
-            tickfont=dict(color="#4A7070"),
-        ),
-        yaxis=dict(
-            gridcolor="#0D2626",
-            zerolinecolor="#0D2626",
-            linecolor="#4A7070",
-            tickcolor="#4A7070",
-            tickfont=dict(color="#4A7070"),
-        ),
-        hoverlabel=dict(
-            bgcolor="#0A1818",
-            bordercolor="#00E5FF",
-            font=dict(color="#C8E8E8", family="JetBrains Mono, monospace"),
-        ),
-        legend=dict(
-            bgcolor="rgba(10,24,24,0.85)",
-            bordercolor="#0D2626",
-            font=dict(color="#C8E8E8"),
-        ),
-        title=dict(font=dict(color="#00E5FF")),
-    )
-    pio.templates[_TEMPLATE] = tmpl
+    layout = copy.deepcopy(pt.PLOTLY_TEMPLATE["layout"])
+    # The one departure from the shared template, and the reason ROIGBIV keeps
+    # a template of its own: every canvas in this app is a fluorescence image
+    # or a trace read against one, so the ground is pure black rather than the
+    # system's --surface-1 panel.
+    layout["paper_bgcolor"] = pt.color("surface-black")
+    layout["plot_bgcolor"] = pt.color("surface-black")
+    # The system's margins assume a page-width figure; ROIGBIV packs several
+    # into a contact sheet and sets its own per figure.
+    layout.pop("margin", None)
+    pio.templates[_TEMPLATE] = go.layout.Template(layout=go.Layout(**layout))
 
 
 _register_roigbiv_template()
@@ -73,7 +58,7 @@ def normalize(theme: Optional[str]) -> str:
 
 
 def plotly_template(theme: Optional[str] = None) -> str:
-    """REACHER Plotly template name — theme arg kept for API compatibility."""
+    """ROIGBIV Plotly template name — theme arg kept for API compatibility."""
     return _TEMPLATE
 
 
@@ -83,17 +68,37 @@ def is_dark(theme: Optional[str]) -> bool:
 
 def axis_muted_color(theme: Optional[str] = None) -> str:
     """Muted color for axis-margin annotations."""
-    return "#4A7070"
+    return pt.color("text-muted")
 
 
 def warning_color(theme: Optional[str] = None) -> str:
-    """Warm amber — readable on pure-black background."""
-    return "#FFB454"
+    """Warm amber — readable on the black figure canvas."""
+    return pt.color("warn")
 
 
 def figure_paper_bg(theme: Optional[str] = None) -> str:
     """Always pure black — FOV canvas must never show a light background."""
-    return "#000000"
+    return pt.color("surface-black")
+
+
+def hover_bg(theme: Optional[str] = None) -> str:
+    """Background for figure hover labels."""
+    return pt.color("surface-2")
+
+
+def hover_border(theme: Optional[str] = None) -> str:
+    """Border for figure hover labels."""
+    return pt.color("border-control")
+
+
+def text_color(theme: Optional[str] = None) -> str:
+    """Body text on the figure canvas."""
+    return pt.color("text")
+
+
+def danger_color(theme: Optional[str] = None) -> str:
+    """Error text on the figure canvas."""
+    return pt.color("err")
 
 
 def heatmap_colorscale(theme: Optional[str] = None) -> str:
