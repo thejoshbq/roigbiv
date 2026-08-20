@@ -1,367 +1,353 @@
-/* ROIGBIV — REACHER Suite theme.
- * Tokens are defined on :root and [data-bs-theme="dark"] so Bootstrap 5.3
- * components pick them up regardless of which data-bs-theme value is active.
- * Bootstrap --bs-* vars are overridden here to retint dbc components without
- * replacing the Bootstrap dependency.
+/* ROIGBIV — Phoxel Interface System.
+ *
+ * The palette lives in `phoxel-tokens`, served at /phoxel-assets/ (see
+ * app.py::_register_phoxel_assets). This sheet owns three things and nothing
+ * else:
+ *
+ *   1. aliases from the historical --roigbiv-* names onto Phoxel tokens, so
+ *      the Python and JS that reference them keep working;
+ *   2. the --bs-* overrides the shared bootstrap bridge cannot reach — CYBORG
+ *      styles tooltips, dropdowns, navs and table striping past what the
+ *      bridge's variables touch;
+ *   3. ROIGBIV's own component and layout rules.
+ *
+ * No colour literal belongs in this file. roigbiv/ui/tests/test_phoxel_tokens.py
+ * enforces that, along with the 12px type floor and the 0.06em tracking cap.
  */
 
-/* ── Google Fonts preconnect (served via external_stylesheets in app.py) ── */
+/* ── Aliases onto the shared tokens ────────────────────────────────────── */
+/* Only the two --roigbiv-* names that something outside this file still reads:
+   components/run_panel.py and the two asset scripts. Everything in this
+   sheet names the Phoxel token directly. The other twenty aliases the old
+   palette declared are gone — nothing referenced them.
 
-/* ── REACHER design tokens ─────────────────────────────────────────────── */
+   Both selectors, because the (dead) theme toggle can still write
+   data-bs-theme="light" onto <html> and ROIGBIV is dark either way. */
 :root,
 [data-bs-theme="dark"] {
-    /* Surface */
-    --roigbiv-surface:            #000000;
-    --roigbiv-panel:              #0A1818;
-    /* Accent */
-    --roigbiv-accent:             #00E5FF;
-    --roigbiv-accent-hover:       #007A8C;
-    --roigbiv-accent-contrast:    #000000;
-    --roigbiv-accent-soft:        rgba(0, 229, 255, 0.18);
-    --roigbiv-cyan-glow:          rgba(0, 229, 255, 0.15);
-    --roigbiv-cyan-glow-strong:   rgba(0, 229, 255, 0.35);
-    /* Text */
-    --roigbiv-text-primary:       #C8E8E8;
-    --roigbiv-text-secondary:     #4A7070;
-    --roigbiv-text-dim:           #285050;
-    /* Borders */
-    --roigbiv-border:             #0D2626;
-    /* Inputs */
-    --roigbiv-input-bg:           #040A0A;
-    /* Log stream */
-    --roigbiv-log-bg:             #040A0A;
-    --roigbiv-log-fg:             #C8E8E8;
-    /* Muted code */
-    --roigbiv-muted-bg:           #0A1818;
-    --roigbiv-muted-fg:           #C8E8E8;
-    /* Typography */
-    --roigbiv-font-body:          'Rajdhani', system-ui, sans-serif;
-    --roigbiv-font-mono:          'JetBrains Mono', 'Share Tech Mono', ui-monospace, monospace;
-    /* Shape */
-    --roigbiv-radius:             2px;
+    --roigbiv-accent:    var(--accent);
+    --roigbiv-font-mono: var(--font-ui);
 
-    /* ── Bootstrap 5.3 overrides (retint dbc components automatically) ── */
-    --bs-body-bg:                 #000000;
-    --bs-body-color:              #C8E8E8;
-    --bs-body-secondary-color:    #4A7070;
-    --bs-tertiary-bg:             #0A1818;
-    --bs-secondary-bg:            #0A1818;
-    --bs-emphasis-color:          #C8E8E8;
-    --bs-card-bg:                 #0A1818;
-    --bs-card-border-color:       #0D2626;
-    --bs-border-color:            #0D2626;
-    --bs-border-color-translucent: rgba(13, 38, 38, 0.5);
-    --bs-primary:                 #00E5FF;
-    --bs-primary-rgb:             0, 229, 255;
-    --bs-link-color:              #00E5FF;
-    --bs-link-color-rgb:          0, 229, 255;
-    --bs-link-hover-color:        #007A8C;
-    --bs-form-control-bg:         #040A0A;
-    --bs-form-control-disabled-bg: #0A1818;
+    /* ── Bootstrap overrides the shared bridge cannot reach ────────────────
+     * The bridge (phoxel-bootstrap-bridge.css) sets body/card/border/primary/
+     * link/form-control/semantic. Everything below is what CYBORG styles past
+     * it, plus one correction:
+     *
+     * --bs-secondary-color is what `.text-muted` and `.form-text` actually
+     * read, and Bootstrap 5.3 defines it as body-colour at 75% alpha. The
+     * template forbids dimming text by opacity — so it is pinned to a real
+     * token here. That single line fixes every `.text-muted` in the app. */
+    --bs-secondary-color:          var(--text-muted);
+    --bs-border-color-translucent: var(--border-hairline);
+
     --bs-table-bg:                transparent;
-    --bs-table-striped-bg:        rgba(0, 229, 255, 0.04);
-    --bs-table-hover-bg:          rgba(0, 229, 255, 0.07);
-    --bs-table-border-color:      #0D2626;
-    --bs-nav-link-color:          #4A7070;
-    --bs-nav-link-hover-color:    #00E5FF;
-    --bs-navbar-color:            #4A7070;
-    --bs-navbar-hover-color:      #00E5FF;
-    --bs-navbar-active-color:     #00E5FF;
-    --bs-navbar-brand-color:      #00E5FF;
-    --bs-dropdown-bg:             #0A1818;
-    --bs-dropdown-border-color:   #0D2626;
-    --bs-dropdown-link-color:     #C8E8E8;
-    --bs-dropdown-link-hover-bg:  rgba(0, 229, 255, 0.1);
-    --bs-dropdown-link-active-bg: #00E5FF;
-    --bs-dropdown-link-active-color: #000000;
-    --bs-modal-bg:                #0A1818;
-    --bs-modal-border-color:      #0D2626;
-    --bs-modal-header-border-color: #0D2626;
-    --bs-input-bg:                #040A0A;
-    --bs-input-border-color:      #0D2626;
-    --bs-input-color:             #C8E8E8;
-    --bs-input-focus-border-color: #00E5FF;
-    --bs-input-focus-box-shadow:  0 0 0 0.2rem rgba(0, 229, 255, 0.18);
-    --bs-success:                 #00E5B4;
-    --bs-success-rgb:             0, 229, 180;
-    --bs-warning:                 #FFB454;
-    --bs-warning-rgb:             255, 180, 84;
-    --bs-danger:                  #FF6B7A;
-    --bs-danger-rgb:              255, 107, 122;
-    --bs-info:                    #00E5FF;
-    --bs-info-rgb:                0, 229, 255;
-    --bs-progress-bg:             #0D2626;
-    --bs-progress-bar-bg:         #00E5FF;
-    --bs-hr-color:                #0D2626;
+    --bs-table-striped-bg:        var(--surface-2);
+    --bs-table-hover-bg:          var(--accent-soft);
+    --bs-table-border-color:      var(--border-hairline);
+
+    --bs-nav-link-color:          var(--text-muted);
+    --bs-nav-link-hover-color:    var(--accent);
+    --bs-navbar-color:            var(--text-muted);
+    --bs-navbar-hover-color:      var(--accent);
+    --bs-navbar-active-color:     var(--accent);
+    --bs-navbar-brand-color:      var(--text-strong);
+
+    --bs-dropdown-bg:             var(--surface-2);
+    --bs-dropdown-border-color:   var(--border);
+    --bs-dropdown-link-color:     var(--text);
+    --bs-dropdown-link-hover-bg:  var(--accent-soft);
+    --bs-dropdown-link-active-bg: var(--accent);
+    --bs-dropdown-link-active-color: var(--accent-ink);
+
+    --bs-modal-bg:                var(--surface-1);
+    --bs-modal-border-color:      var(--border);
+    --bs-modal-header-border-color: var(--border);
+
+    --bs-input-bg:                var(--surface-inset);
+    --bs-input-border-color:      var(--border-control);
+    --bs-input-color:             var(--text);
+    --bs-input-focus-border-color: var(--border-focus);
+    /* Focus is a real ring below, not a bloom. */
+    --bs-input-focus-box-shadow:  none;
+    --bs-form-control-disabled-bg: var(--surface-1);
+
+    --bs-progress-bg:             var(--surface-2);
+    --bs-progress-bar-bg:         var(--accent);
+    --bs-hr-color:                var(--border);
     --bs-hr-opacity:              1;
 }
 
 /* ── Base typography ───────────────────────────────────────────────────── */
+/* Prose sans for running text; mono is applied per-role below, on the short
+   strings where the terminal read is actually noticed. */
 body {
-    font-family: var(--roigbiv-font-body);
-    background-color: var(--roigbiv-surface);
-    color: var(--roigbiv-text-primary);
+    font-family: var(--font-prose);
+    background-color: var(--surface-0);
+    color: var(--text);
 }
 code, pre, kbd, samp,
 .font-monospace,
 .roigbiv-muted-code,
 .roigbiv-log-stream {
-    font-family: var(--roigbiv-font-mono) !important;
+    font-family: var(--font-ui) !important;
+}
+/* Every metric and table column lines up. */
+.table, .roigbiv-tooltip-table, .roigbiv-track-seq {
+    font-variant-numeric: tabular-nums;
 }
 
-/* ── Scanlines overlay (tasteful — 18% opacity, 3px step) ─────────────── */
-body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    pointer-events: none;
-    background: repeating-linear-gradient(
-        0deg,
-        rgba(0, 0, 0, 0.18) 0px,
-        rgba(0, 0, 0, 0.18) 1px,
-        transparent 1px,
-        transparent 3px
-    );
+/* ── Focus ─────────────────────────────────────────────────────────────── */
+/* One visible ring everywhere, never colour-alone and never a box-shadow
+   bloom that reads as decoration. */
+:focus-visible,
+.form-control:focus,
+.form-select:focus,
+.btn:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+    box-shadow: none !important;
 }
 
 /* ── Custom scrollbars ─────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--roigbiv-surface); }
+::-webkit-scrollbar-track { background: var(--surface-0); }
 ::-webkit-scrollbar-thumb {
-    background: rgba(0, 229, 255, 0.20);
+    background: var(--border-control);
     border-radius: 3px;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(0, 229, 255, 0.40); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
 /* ── Branding ──────────────────────────────────────────────────────────── */
 .roigbiv-brand {
+    font-family: var(--font-display);
     font-weight: 700;
-    font-size: 1.25rem;
-    letter-spacing: 0.18em;
+    font-size: var(--fs-h2);
+    letter-spacing: var(--tracking-caps);
     text-transform: uppercase;
-    font-family: var(--roigbiv-font-body);
-    color: var(--roigbiv-text-primary);
+    color: var(--text-strong);
 }
 .roigbiv-brand-accent {
-    color: var(--roigbiv-accent);
-    text-shadow: 0 0 8px var(--roigbiv-cyan-glow-strong);
+    color: var(--accent);
 }
 .roigbiv-brand-sub {
-    font-family: var(--roigbiv-font-mono);
-    font-size: 0.55rem;
-    letter-spacing: 0.14em;
+    font-family: var(--font-ui);
+    font-size: var(--fs-micro);
+    line-height: var(--lh-micro);
+    letter-spacing: var(--tracking-caps);
     text-transform: uppercase;
-    color: var(--roigbiv-text-dim);
-    margin-top: -2px;
+    color: var(--text);
 }
 
 /* ── Navbar ────────────────────────────────────────────────────────────── */
+/* Solid, not translucent: the CRT layer lives on this element and a blurred
+   backdrop underneath it just muddies the texture. */
 .roigbiv-navbar {
-    background-color: rgba(10, 24, 24, 0.92) !important;
-    border-bottom: 1px solid var(--roigbiv-border);
-    backdrop-filter: blur(6px);
+    background-color: var(--surface-2) !important;
+    border-bottom: 1px solid var(--border);
 }
+/* --text, not --text-muted: the navbar carries the CRT layer, and the design
+   system floors text on a .crt surface at --text. Primary navigation reads
+   better for it — the accent is what marks the current page. */
 .roigbiv-navbar .nav-link {
-    font-family: var(--roigbiv-font-body);
+    font-family: var(--font-ui);
     font-weight: 600;
-    letter-spacing: 0.10em;
-    text-transform: uppercase;
-    font-size: 0.8rem;
-    color: var(--roigbiv-text-secondary) !important;
+    letter-spacing: var(--tracking-caps);
+    font-size: var(--fs-label);
+    color: var(--text) !important;
     transition: color 0.2s;
 }
 .roigbiv-navbar .nav-link:hover,
 .roigbiv-navbar .nav-link.active {
-    color: var(--roigbiv-accent) !important;
+    color: var(--accent) !important;
 }
-/* Hide theme toggle — REACHER is always dark */
+/* Hide theme toggle — ROIGBIV is always dark */
 .roigbiv-theme-toggle {
     display: none !important;
 }
 /* Workspace disclosure: reads as status the whole time, and as a control on
    hover. It is the only navbar item that is neither branding nor navigation. */
 .roigbiv-workspace-toggle {
-    font-family: var(--roigbiv-font-mono);
-    font-size: 0.78rem;
-    color: var(--roigbiv-text-secondary) !important;
+    font-family: var(--font-ui);
+    font-size: var(--fs-label);
+    color: var(--text) !important;
     border: 1px solid transparent;
-    border-radius: var(--roigbiv-radius);
+    border-radius: var(--radius);
     padding: 0.15rem 0.6rem !important;
     transition: color 0.2s, border-color 0.2s;
 }
 .roigbiv-workspace-toggle:hover {
-    color: var(--roigbiv-accent) !important;
-    border-color: rgba(0, 229, 255, 0.35);
+    color: var(--accent) !important;
+    border-color: var(--border-control);
 }
 
 /* ── Cards ─────────────────────────────────────────────────────────────── */
+/* On a near-black ground the fill step between surfaces measures ~1.07:1 —
+   invisible. The border is what carries elevation, so it has to be real. */
 .card {
-    background-color: var(--roigbiv-panel) !important;
-    border: 1px solid var(--roigbiv-border) !important;
-    border-radius: var(--roigbiv-radius) !important;
-    transition: border-color 0.2s, box-shadow 0.2s;
-}
-.card:hover {
-    border-color: rgba(0, 229, 255, 0.25) !important;
-    box-shadow: 0 0 12px var(--roigbiv-cyan-glow);
+    background-color: var(--surface-1) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
 }
 .roigbiv-card-accent {
-    border-left: 2px solid var(--roigbiv-accent) !important;
+    border-left: 2px solid var(--accent) !important;
 }
 
 /* ── Tooltips (hover-help info cards) ─────────────────────────────────────
- * Bootstrap's stock tooltip is unstyled here otherwise: black bg, centered
- * text, 200px max-width — on this theme's pure-black page it barely reads
- * as a distinct surface. The --bs-tooltip-* custom properties alone weren't
- * enough to retint it (same issue .card hit above), so force literal
- * values with !important rather than relying on CYBORG threading the vars
- * through cleanly.
- */
+ * CYBORG styles the stock tooltip past what the --bs-tooltip-* variables
+ * reach — black bg, centered text, 200px max-width. Forced literally here for
+ * the same reason the .card rule above is forced. */
 .tooltip {
     --bs-tooltip-max-width: 320px;
     --bs-tooltip-padding-x: 0.65rem;
     --bs-tooltip-padding-y: 0.5rem;
-    font-family: var(--roigbiv-font-body);
-    font-size: 0.8rem !important;
+    font-family: var(--font-prose);
+    font-size: var(--fs-body) !important;
+    line-height: var(--lh-body);
     opacity: 1 !important;
 }
 .tooltip .tooltip-arrow::before {
-    border-top-color: var(--roigbiv-border) !important;
-    border-bottom-color: var(--roigbiv-border) !important;
+    border-top-color: var(--border) !important;
+    border-bottom-color: var(--border) !important;
 }
 .tooltip-inner {
-    background-color: var(--roigbiv-panel) !important;
-    color: var(--roigbiv-text-primary) !important;
+    background-color: var(--surface-2) !important;
+    color: var(--text) !important;
     text-align: left !important;
-    border: 1px solid var(--roigbiv-border) !important;
-    border-radius: var(--roigbiv-radius) !important;
-    box-shadow: 0 0 12px var(--roigbiv-cyan-glow);
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
 }
 
 /* ── Buttons ───────────────────────────────────────────────────────────── */
+/* Sentence case. Uppercase is capped at label size and roughly three words in
+   this system, and these read "Run motion correction". */
 .btn {
-    font-family: var(--roigbiv-font-body);
+    --bs-btn-font-size: var(--fs-body);
+    font-family: var(--font-ui);
     font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    border-radius: var(--roigbiv-radius) !important;
-    transition: all 0.2s;
+    letter-spacing: var(--tracking-none);
+    border-radius: var(--radius) !important;
+    transition: background-color 0.2s, border-color 0.2s, color 0.2s;
 }
+.btn-sm { --bs-btn-font-size: var(--fs-label); }
 .btn:active { transform: translateY(1px); }
 
+/* Glow is a state, not a resting style: nothing below carries a shadow until
+   the pointer or keyboard is on it. */
 .btn-primary {
-    background-color: var(--roigbiv-accent) !important;
-    border-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent-contrast) !important;
-    box-shadow: 0 0 8px var(--roigbiv-cyan-glow);
+    background-color: var(--accent) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent-ink) !important;
 }
 .btn-primary:hover,
 .btn-primary:focus {
-    background-color: var(--roigbiv-accent-hover) !important;
-    border-color: var(--roigbiv-accent-hover) !important;
-    box-shadow: 0 0 14px var(--roigbiv-cyan-glow-strong);
+    background-color: var(--accent-hover) !important;
+    border-color: var(--accent-hover) !important;
+}
+.btn-primary:active {
+    background-color: var(--accent-pressed) !important;
+    border-color: var(--accent-pressed) !important;
 }
 
 .btn-outline-primary {
-    border-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
     background-color: transparent !important;
 }
 .btn-outline-primary:hover,
 .btn-outline-primary:focus,
 .btn-outline-primary.active {
-    background-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent-contrast) !important;
-    box-shadow: 0 0 10px var(--roigbiv-cyan-glow-strong);
+    background-color: var(--accent) !important;
+    color: var(--accent-ink) !important;
 }
 
 .btn-outline-secondary {
-    border-color: var(--roigbiv-border) !important;
-    color: var(--roigbiv-text-secondary) !important;
+    border-color: var(--border-control) !important;
+    color: var(--text-muted) !important;
     background-color: transparent !important;
 }
 .btn-outline-secondary:hover,
 .btn-outline-secondary:focus {
-    border-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent) !important;
-    background-color: rgba(0, 229, 255, 0.07) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+    background-color: var(--accent-soft) !important;
 }
 
 .btn-link {
-    color: var(--roigbiv-text-secondary) !important;
+    color: var(--accent) !important;
     text-transform: none;
-    letter-spacing: 0;
+    letter-spacing: var(--tracking-none);
 }
-.btn-link:hover { color: var(--roigbiv-accent) !important; }
+.btn-link:hover { color: var(--accent-hover) !important; }
 
 /* ── Segmented controls ────────────────────────────────────────────────── */
 .roigbiv-segmented .btn {
-    font-size: 0.75rem;
+    --bs-btn-font-size: var(--fs-micro);
     padding: 0.25rem 0.6rem;
-    font-family: var(--roigbiv-font-mono);
     font-weight: 400;
-    letter-spacing: 0.06em;
+    letter-spacing: var(--tracking-caps);
 }
 .roigbiv-segmented .btn.active {
-    background-color: var(--roigbiv-accent) !important;
-    border-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent-contrast) !important;
-    box-shadow: 0 0 8px var(--roigbiv-cyan-glow);
+    background-color: var(--accent) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent-ink) !important;
 }
 
 /* ── Inputs & selects ──────────────────────────────────────────────────── */
+/* Control edges sit on --border-control, the one border level held to the 3:1
+   non-text bar — an input whose edge you cannot see is not a control. */
 .form-control,
 .form-select {
-    background-color: var(--roigbiv-input-bg) !important;
-    border-color: var(--roigbiv-border) !important;
-    color: var(--roigbiv-text-primary) !important;
-    border-radius: var(--roigbiv-radius) !important;
-    font-family: var(--roigbiv-font-mono);
-    font-size: 0.85rem;
+    background-color: var(--surface-inset) !important;
+    border-color: var(--border-control) !important;
+    color: var(--text) !important;
+    border-radius: var(--radius) !important;
+    font-family: var(--font-ui);
+    font-size: var(--fs-body);
 }
 .form-control:focus,
 .form-select:focus {
-    border-color: var(--roigbiv-accent) !important;
-    box-shadow: 0 0 0 0.2rem var(--roigbiv-accent-soft) !important;
+    border-color: var(--border-focus) !important;
 }
-.form-control::placeholder { color: var(--roigbiv-text-dim); }
+.form-control::placeholder { color: var(--text-faint); }
+.form-label { font-size: var(--fs-label); color: var(--text-muted); }
 
 /* dbc.Switch / Checklist accent */
-.form-check-input:checked {
-    background-color: var(--roigbiv-accent) !important;
-    border-color: var(--roigbiv-accent) !important;
+.form-check-input {
+    border-color: var(--border-control);
 }
+.form-check-input:checked,
 .form-switch .form-check-input:checked {
-    background-color: var(--roigbiv-accent) !important;
-    border-color: var(--roigbiv-accent) !important;
+    background-color: var(--accent) !important;
+    border-color: var(--accent) !important;
 }
 
 /* ── Code & log primitives ─────────────────────────────────────────────── */
+/* Inline code is not interactive, so it is not cyan. */
 .roigbiv-muted-code {
-    font-size: 0.82rem;
-    background: var(--roigbiv-muted-bg);
-    color: var(--roigbiv-accent);
+    font-size: var(--fs-label);
+    background: var(--surface-inset);
+    color: var(--text);
     padding: 0.1rem 0.35rem;
-    border-radius: var(--roigbiv-radius);
-    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
 }
 .roigbiv-log-stream {
-    font-size: 0.78rem;
-    background: var(--roigbiv-log-bg);
-    color: var(--roigbiv-log-fg);
+    font-size: var(--fs-micro);
+    line-height: var(--lh-micro);
+    background: var(--surface-inset);
+    color: var(--text);
     padding: 0.75rem 0.9rem;
-    border-radius: var(--roigbiv-radius);
-    border: 1px solid var(--roigbiv-border);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
     max-height: 18rem;
     overflow-y: auto;
     white-space: pre-wrap;
 }
 
-/* ── Section divider (Labrynth-style heading line) ─────────────────────── */
+/* ── Section divider ───────────────────────────────────────────────────── */
 .roigbiv-h-line {
     border: none;
-    border-top: 1px solid var(--roigbiv-border);
+    border-top: 1px solid var(--border-hairline);
     margin: 1.25rem 0 1rem;
     opacity: 1;
 }
@@ -372,139 +358,157 @@ body::before {
 }
 .roigbiv-tooltip-table td {
     padding: 0.1rem 0.5rem;
-    color: var(--roigbiv-text-primary);
-    font-family: var(--roigbiv-font-mono);
-    font-size: 0.8rem;
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: var(--fs-label);
 }
 
 /* ── Review page — sidebars, session ring, drawer ──────────────────────── */
 .roigbiv-sidebar-toggle {
-    border: 1px solid var(--roigbiv-border) !important;
+    border: 1px solid var(--border) !important;
     margin-bottom: 0.5rem;
 }
 .roigbiv-active-session {
-    border: 2px solid var(--roigbiv-accent) !important;
-    box-shadow: 0 0 0 3px var(--roigbiv-accent-soft);
+    border: 2px solid var(--accent) !important;
+    box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .roigbiv-drawer-hero h5,
 .roigbiv-roi-title {
-    color: var(--roigbiv-accent);
-    font-family: var(--roigbiv-font-body);
+    color: var(--text-strong);
+    font-family: var(--font-ui);
     font-weight: 700;
-    letter-spacing: 0.08em;
+    letter-spacing: var(--tracking-title);
     margin-bottom: 0.25rem;
 }
 .roigbiv-drawer-hero .badge {
-    font-size: 0.70rem;
+    font-size: var(--fs-micro);
     font-weight: 600;
-    font-family: var(--roigbiv-font-mono);
-    border-radius: var(--roigbiv-radius);
-    letter-spacing: 0.06em;
+    font-family: var(--font-ui);
+    border-radius: var(--radius);
+    letter-spacing: var(--tracking-caps);
 }
 
 /* ── Tables ────────────────────────────────────────────────────────────── */
 .table {
-    color: var(--roigbiv-text-primary);
-    border-color: var(--roigbiv-border);
-}
-.table-striped > tbody > tr:nth-of-type(odd) > * {
-    background-color: rgba(0, 229, 255, 0.04);
-    color: var(--roigbiv-text-primary);
+    color: var(--text);
+    border-color: var(--border-hairline);
 }
 .table thead th {
-    font-family: var(--roigbiv-font-body);
+    font-family: var(--font-ui);
     font-weight: 700;
-    letter-spacing: 0.10em;
+    letter-spacing: var(--tracking-caps);
     text-transform: uppercase;
-    font-size: 0.72rem;
-    color: var(--roigbiv-text-secondary);
-    border-bottom-color: var(--roigbiv-border);
+    font-size: var(--fs-label);
+    color: var(--text-muted);
+    border-bottom-color: var(--border);
 }
 
 /* ── Progress bar ──────────────────────────────────────────────────────── */
 .progress {
-    background-color: var(--roigbiv-border) !important;
-    border-radius: var(--roigbiv-radius);
+    background-color: var(--surface-2) !important;
+    border-radius: var(--radius);
     height: 6px;
 }
 .progress-bar {
-    background-color: var(--roigbiv-accent) !important;
-    box-shadow: 0 0 6px var(--roigbiv-cyan-glow);
+    background-color: var(--accent) !important;
 }
 
 /* ── Headings ──────────────────────────────────────────────────────────── */
-h1, h2, h3, h4 {
-    font-family: var(--roigbiv-font-body);
+/* Sentence case, --text-strong, never accent: cyan is reserved for things you
+   can interact with. h4/h5 are the page- and panel-level titles this app
+   actually uses; h6 is a group eyebrow and is the one heading still in caps. */
+h1, h2, h3, h4, h5 {
+    font-family: var(--font-ui);
     font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--roigbiv-text-primary);
+    letter-spacing: var(--tracking-title);
+    text-transform: none;
+    color: var(--text-strong);
 }
-h5, h6 {
-    font-family: var(--roigbiv-font-body);
+h1 { font-size: var(--fs-h1); line-height: var(--lh-h1); }
+h2 { font-size: var(--fs-h2); line-height: var(--lh-h2); }
+h3 { font-size: var(--fs-h3); line-height: var(--lh-h3); }
+h4 { font-size: var(--fs-h2); line-height: var(--lh-h2); }
+h5 { font-size: var(--fs-h3); line-height: var(--lh-h3); }
+h6 {
+    font-family: var(--font-ui);
     font-weight: 600;
-    letter-spacing: 0.05em;
-    color: var(--roigbiv-text-secondary);
+    font-size: var(--fs-label);
+    line-height: var(--lh-label);
+    letter-spacing: var(--tracking-caps);
+    text-transform: uppercase;
+    color: var(--text-muted);
 }
 
 /* ── Alerts ────────────────────────────────────────────────────────────── */
+/* Prose face, not mono: these are sentences, and every one already carries a
+   word rather than relying on its colour. */
 .alert {
-    border-radius: var(--roigbiv-radius);
+    border-radius: var(--radius);
     border-left-width: 3px;
-    font-family: var(--roigbiv-font-mono);
-    font-size: 0.85rem;
+    font-family: var(--font-prose);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
 }
-.alert-danger  { background-color: rgba(255, 107, 122, 0.10); border-color: #FF6B7A; color: #FF6B7A; }
-.alert-warning { background-color: rgba(255, 180, 84, 0.10);  border-color: #FFB454; color: #FFB454; }
-.alert-info    { background-color: rgba(0, 229, 255, 0.08);   border-color: #00E5FF; color: #00E5FF; }
-.alert-success { background-color: rgba(0, 229, 180, 0.08);   border-color: #00E5B4; color: #00E5B4; }
+.alert-danger  { background-color: var(--err-soft);  border-color: var(--err);  color: var(--err); }
+.alert-warning { background-color: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+.alert-info    { background-color: var(--info-soft); border-color: var(--accent); color: var(--accent); }
+.alert-success { background-color: var(--ok-soft);   border-color: var(--ok);   color: var(--ok); }
+
+/* Bootstrap composes these from --bs-*-rgb at --bs-text-opacity, which would
+   put a second copy of every semantic value in this file. Pinned instead. */
+.text-danger  { color: var(--err) !important; }
+.text-warning { color: var(--warn) !important; }
+.text-success { color: var(--ok) !important; }
+.text-info    { color: var(--info) !important; }
 
 /* ── Badges ────────────────────────────────────────────────────────────── */
 .badge {
-    border-radius: var(--roigbiv-radius);
-    font-family: var(--roigbiv-font-mono);
+    border-radius: var(--radius);
+    font-family: var(--font-ui);
+    font-size: var(--fs-micro);
+    letter-spacing: var(--tracking-caps);
 }
 
 /* ── Plotly modebar ────────────────────────────────────────────────────── */
-.modebar-btn path { fill: var(--roigbiv-text-secondary) !important; }
-.modebar-btn:hover path { fill: var(--roigbiv-accent) !important; }
-.modebar { background: rgba(10, 24, 24, 0.85) !important; }
+.modebar-btn path { fill: var(--text-muted) !important; }
+.modebar-btn:hover path { fill: var(--accent) !important; }
+.modebar { background: var(--surface-2) !important; }
 
 /* ── HR ───────────────────────────────────────────────────────────────── */
 hr {
-    border-color: var(--roigbiv-border);
+    border-color: var(--border-hairline);
     opacity: 1;
 }
 
 /* ── Nav pills / tabs ──────────────────────────────────────────────────── */
 .nav-pills .nav-link.active {
-    background-color: var(--roigbiv-accent) !important;
-    color: var(--roigbiv-accent-contrast) !important;
+    background-color: var(--accent) !important;
+    color: var(--accent-ink) !important;
 }
 .nav-pills .nav-link {
-    color: var(--roigbiv-text-secondary);
-    border-radius: var(--roigbiv-radius);
+    color: var(--text-muted);
+    border-radius: var(--radius);
 }
-.nav-pills .nav-link:hover { color: var(--roigbiv-accent); }
+.nav-pills .nav-link:hover { color: var(--accent); }
 
 /* ── Track page: drag-to-reorder session list ──────────────────────────── */
 .roigbiv-track-row {
     cursor: grab;
-    border: 1px solid var(--roigbiv-border);
-    border-radius: var(--roigbiv-radius);
-    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-1);
 }
-.roigbiv-track-row:hover { border-color: var(--roigbiv-accent); }
+.roigbiv-track-row:hover { border-color: var(--accent); }
 .roigbiv-track-row:active { cursor: grabbing; }
 .roigbiv-track-dragging { opacity: 0.4; border-style: dashed; }
 .roigbiv-track-handle {
-    color: var(--roigbiv-text-secondary);
-    font-size: 1.1rem;
+    color: var(--text-muted);
+    font-size: var(--fs-prose);
     line-height: 1;
 }
 .roigbiv-track-seq {
-    font-family: var(--roigbiv-font-mono);
-    color: var(--roigbiv-accent);
+    font-family: var(--font-ui);
+    color: var(--accent);
     min-width: 2.5rem;
 }
 
@@ -549,20 +553,22 @@ hr {
     display: flex;
     align-items: center;
     cursor: pointer;
-    font-size: 0.85rem;
+    font-size: var(--fs-body);
     padding: 0.15rem 0.1rem;
-    border-radius: var(--roigbiv-radius);
+    border-radius: var(--radius);
 }
-.roigbiv-cells-panel-head:hover { background: rgba(0, 229, 255, 0.08); }
+.roigbiv-cells-panel-head:hover { background: var(--accent-soft); }
 .roigbiv-cells-panel-focus > .roigbiv-cells-panel-head {
-    box-shadow: inset 2px 0 0 var(--roigbiv-accent);
+    box-shadow: inset 2px 0 0 var(--accent);
 }
+/* Pure black, like every other FOV canvas in the app — a projection is read
+   against black or it is not read at all. */
 .roigbiv-cells-panel-view {
     width: 100%;
     aspect-ratio: 1 / 1;   /* replaced inline with the frame's true ratio */
-    background: var(--roigbiv-surface, rgba(255, 255, 255, 0.02));
-    border: 1px solid var(--roigbiv-border);
-    border-radius: var(--roigbiv-radius);
+    background: var(--surface-black);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
     overflow: hidden;
 }
 
@@ -607,9 +613,11 @@ hr {
    that click-empty-space-to-add no longer reaches *inside* a ghost outline. */
 .roigbiv-cells-panel-editing .roigbiv-roi.is-ghost { cursor: pointer; }
 .roigbiv-cells-panel-editing .roigbiv-roi.is-ghost path { pointer-events: all; }
+/* The stroke is a legibility scrim over arbitrary image data, not a theme
+   colour — it has to be black whatever the surface underneath is doing. */
 .roigbiv-cells-badge {
-    font-family: var(--roigbiv-font-mono);
-    font-size: 11px;
+    font-family: var(--font-ui);
+    font-size: var(--fs-micro);
     text-anchor: middle;
     dominant-baseline: middle;
     pointer-events: none;
@@ -618,7 +626,7 @@ hr {
     stroke-width: 2.5px;
     vector-effect: non-scaling-stroke;
 }
-.roigbiv-roi.is-selected .roigbiv-cells-badge { font-size: 15px; }
+.roigbiv-roi.is-selected .roigbiv-cells-badge { font-size: var(--fs-h3); }
 .roigbiv-roi.hide-badge .roigbiv-cells-badge { display: none; }
 .roigbiv-cells-centroid-dot {
     vector-effect: non-scaling-stroke;
@@ -652,11 +660,11 @@ hr {
     display: none;
     flex: 0 0 auto;
     writing-mode: vertical-rl;
-    border: 1px solid var(--roigbiv-border);
-    border-radius: var(--roigbiv-radius);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
     padding: 0.35rem 0;
 }
-.roigbiv-cells-rail-tab:hover { background: rgba(0, 229, 255, 0.08); }
+.roigbiv-cells-rail-tab:hover { background: var(--accent-soft); }
 .roigbiv-cells-body.is-collapsed .roigbiv-cells-rail-tab { display: block; }
 
 /* Same breakpoint the focused panel uses — below it the sheet is one column
@@ -673,8 +681,8 @@ hr {
     overflow-y: auto;
 }
 .roigbiv-cells-row { cursor: pointer; }
-.roigbiv-cells-row:hover { background: rgba(0, 229, 255, 0.06); }
+.roigbiv-cells-row:hover { background: var(--surface-2); }
 .roigbiv-cells-row-active {
-    background: rgba(0, 229, 255, 0.12);
-    box-shadow: inset 2px 0 0 var(--roigbiv-accent);
+    background: var(--accent-soft);
+    box-shadow: inset 2px 0 0 var(--accent);
 }

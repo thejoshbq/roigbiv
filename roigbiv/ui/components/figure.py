@@ -33,7 +33,10 @@ from roigbiv.ui.services.theme import (
     figure_paper_bg,
     heatmap_colorscale,
     heatmap_reverse,
+    hover_bg,
+    hover_border,
     plotly_template,
+    text_color,
 )
 
 
@@ -165,7 +168,8 @@ def build_roi_figure(
         clickmode="event",
         plot_bgcolor=figure_paper_bg(theme),
         paper_bgcolor=figure_paper_bg(theme),
-        hoverlabel=dict(bgcolor="#0A1818", bordercolor="#00E5FF", font_color="#C8E8E8"),
+        hoverlabel=dict(bgcolor=hover_bg(theme), bordercolor=hover_border(theme),
+                        font_color=text_color(theme)),
     )
     return fig
 

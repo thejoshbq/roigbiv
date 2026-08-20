@@ -75,6 +75,8 @@ def user_error_figure(exc: BaseException, context: str,
     """
     from roigbiv.ui.services.theme import (
         axis_muted_color,
+        danger_color,
+        figure_paper_bg,
         plotly_template,
     )
 
@@ -87,8 +89,8 @@ def user_error_figure(exc: BaseException, context: str,
         "layout": {
             "height": 420,
             "template": plotly_template(theme),
-            "paper_bgcolor": "#000000",
-            "plot_bgcolor": "#000000",
+            "paper_bgcolor": figure_paper_bg(theme),
+            "plot_bgcolor": figure_paper_bg(theme),
             "xaxis": {"visible": False},
             "yaxis": {"visible": False},
             "annotations": [
@@ -97,7 +99,7 @@ def user_error_figure(exc: BaseException, context: str,
                     "showarrow": False,
                     "xref": "paper", "yref": "paper",
                     "x": 0.5, "y": 0.58,
-                    "font": {"size": 14, "color": "#FF6B7A"},
+                    "font": {"size": 14, "color": danger_color(theme)},
                 },
                 {
                     "text": message,
