@@ -4,10 +4,9 @@ Colour comes from ``phoxel_tokens`` — the shared Phoxel Workbench design
 system — not from values held here.  The Plotly template is the package's
 layout template with one deliberate departure, described below.
 
-The runtime toggle in :mod:`roigbiv.ui.app` flips ``data-bs-theme`` on
-the document root and writes the chosen theme name to a ``dcc.Store``.
-Pages thread that store value into figure callbacks; figure builders call
-:func:`plotly_template` to convert it to the registered Plotly template name.
+The shell is dark-only. Figure builders still accept a ``theme`` argument
+for call-site compatibility; :func:`plotly_template` ignores it and always
+returns the registered ``roigbiv-reacher`` Plotly template.
 
 FOV invariant: the mean-projection heatmap canvas is ALWAYS pure black
 (``#000000``) regardless of UI theme.  ``heatmap_colorscale`` / ``heatmap_reverse``

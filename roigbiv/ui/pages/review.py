@@ -558,9 +558,8 @@ def register_callbacks(app: dash.Dash) -> None:
         Input("roigbiv-review-state", "data"),
         Input("roigbiv-review-session-check", "value"),
         Input("roigbiv-review-kind", "value"),
-        Input("roigbiv-theme", "data"),
     )
-    def _render_fov_trace(viewer_state, selected_ids, kind, theme):
+    def _render_fov_trace(viewer_state, selected_ids, kind, theme=None):
         if not (viewer_state and viewer_state.get("fov_id")):
             return _placeholder_fig("Select a FOV to load traces.", theme)
         kind = kind or "f"
@@ -592,10 +591,9 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-review-roi-trace", "figure"),
         Input("roigbiv-review-selected-roi", "data"),
         Input("roigbiv-review-kind", "value"),
-        Input("roigbiv-theme", "data"),
         State("roigbiv-review-state", "data"),
     )
-    def _render_roi_trace(selected, kind, theme, viewer_state):
+    def _render_roi_trace(selected, kind, viewer_state, theme=None):
         if not (selected and viewer_state and viewer_state.get("fov_id")):
             return _placeholder_fig(
                 "Click an ROI in a session above to load traces.", theme,

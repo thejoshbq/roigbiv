@@ -51,17 +51,18 @@ business dragging in.
 
 Trace extraction
 -----------------
-A third section, below boundary tuning, appears once this FOV has a
-``merged_masks.tif`` — the one label image the registry actually matches
-against, produced either by a full pipeline cascade or by the Tracking
-page stamping this page's saved centroids. It is deliberately NOT keyed off
-the live boundary preview above it: that preview's label_ids are not yet
-registry-stable. "Extract traces" runs
+The **Extract traces** button sits in the right-column toolbar next to Run,
+so it stays on screen with the calibration sidebar collapsed and with the
+preview filling the rest of the page. It runs against this FOV's saved
+``boundaries.tif`` once those have been written, or ``merged_masks.tif``
+after Tracking / a full cascade. It is deliberately NOT keyed off the live
+boundary preview: that preview's label_ids are not yet disk-stable.
+"Extract traces" runs
 :func:`roigbiv.pipeline.discovery_extract.extract_from_merged_masks` via
 :mod:`roigbiv.ui.services.extraction_runner` (mean always, median/mode
 opt-in), producing a ``traces/`` bundle whose rows are keyed by
 ``local_label_id`` — the same numbers now drawn on the centroid markers
-above — and by ``global_cell_id`` wherever this FOV has already gone through
+— and by ``global_cell_id`` wherever this FOV has already gone through
 Tracking. This replaces the old ad hoc ``.npy``-plus-manual-alignment
 workflow with the structured bundle :mod:`roigbiv.pipeline.traces_io` already
 established for the cascade's own automatic extraction.
@@ -78,7 +79,7 @@ from dash import Input, Output, State, dcc, html
 
 from roigbiv.pipeline.calibration import load_calibration, write_calibration
 from roigbiv.pipeline.centroids import clear_centroid_output
-from roigbiv.ui.components import fov_select, run_panel, workspace_bar
+from roigbiv.ui.components import fov_select, run_panel, sidebar, workspace_bar
 from roigbiv.ui.components.errors import user_error
 from roigbiv.ui.components.forms import HELP_TEXT, button_tooltip, help_icon
 from roigbiv.ui.services import boundary_preview
@@ -87,6 +88,24 @@ from roigbiv.ui.services.extraction_runner import get_extraction_runner
 from roigbiv.ui.services.pipeline_runner import get_pipeline_runner
 
 RUN_ID = "roigbiv-discovery-run-btn"
+
+SIDEBAR_TOGGLE_ID = "roigbiv-discovery-sidebar-toggle"
+SIDEBAR_STORE_ID = "roigbiv-discovery-sidebar-store"
+PARAMS_COLLAPSE_ID = "roigbiv-discovery-params-collapse"
+LEFT_COL_ID = "roigbiv-discovery-left-col"
+RIGHT_COL_ID = "roigbiv-discovery-right-col"
+
+# Left column width classes. Default is collapsed, so the layout is built
+# closed and the clientside toggle (sidebar.register_collapsible_toggle)
+# swaps to the open classes on expand. Closed is a bare icon rail — the FOV
+# picker, Run button, and Extract traces all live in the right-column
+# toolbar now, and Boundary tuning is folded into the same collapse as
+# Calibration so nothing left column-side can force width back open while
+# collapsed.
+_LEFT_OPEN_CLASS = "col-md-5 col-lg-4 pe-md-4"
+_LEFT_CLOSED_CLASS = "col-auto pe-md-2"
+_RIGHT_OPEN_CLASS = "col-md-7 col-lg-8"
+_RIGHT_CLOSED_CLASS = "col"
 FOV_SELECT_ID = "roigbiv-discovery-fov-select"
 DIAMETER_ID = "roigbiv-discovery-diameter"
 THRESHOLD_ID = "roigbiv-discovery-threshold"
@@ -145,8 +164,10 @@ def layout() -> html.Div:
         run_panel.tick(),
         run_panel.page_tick(TICK_ID),
         dbc.Row([
-            dbc.Col(_left_column(), md=5, lg=4, className="pe-md-4"),
-            dbc.Col(_right_column(), md=7, lg=8),
+            dbc.Col(_left_column(), id=LEFT_COL_ID,
+                    className=_LEFT_CLOSED_CLASS),
+            dbc.Col(_right_column(), id=RIGHT_COL_ID,
+                    className=_RIGHT_CLOSED_CLASS),
         ], className="g-3"),
     ])
 
@@ -159,51 +180,47 @@ def _left_column() -> html.Div:
     capture, min_area = _boundary_settings_for(out_dir)
     stats, _contours = _boundary_preview_payload(out_dir, capture, min_area)
     return html.Div([
-        html.H4("Calibration", className="mb-3"),
-        fov_select.select(FOV_SELECT_ID, workspace, className="mb-3"),
-        dbc.Card(dbc.CardBody([
-            _field("Cell diameter (px)",
-                   dbc.Input(id=DIAMETER_ID, type="number", min=1, step=0.5,
-                             value=(calib.diameter_px if calib
-                                    else DEFAULT_DIAMETER_PX)),
-                   help_id=DIAMETER_ID),
-            _field("cellprob_threshold",
-                   dbc.Input(id=THRESHOLD_ID, type="number", min=-6, max=6,
-                             step=0.5,
-                             value=(calib.cellprob_threshold if calib
-                                    else DEFAULT_CELLPROB_THRESHOLD))),
-            _field("Cellpose model",
-                   dbc.Select(id=MODEL_ID, options=MODEL_OPTIONS,
-                              value=(calib.cellpose_model or "") if calib else "")),
+        sidebar.sidebar_toggle(toggle_id=SIDEBAR_TOGGLE_ID,
+                               store_id=SIDEBAR_STORE_ID,
+                               default_open=False),
+        dbc.Collapse(html.Div([
+            html.H4("Calibration", className="mb-3"),
+            dbc.Card(dbc.CardBody([
+                _field("Cell diameter (px)",
+                       dbc.Input(id=DIAMETER_ID, type="number", min=1, step=0.5,
+                                 value=(calib.diameter_px if calib
+                                        else DEFAULT_DIAMETER_PX)),
+                       help_id=DIAMETER_ID),
+                _field("cellprob_threshold",
+                       dbc.Input(id=THRESHOLD_ID, type="number", min=-6, max=6,
+                                 step=0.5,
+                                 value=(calib.cellprob_threshold if calib
+                                        else DEFAULT_CELLPROB_THRESHOLD))),
+                _field("Cellpose model",
+                       dbc.Select(id=MODEL_ID, options=MODEL_OPTIONS,
+                                  value=(calib.cellpose_model or "") if calib else "")),
+                html.Div([
+                    dbc.Button("Save calibration", id=SAVE_ID, size="sm",
+                               color="secondary", className="me-2"),
+                    dbc.Button("Save & clear existing output", id=SAVE_CLEAR_ID,
+                               size="sm", color="warning", outline=True),
+                ], className="mt-2"),
+                html.Div(_readout_text(calib, out_dir),
+                         id=READOUT_ID, className="small text-muted mt-2"),
+            ]), className="mb-3"),
+
+            html.H5("Detection run", className="mb-2"),
+            dbc.Switch(id=FORCE_CPU_ID, label="Force CPU", value=False),
             html.Div([
-                dbc.Button("Save calibration", id=SAVE_ID, size="sm",
-                           color="secondary", className="me-2"),
-                dbc.Button("Save & clear existing output", id=SAVE_CLEAR_ID,
-                           size="sm", color="warning", outline=True),
-            ], className="mt-2"),
-            html.Div(_readout_text(calib, out_dir),
-                     id=READOUT_ID, className="small text-muted mt-2"),
-        ]), className="mb-3"),
+                dbc.Switch(id=PERSIST_FLOWS_ID, label="Cache the flow field",
+                           value=True, className="mb-0"),
+                *help_icon(PERSIST_FLOWS_ID, HELP_TEXT[PERSIST_FLOWS_ID]),
+            ], className="d-flex align-items-center mb-2"),
 
-        html.H5("Detection run", className="mb-2"),
-        dbc.Switch(id=FORCE_CPU_ID, label="Force CPU", value=False),
-        html.Div([
-            dbc.Switch(id=PERSIST_FLOWS_ID, label="Cache the flow field",
-                       value=True, className="mb-0"),
-            *help_icon(PERSIST_FLOWS_ID, HELP_TEXT[PERSIST_FLOWS_ID]),
-        ], className="d-flex align-items-center mb-2"),
-        dbc.Button("Run centroid discovery", id=RUN_ID, color="primary",
-                   className="mt-2 w-100", n_clicks=0,
-                   disabled=run_panel.run_disabled()),
-        button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
-
-        html.Div(_boundary_section(out_dir, capture, min_area, stats),
-                 id=BOUNDARY_SECTION_ID,
-                 style=_boundary_style(out_dir)),
-
-        html.Div(_extraction_section(out_dir),
-                 id=EXTRACT_SECTION_ID,
-                 style=_extraction_style(out_dir)),
+            html.Div(_boundary_section(out_dir, capture, min_area, stats),
+                     id=BOUNDARY_SECTION_ID,
+                     style=_boundary_style(out_dir)),
+        ]), id=PARAMS_COLLAPSE_ID, is_open=False),
     ])
 
 
@@ -237,32 +254,33 @@ def _boundary_section(out_dir, capture, min_area, stats) -> list:
     ]
 
 
-def _extraction_section(out_dir: Optional[Path]) -> list:
+def _extraction_controls() -> list:
+    """Always-visible toolbar controls — never ``display: none``.
+
+    A 1:1 OpenSeadragon preview fills the viewport, so anything below the
+    sheet is off-screen. Hiding this until ``merged_masks.tif`` exists made
+    the button unreachable on Discovery-only FOVs that only have
+    ``boundaries.tif``.
+    """
     return [
-        html.Hr(),
-        html.H5("Trace extraction", className="mb-2"),
-        html.Div([
-            html.Span("additional stats", className="small text-muted me-2"),
-            *help_icon(EXTRACT_STATS_ID, HELP_TEXT[EXTRACT_STATS_ID]),
-        ], className="d-flex align-items-center mb-1"),
+        html.Span("additional stats", className="small text-muted me-2 ms-3"),
+        *help_icon(EXTRACT_STATS_ID, HELP_TEXT[EXTRACT_STATS_ID]),
         dbc.Checklist(
             id=EXTRACT_STATS_ID,
             options=[{"label": "median", "value": "median"},
                      {"label": "mode", "value": "mode"}],
-            value=[], inline=True, className="mb-2"),
+            value=[], inline=True, className="mb-0 me-2"),
         dbc.Button("Extract traces", id=EXTRACT_BTN_ID, color="primary",
                    outline=True, size="sm"),
-        html.Div(_extraction_status(out_dir), id=EXTRACT_STATUS_ID,
-                 className="mt-2"),
+        button_tooltip(EXTRACT_BTN_ID, HELP_TEXT[EXTRACT_BTN_ID]),
     ]
 
 
-def _has_merged_masks(out_dir: Optional[Path]) -> bool:
-    return out_dir is not None and (out_dir / "merged_masks.tif").exists()
-
-
-def _extraction_style(out_dir: Optional[Path]) -> dict:
-    return {} if _has_merged_masks(out_dir) else {"display": "none"}
+def _has_extractable_masks(out_dir: Optional[Path]) -> bool:
+    if out_dir is None:
+        return False
+    return ((out_dir / "merged_masks.tif").exists()
+            or (out_dir / "boundaries.tif").exists())
 
 
 def _extraction_status(out_dir: Optional[Path]):
@@ -295,11 +313,26 @@ def _extraction_status(out_dir: Optional[Path]):
              for r in rows[:200]  # guard against a very large ROI count
          ])],
         size="sm", striped=True, className="mb-0")
-    return html.Div([header, table])
+    return html.Div([header, table],
+                    style={"maxHeight": "12rem", "overflowY": "auto"})
 
 
 def _right_column() -> html.Div:
+    workspace = get_app_state().workspace
+    _, value = fov_select.options_and_value(workspace)
+    out_dir = fov_select.resolve_output_dir(value)
     return html.Div([
+        html.Div([
+            fov_select.select(FOV_SELECT_ID, workspace,
+                              className="me-2", style={"width": "auto"}),
+            dbc.Button("Run centroid discovery", id=RUN_ID, color="primary",
+                       n_clicks=0, disabled=run_panel.run_disabled()),
+            button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
+            html.Div(_extraction_controls(), id=EXTRACT_SECTION_ID,
+                     className="d-flex align-items-center flex-wrap"),
+        ], className="d-flex align-items-center flex-wrap mb-2"),
+        html.Div(_extraction_status(out_dir), id=EXTRACT_STATUS_ID,
+                 className="mb-2"),
         html.Div([
             html.H5("Preview", className="mb-0 me-3"),
             dbc.Switch(id=SHOW_CENTROIDS_ID, label="Show centroids", value=True,
@@ -518,6 +551,14 @@ def _save_report(written: list, skipped: list, failed: list):
 
 
 def register_callbacks(app: dash.Dash) -> None:
+    sidebar.register_collapsible_toggle(
+        app, toggle_id=SIDEBAR_TOGGLE_ID, store_id=SIDEBAR_STORE_ID,
+        collapse_id=PARAMS_COLLAPSE_ID,
+        left_col_id=LEFT_COL_ID, right_col_id=RIGHT_COL_ID,
+        left_open_class=_LEFT_OPEN_CLASS, left_closed_class=_LEFT_CLOSED_CLASS,
+        right_open_class=_RIGHT_OPEN_CLASS, right_closed_class=_RIGHT_CLOSED_CLASS,
+    )
+
     @app.callback(
         Output(RUN_ID, "disabled"),
         Input(workspace_bar.WORKSPACE_VERSION, "data"),
@@ -579,7 +620,6 @@ def register_callbacks(app: dash.Dash) -> None:
         Output(BOUNDARY_SECTION_ID, "style"),
         Output(CAPTURE_ID, "value"),
         Output(MIN_AREA_ID, "value"),
-        Output(EXTRACT_SECTION_ID, "style"),
         Output(EXTRACT_STATUS_ID, "children"),
         Input(FOV_SELECT_ID, "value"),
         prevent_initial_call=True,
@@ -591,7 +631,7 @@ def register_callbacks(app: dash.Dash) -> None:
         out_dir = fov_select.resolve_output_dir(value)
         if out_dir is None:
             return (DEFAULT_DIAMETER_PX, DEFAULT_CELLPROB_THRESHOLD, "", "",
-                    {"display": "none"}, 12.0, 0, {"display": "none"}, None)
+                    {"display": "none"}, 12.0, 0, None)
         calib = load_calibration(out_dir)
         capture, min_area = _boundary_settings_for(out_dir)
         return (
@@ -601,7 +641,7 @@ def register_callbacks(app: dash.Dash) -> None:
             _readout_text(calib, out_dir),
             _boundary_style(out_dir),
             capture, min_area,
-            _extraction_style(out_dir), _extraction_status(out_dir),
+            _extraction_status(out_dir),
         )
 
     @app.callback(
@@ -698,10 +738,10 @@ def register_callbacks(app: dash.Dash) -> None:
         if out_dir is None:
             return dbc.Alert("Select a FOV first.", color="warning",
                              className="py-2 mb-0")
-        if not _has_merged_masks(out_dir):
+        if not _has_extractable_masks(out_dir):
             return dbc.Alert(
-                "No merged_masks.tif for this FOV yet — save boundaries and "
-                "run Tracking first.", color="warning", className="py-2 mb-0")
+                "No saved masks for this FOV yet — save boundaries first "
+                "(or run Tracking).", color="warning", className="py-2 mb-0")
         started = get_extraction_runner().start(
             out_dir, out_dir.name, tuple(stats or []))
         if not started:

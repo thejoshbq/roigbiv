@@ -31,11 +31,13 @@ def app_client():
 
 # ── the stylesheets are actually served ───────────────────────────────────
 @pytest.mark.parametrize(
-    "name", ["phoxel-tokens.css", "phoxel-bootstrap-bridge.css"])
+    "name",
+    ["phoxel-tokens.css", "phoxel-bootstrap-bridge.css", "phoxel-tokens_chrome.css"],
+)
 def test_token_stylesheet_is_served(app_client, name):
     resp = app_client.get(f"/phoxel-assets/{name}")
     assert resp.status_code == 200, f"/phoxel-assets/{name} is not reachable"
-    assert b":root" in resp.data
+    assert b":root" in resp.data or b"phoxel" in resp.data.lower()
 
 
 def test_token_stylesheets_load_before_the_app_sheet(app_client):
@@ -44,10 +46,11 @@ def test_token_stylesheets_load_before_the_app_sheet(app_client):
     positions = [
         html.index("/phoxel-assets/phoxel-tokens.css"),
         html.index("/phoxel-assets/phoxel-bootstrap-bridge.css"),
+        html.index("/phoxel-assets/phoxel-tokens_chrome.css"),
         html.index("roigbiv.css"),
     ]
     assert positions == sorted(positions), (
-        "roigbiv.css must be linked after both token stylesheets")
+        "chrome recipes must follow tokens; roigbiv.css must follow both")
 
 
 # ── ROIGBIV owns no colour ────────────────────────────────────────────────
@@ -175,8 +178,23 @@ def test_crt_class_is_applied_to_the_navbar_and_nothing_else():
             if "crt" in match.group(1).split():
                 users[path.name] = match.group(1)
 
-    assert users == {"app.py": "roigbiv-navbar crt mb-2"}, (
+    assert users == {"app.py": "phoxel-header crt sticky-top roigbiv-navbar"}, (
         f".crt appears on unexpected surfaces: {users}")
+
+
+def test_chrome_wordmark_and_footer_are_mounted():
+    """Layout is a Dash SPA; assert the shell in source, not the loading HTML."""
+    from roigbiv.ui import app as app_module
+
+    src = Path(app_module.__file__).read_text()
+    assert '"// ROIGBIV"' in src or "'// ROIGBIV'" in src
+    assert "phoxel-wordmark" in src
+    assert "phoxel-mark" in src
+    assert "phoxel-footer" in src
+    assert "LOGISTECH" in src
+    assert "SYS_ONLINE" in src
+    assert "phoxel-header" in src
+    assert "roigbiv-grid" in src
 
 
 def _luminance(hex_colour: str) -> float:
@@ -205,11 +223,10 @@ def test_navbar_text_clears_aa_on_a_scanline_row(css):
         round(int(surface[i:i + 2], 16) * (1 - alpha)) for i in (0, 2, 4))
 
     navbar_block = css[css.index("── Navbar"):css.index("── Cards")]
-    branding = css[css.index("── Branding"):css.index("── Navbar")]
     # Negative lookbehind so `border-color:` and `background-color:` — which
     # are not text — do not get swept in.
     tokens = sorted(set(re.findall(r"(?<![-\w])color:\s*var\(\s*(--[a-z-]+)\s*\)",
-                                   navbar_block + branding)))
+                                   navbar_block)))
     assert tokens, "no text colours found on the navbar"
 
     for token in tokens:

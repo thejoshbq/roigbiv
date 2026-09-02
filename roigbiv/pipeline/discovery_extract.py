@@ -73,15 +73,16 @@ def extract_from_merged_masks(
     skip_overlap_correction: bool = False,
 ) -> Path:
     """Extract mean (+ any requested extra statistics) from this FOV's
-    current ``merged_masks.tif``.
+    ``merged_masks.tif``, or ``boundaries.tif`` when Tracking has not stamped
+    merged masks yet.
 
     Parameters
     ----------
     fov_output_dir
         The FOV's pipeline output directory (must contain ``merged_masks.tif``
-        and a Suite2p ``plane0/{ops.npy,data.bin}`` pair, at either
-        ``suite2p/plane0/`` or ``{stem}/suite2p/plane0/`` — see
-        ``resolve_suite2p``).
+        or ``boundaries.tif``, and a Suite2p ``plane0/{ops.npy,data.bin}``
+        pair, at either ``suite2p/plane0/`` or ``{stem}/suite2p/plane0/`` —
+        see ``resolve_suite2p``).
     cfg
         Optional override. Defaults to a ``PipelineConfig`` built from
         ``suite2p/plane0/ops.npy``'s ``fs`` (roigbiv-default neuropil params).
@@ -103,17 +104,12 @@ def extract_from_merged_masks(
     Raises
     ------
     FileNotFoundError
-        If ``merged_masks.tif`` or the Suite2p ``ops.npy``/``data.bin`` pair
-        is missing.
+        If neither ``merged_masks.tif`` nor ``boundaries.tif`` is present, or
+        the Suite2p ``ops.npy``/``data.bin`` pair is missing.
     """
     fov_output_dir = Path(fov_output_dir)
 
-    masks_path = fov_output_dir / "merged_masks.tif"
-    if not masks_path.exists():
-        raise FileNotFoundError(
-            f"no merged_masks.tif at {masks_path}; run centroid discovery, "
-            "save boundaries, and run Tracking first."
-        )
+    masks_path = resolve_label_image(fov_output_dir)
 
     data_bin_path, fov_shape, ops_fs = resolve_suite2p(fov_output_dir)
 
@@ -123,7 +119,7 @@ def extract_from_merged_masks(
 
     rois = _load_rois_from_label_image(masks_path)
     if not rois:
-        raise ValueError(f"merged_masks.tif at {masks_path} has no labeled ROIs.")
+        raise ValueError(f"{masks_path.name} at {masks_path} has no labeled ROIs.")
     rois.sort(key=lambda r: int(r.label_id))
 
     corrections_rev = compute_corrections_rev(rois)
@@ -182,6 +178,28 @@ def extract_from_merged_masks(
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+
+def resolve_label_image(fov_output_dir: Path) -> Path:
+    """Label image used for Discovery-triggered extraction.
+
+    Prefers ``merged_masks.tif`` when Tracking (or a full cascade) has
+    already stamped it, so an existing extraction path does not silently
+    switch geometry. Falls back to ``boundaries.tif`` — the masks Discovery
+    itself just saved, and the geometry ADR-0005 reserved for trace work —
+    so a FOV that has not gone through Tracking is still extractable.
+    """
+    fov_output_dir = Path(fov_output_dir)
+    merged = fov_output_dir / "merged_masks.tif"
+    if merged.exists():
+        return merged
+    boundaries = fov_output_dir / "boundaries.tif"
+    if boundaries.exists():
+        return boundaries
+    raise FileNotFoundError(
+        f"no merged_masks.tif or boundaries.tif under {fov_output_dir}; "
+        "save boundaries on Discovery, or run Tracking."
+    )
 
 
 def resolve_suite2p(fov_output_dir: Path) -> tuple[Path, tuple[int, int, int], float]:

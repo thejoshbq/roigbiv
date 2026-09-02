@@ -11,7 +11,9 @@ module exists for), then verifies:
   * extraction against a FOV that already has a primary bundle writes a
     ``traces/discovery-{hash}/`` sibling and never touches the primary
   * a second, unchanged invocation is idempotent
-  * a missing ``merged_masks.tif`` raises ``FileNotFoundError``
+  * a missing ``merged_masks.tif`` *and* ``boundaries.tif`` raises
+    ``FileNotFoundError``
+  * ``boundaries.tif`` is enough when ``merged_masks.tif`` is absent
   * a present ``registry_match.json`` populates ``global_cell_id`` per row
   * a flattened ``suite2p/plane0/`` (no ``{stem}/`` nesting) also resolves —
     see ``resume.py::_suite2p_plane_dir`` for the same two-layout ambiguity
@@ -143,6 +145,20 @@ def test_extract_missing_merged_masks_raises(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError):
         extract_from_merged_masks(fov_out)
+
+
+def test_extract_falls_back_to_boundaries_tif(tmp_path: Path):
+    fov_out = tmp_path / "fov7"
+    fov_out.mkdir()
+    _make_suite2p(fov_out)
+    label_img = np.zeros((H, W), dtype=np.uint16)
+    label_img[0:4, 0:4] = 1
+    tifffile.imwrite(str(fov_out / "boundaries.tif"), label_img)
+
+    bundle = extract_from_merged_masks(fov_out)
+    assert bundle == fov_out / "traces"
+    meta = json.loads((bundle / "traces_meta.json").read_text())
+    assert meta["n_rois"] == 1
 
 
 def test_extract_picks_up_registry_match(tmp_path: Path):

@@ -21,8 +21,8 @@
    sheet names the Phoxel token directly. The other twenty aliases the old
    palette declared are gone — nothing referenced them.
 
-   Both selectors, because the (dead) theme toggle can still write
-   data-bs-theme="light" onto <html> and ROIGBIV is dark either way. */
+   Both selectors, because a leftover data-bs-theme="light" on <html>
+   must not resurrect CYBORG's light canvas — ROIGBIV is dark either way. */
 :root,
 [data-bs-theme="dark"] {
     --roigbiv-accent:    var(--accent);
@@ -117,33 +117,67 @@ code, pre, kbd, samp,
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
-/* ── Branding ──────────────────────────────────────────────────────────── */
-.roigbiv-brand {
-    font-family: var(--font-display);
-    font-weight: 700;
-    font-size: var(--fs-h2);
-    letter-spacing: var(--tracking-caps);
-    text-transform: uppercase;
-    color: var(--text-strong);
+/* ── Shell ─────────────────────────────────────────────────────────────── */
+.roigbiv-shell {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    isolation: isolate;
+    background-color: var(--surface-0);
 }
-.roigbiv-brand-accent {
-    color: var(--accent);
+
+/* Axplorer's cyberpunk-grid canvas, product-local. A dedicated layer, not a
+   document-wide CRT overlay. Isolation on the shell keeps z-index: -1
+   behind the cards without slipping under the page background. */
+.roigbiv-grid {
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    z-index: -1;
 }
-.roigbiv-brand-sub {
-    font-family: var(--font-ui);
-    font-size: var(--fs-micro);
-    line-height: var(--lh-micro);
-    letter-spacing: var(--tracking-caps);
-    text-transform: uppercase;
-    color: var(--text);
+.roigbiv-grid::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+        linear-gradient(color-mix(in srgb, var(--border-hairline) 40%, transparent) 1px, transparent 1px),
+        linear-gradient(90deg, color-mix(in srgb, var(--border-hairline) 40%, transparent) 1px, transparent 1px);
+    background-size: 60px 60px;
+    animation: roigbiv-grid-drift 60s linear infinite;
+    mask-image: radial-gradient(ellipse 80% 70% at 50% 50%, black 30%, transparent 100%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 70% at 50% 50%, black 30%, transparent 100%);
+}
+.roigbiv-grid::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse 600px 400px at 50% 40%, color-mix(in srgb, var(--accent) 5%, transparent), transparent);
+}
+@keyframes roigbiv-grid-drift {
+    to { background-position: 60px 60px; }
 }
 
 /* ── Navbar ────────────────────────────────────────────────────────────── */
 /* Solid, not translucent: the CRT layer lives on this element and a blurred
-   backdrop underneath it just muddies the texture. */
+   backdrop underneath it just muddies the texture. Branding (wordmark,
+   SYS_ONLINE) comes from phoxel-tokens chrome.css. */
 .roigbiv-navbar {
     background-color: var(--surface-2) !important;
     border-bottom: 1px solid var(--border);
+}
+.roigbiv-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s3);
+}
+.phoxel-mark {
+    display: block;
+    width: 2rem;
+    height: 2rem;
+    flex-shrink: 0;
+    background-color: var(--accent);
+    -webkit-mask: url("favicon.svg") center / contain no-repeat;
+    mask: url("favicon.svg") center / contain no-repeat;
 }
 /* --text, not --text-muted: the navbar carries the CRT layer, and the design
    system floors text on a .crt surface at --text. Primary navigation reads
@@ -159,10 +193,6 @@ code, pre, kbd, samp,
 .roigbiv-navbar .nav-link:hover,
 .roigbiv-navbar .nav-link.active {
     color: var(--accent) !important;
-}
-/* Hide theme toggle — ROIGBIV is always dark */
-.roigbiv-theme-toggle {
-    display: none !important;
 }
 /* Workspace disclosure: reads as status the whole time, and as a control on
    hover. It is the only navbar item that is neither branding nor navigation. */

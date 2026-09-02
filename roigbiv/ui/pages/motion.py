@@ -25,7 +25,7 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
-from roigbiv.ui.components import fov_select, run_panel, workspace_bar
+from roigbiv.ui.components import fov_select, run_panel, sidebar, workspace_bar
 from roigbiv.ui.components.figure import build_roi_figure
 from roigbiv.ui.components.forms import (
     HELP_TEXT, button_tooltip, help_icon, labeled_with_help,
@@ -38,6 +38,22 @@ FOV_SELECT_ID = "roigbiv-mc-fov-select"
 PREVIEW_ID = "roigbiv-mc-preview"
 TICK_ID = "roigbiv-motion-tick"
 
+SIDEBAR_TOGGLE_ID = "roigbiv-motion-sidebar-toggle"
+SIDEBAR_STORE_ID = "roigbiv-motion-sidebar-store"
+PARAMS_COLLAPSE_ID = "roigbiv-motion-params-collapse"
+LEFT_COL_ID = "roigbiv-motion-left-col"
+RIGHT_COL_ID = "roigbiv-motion-right-col"
+
+# Left column width classes. Default is collapsed, so the layout is built
+# closed and the clientside toggle (sidebar.register_collapsible_toggle)
+# swaps to the open classes on expand. Closed is a bare icon rail — the Run
+# button lives in the right column now, so nothing left column-side needs
+# more than the toggle chevron's own width.
+_LEFT_OPEN_CLASS = "col-md-5 col-lg-4 pe-md-4"
+_LEFT_CLOSED_CLASS = "col-auto pe-md-2"
+_RIGHT_OPEN_CLASS = "col-md-7 col-lg-8"
+_RIGHT_CLOSED_CLASS = "col"
+
 
 # ── layout ─────────────────────────────────────────────────────────────────
 
@@ -47,25 +63,34 @@ def layout() -> html.Div:
         run_panel.tick(),
         run_panel.page_tick(TICK_ID),
         dbc.Row([
-            dbc.Col(_left_column(), md=5, lg=4, className="pe-md-4"),
-            dbc.Col(_right_column(), md=7, lg=8),
+            dbc.Col(_left_column(), id=LEFT_COL_ID,
+                    className=_LEFT_CLOSED_CLASS),
+            dbc.Col(_right_column(), id=RIGHT_COL_ID,
+                    className=_RIGHT_CLOSED_CLASS),
         ], className="g-3"),
     ])
 
 
 def _left_column() -> html.Div:
     return html.Div([
-        html.H4("Motion-correction parameters", className="mb-3"),
-        _params_form(),
-        dbc.Button("Run motion correction", id=RUN_ID,
-                   color="primary", className="mt-3 w-100", n_clicks=0,
-                   disabled=run_panel.run_disabled()),
-        button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
+        sidebar.sidebar_toggle(toggle_id=SIDEBAR_TOGGLE_ID,
+                               store_id=SIDEBAR_STORE_ID,
+                               default_open=False),
+        dbc.Collapse(html.Div([
+            html.H4("Motion-correction parameters", className="mb-3"),
+            _params_form(),
+        ]), id=PARAMS_COLLAPSE_ID, is_open=False),
     ])
 
 
 def _right_column() -> html.Div:
     return html.Div([
+        html.Div([
+            dbc.Button("Run motion correction", id=RUN_ID,
+                       color="primary", n_clicks=0,
+                       disabled=run_panel.run_disabled()),
+            button_tooltip(RUN_ID, HELP_TEXT[RUN_ID]),
+        ], className="mb-3"),
         run_panel.layout(),
         _live_mc_section(),
         _mc_preview_section(),
@@ -369,6 +394,14 @@ def _preview_figure(value: Optional[str]):
 
 
 def register_callbacks(app: dash.Dash) -> None:
+    sidebar.register_collapsible_toggle(
+        app, toggle_id=SIDEBAR_TOGGLE_ID, store_id=SIDEBAR_STORE_ID,
+        collapse_id=PARAMS_COLLAPSE_ID,
+        left_col_id=LEFT_COL_ID, right_col_id=RIGHT_COL_ID,
+        left_open_class=_LEFT_OPEN_CLASS, left_closed_class=_LEFT_CLOSED_CLASS,
+        right_open_class=_RIGHT_OPEN_CLASS, right_closed_class=_RIGHT_CLOSED_CLASS,
+    )
+
     @app.callback(
         Output(RUN_ID, "disabled"),
         Input(workspace_bar.WORKSPACE_VERSION, "data"),
@@ -525,10 +558,9 @@ def register_callbacks(app: dash.Dash) -> None:
         Output("roigbiv-mc-live-scrub", "marks"),
         Output("roigbiv-mc-live-scrub", "disabled"),
         Input(TICK_ID, "n_intervals"),
-        State("roigbiv-theme", "data"),
         prevent_initial_call="initial_duplicate",
     )
-    def _on_live_tick(_n, theme):
+    def _on_live_tick(_n):
         # The slow half: traces, metrics, crop box and scrub range, all derived
         # from state.json read straight off disk (no HTTP hop — this is the same
         # process that wrote it). Rides the existing 1.5 s run-status interval
@@ -545,7 +577,7 @@ def register_callbacks(app: dash.Dash) -> None:
         return (
             not _live_tick_active(state),
             _live_status_text(state),
-            _shift_figure(state, theme),
+            _shift_figure(state),
             _render_live_metrics(state),
             _crop_overlay_style(state),
             min(records) if records else 0,

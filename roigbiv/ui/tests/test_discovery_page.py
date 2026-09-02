@@ -143,26 +143,32 @@ def test_the_boundary_section_is_hidden_without_centroids(monkeypatch, tmp_path)
 # ── the extraction section ──────────────────────────────────────────────────
 
 
-def test_the_extraction_section_is_hidden_without_merged_masks(monkeypatch, tmp_path):
+def test_the_extraction_controls_are_visible_without_merged_masks(monkeypatch, tmp_path):
     monkeypatch.setattr(discovery, "get_app_state",
                         lambda: _FakeState(output_root=tmp_path))
     section = find_by_id(discovery.layout(), discovery.EXTRACT_SECTION_ID)
-    assert section.style == {"display": "none"}
+    assert getattr(section, "style", None) in (None, {}, [])
+    assert discovery.EXTRACT_BTN_ID in ids(section)
 
 
-def test_has_merged_masks_is_false_without_the_file(tmp_path):
+def test_has_extractable_masks_is_false_without_either_file(tmp_path):
     out = tmp_path / "sess01"
     out.mkdir()
-    assert discovery._has_merged_masks(out) is False
-    assert discovery._extraction_style(out) == {"display": "none"}
+    assert discovery._has_extractable_masks(out) is False
 
 
-def test_has_merged_masks_is_true_once_written(tmp_path):
+def test_has_extractable_masks_is_true_with_boundaries(tmp_path):
+    out = tmp_path / "sess01"
+    out.mkdir()
+    tifffile.imwrite(out / "boundaries.tif", np.zeros((8, 8), np.uint16))
+    assert discovery._has_extractable_masks(out) is True
+
+
+def test_has_extractable_masks_is_true_with_merged_masks(tmp_path):
     out = tmp_path / "sess01"
     out.mkdir()
     tifffile.imwrite(out / "merged_masks.tif", np.zeros((8, 8), np.uint16))
-    assert discovery._has_merged_masks(out) is True
-    assert discovery._extraction_style(out) == {}
+    assert discovery._has_extractable_masks(out) is True
 
 
 def test_extraction_status_without_a_bundle_says_so(tmp_path):
@@ -182,6 +188,22 @@ def test_extraction_section_carries_the_stats_checklist_and_button(monkeypatch):
     for cid in (discovery.EXTRACT_STATS_ID, discovery.EXTRACT_BTN_ID,
                 discovery.EXTRACT_STATUS_ID):
         assert cid in present
+
+
+def test_extraction_section_is_in_the_toolbar_not_the_params_collapse(monkeypatch):
+    """Extract traces has to sit next to Run — the preview is 1:1 and
+    fills the viewport, so anything below the sheet is off-screen."""
+    monkeypatch.setattr(discovery, "get_app_state", lambda: _FakeState())
+    layout = discovery.layout()
+    collapse = find_by_id(layout, discovery.PARAMS_COLLAPSE_ID)
+    right = find_by_id(layout, discovery.RIGHT_COL_ID)
+    assert discovery.EXTRACT_SECTION_ID not in ids(collapse)
+    assert discovery.EXTRACT_SECTION_ID in ids(right)
+    assert discovery.EXTRACT_BTN_ID in ids(right)
+    for cid in (discovery.EXTRACT_STATS_ID, discovery.EXTRACT_BTN_ID,
+                discovery.EXTRACT_STATUS_ID):
+        assert cid not in ids(collapse)
+        assert cid in ids(right)
 
 
 # ── the boundary preview (ported from test_boundaries_page) ────────────────
