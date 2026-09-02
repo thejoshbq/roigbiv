@@ -130,8 +130,7 @@ def test_no_callback_writes_to_a_component_on_another_page():
         workspace_bar.PATH_ID, workspace_bar.SCAN_ID,
         workspace_bar.RESULT_ID, workspace_bar.REGISTRY_ID,
         workspace_bar.TIF_SELECT_ID, workspace_bar.TIF_SELECT_ALL_ID,
-        "roigbiv-url", "roigbiv-redirect", "roigbiv-theme",
-        "roigbiv-theme-toggle", "roigbiv-theme-toggle-icon",
+        "roigbiv-url", "roigbiv-redirect",
         "roigbiv-page-content",
     }
 

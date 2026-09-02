@@ -223,12 +223,16 @@ HELP_TEXT: dict[str, str] = {
         "How far a flow trajectory may land from a seed and still be that "
         "cell. Recomputes instantly against a cached flow field — nothing "
         "here touches the GPU.",
+    "roigbiv-discovery-extract-btn":
+        "Extracts every ROI's fluorescence trace for the whole session from "
+        "this FOV's saved boundaries (or merged_masks.tif after Tracking). "
+        "Mean is always extracted.",
     "roigbiv-discovery-extract-stats":
         "Extracts every ROI's fluorescence trace for the whole session from "
-        "this FOV's current merged_masks.tif. Mean is always extracted; "
-        "median and mode are additional per-frame spatial statistics over "
-        "the same masked pixels, each neuropil-corrected the same way as "
-        "mean.",
+        "this FOV's saved boundaries, or merged_masks.tif after Tracking. "
+        "Mean is always extracted; median and mode are additional per-frame "
+        "spatial statistics over the same masked pixels, each neuropil-"
+        "corrected the same way as mean.",
     # Discovery · preview canvas gestures
     "roigbiv-discovery-edit":
         "drag to move · right-click to delete · click empty space to add",

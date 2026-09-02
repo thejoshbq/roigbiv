@@ -54,6 +54,7 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 
+from roigbiv import __version__ as _ROIGBIV_VERSION
 from roigbiv.ui.components import errors as error_components
 from roigbiv.ui.components import run_panel, workspace_bar
 from roigbiv.ui.logging import configure_ui_logging
@@ -87,11 +88,8 @@ _PHOXEL_ROUTE = "/phoxel-assets"
 _PHOXEL_STYLESHEETS = (
     f"{_PHOXEL_ROUTE}/phoxel-tokens.css",
     f"{_PHOXEL_ROUTE}/phoxel-bootstrap-bridge.css",
+    f"{_PHOXEL_ROUTE}/phoxel-tokens_chrome.css",
 )
-
-THEME_STORE_ID = "roigbiv-theme"
-THEME_TOGGLE_ID = "roigbiv-theme-toggle"
-THEME_TOGGLE_ICON_ID = "roigbiv-theme-toggle-icon"
 
 PAGES = (
     ("/motion-correction", "Motion correction", motion),
@@ -162,6 +160,14 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
         suppress_callback_exceptions=True,
         assets_folder="assets",
     )
+    app.index_string = (
+        "<!DOCTYPE html>\n<html>\n    <head>\n        {%metas%}\n"
+        "        <title>{%title%}</title>\n        {%favicon%}\n"
+        '        <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">\n'
+        "        {%css%}\n    </head>\n    <body>\n        {%app_entry%}\n"
+        "        <footer>\n            {%config%}\n            {%scripts%}\n"
+        "            {%renderer%}\n        </footer>\n    </body>\n</html>"
+    )
     app.server.secret_key = os.environ.get(
         "ROIGBIV_SECRET_KEY", _secrets.token_hex(32)
     )
@@ -194,7 +200,6 @@ def build_app(preset_workspace: "Optional[WorkspacePaths]" = None) -> dash.Dash:
         register_flask_routes as register_discovery_api_routes)
     register_discovery_api_routes(app.server)
     _wire_sidebar_toggles(app)
-    _wire_theme_toggle(app)
     error_components.register_callbacks(app)
     # Registered once, not per page: both live outside the routed container and
     # a second registration would be duplicate Outputs on the same ids.
@@ -217,54 +222,58 @@ def _register_phoxel_assets(server) -> None:  # noqa: ANN001
         return send_from_directory(assets, filename)
 
 
+def _fov_mark() -> html.Span:
+    """Header mark: FOV frame, two ROI contours, one centroid.
+
+    Dash has no ``html.Svg``, so the glyph lives in ``assets/favicon.svg``
+    and is painted here with ``--accent`` through a CSS mask.
+    """
+    return html.Span(
+        className="phoxel-mark",
+        role="img",
+        **{"aria-label": "ROIGBIV"},
+    )
+
+
 def _build_layout() -> html.Div:
     nav_items = [
         dbc.NavItem(dbc.NavLink(label, href=path, active="exact"))
         for path, label, _ in PAGES
     ]
     brand = html.Div([
-        html.Div([
-            html.Span("ROI", className="roigbiv-brand-accent"),
-            html.Span("GBIV"),
-        ], className="roigbiv-brand"),
-        html.Div("// CALCIUM REGISTRY", className="roigbiv-brand-sub"),
-    ], className="d-flex flex-column")
-    theme_toggle = dbc.Button(
-        html.I(id=THEME_TOGGLE_ICON_ID, className="bi bi-sun-fill"),
-        id=THEME_TOGGLE_ID,
-        color="link",
-        className="roigbiv-theme-toggle ms-2 p-1",
-        title="Toggle light / dark theme",
-        n_clicks=0,
-    )
-    navbar = dbc.Navbar(
-        dbc.Container(
-            [
-                dcc.Link(brand, href=PAGES[0][0],
-                         style={"textDecoration": "none", "color": "inherit"}),
-                html.Span(workspace_bar.toggle_button(), className="ms-3"),
-                dbc.Nav(nav_items, navbar=True, className="ms-auto"),
-                theme_toggle,
-            ],
-            fluid=True,
-        ),
-        sticky="top",
-        # `crt` is the Phoxel scanline layer, opt-in and chrome-only. The navbar
-        # is the one surface in this app that qualifies — it carries no body
-        # text, no table and no plot.
-        className="roigbiv-navbar crt mb-2",
+        _fov_mark(),
+        html.H1("// ROIGBIV",
+                className="phoxel-wordmark title-glow glitch-hover"),
+    ], className="roigbiv-brand")
+    sys_online = html.Span([
+        html.Span(className="pulse-dot"),
+        html.Span("SYS_ONLINE", className="sys-label"),
+    ], className="sys-online")
+    # `crt` is the Phoxel scanline layer, opt-in and chrome-only. The title
+    # bar is the one surface in this app that qualifies — it carries no body
+    # text, no table and no plot.
+    header = html.Header([
+        dcc.Link(brand, href=PAGES[0][0],
+                 className="text-decoration-none"),
+        sys_online,
+        html.Span(workspace_bar.toggle_button(), className="ms-3"),
+        dbc.Nav(nav_items, navbar=True, className="ms-auto"),
+    ], className="phoxel-header crt sticky-top roigbiv-navbar")
+    footer = html.Footer(
+        f"(c) 2026 LOGISTECH // ALL RIGHTS RESERVED // BUILD {_ROIGBIV_VERSION}",
+        className="phoxel-footer",
     )
     return html.Div([
         dcc.Location(id="roigbiv-url", refresh=False),
         dcc.Location(id="roigbiv-redirect", refresh=False),
-        # Default = "dark" (the lab uses ROIGBIV in a darkened scope room).
-        # Persisted in localStorage so the choice survives reloads.
-        dcc.Store(id=THEME_STORE_ID, storage_type="local", data="dark"),
         workspace_bar.stores(),
-        navbar,
+        html.Div(className="roigbiv-grid", **{"aria-hidden": "true"}),
+        header,
         dbc.Container([workspace_bar.collapse()], fluid=True),
-        dbc.Container(id="roigbiv-page-content", fluid=True, className="pb-5"),
-    ])
+        dbc.Container(id="roigbiv-page-content", fluid=True,
+                      className="flex-grow-1 pb-4"),
+        footer,
+    ], className="roigbiv-shell")
 
 
 def resolve_route(pathname: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -310,44 +319,6 @@ def _wire_routes(app: dash.Dash) -> None:
         # Input and the Output of the same callback.
         _, target = resolve_route(pathname)
         return target if target is not None else no_update
-
-
-def _wire_theme_toggle(app: dash.Dash) -> None:
-    """Theme toggle — flips ``data-bs-theme`` on <html> and persists choice.
-
-    Two clientside callbacks:
-
-    * Button click → toggle the stored theme.
-    * Store value  → apply ``data-bs-theme`` to the document root and update
-      the toggle icon. Runs on initial load too, so the persisted choice is
-      respected without a click.
-    """
-    app.clientside_callback(
-        """
-        function(n_clicks, current) {
-            if (!n_clicks) {
-                return current || "dark";
-            }
-            return (current === "dark") ? "light" : "dark";
-        }
-        """,
-        Output(THEME_STORE_ID, "data"),
-        Input(THEME_TOGGLE_ID, "n_clicks"),
-        State(THEME_STORE_ID, "data"),
-        prevent_initial_call=True,
-    )
-    app.clientside_callback(
-        """
-        function(theme) {
-            const t = (theme === "light") ? "light" : "dark";
-            document.documentElement.setAttribute("data-bs-theme", t);
-            // Sun icon when in dark mode (click to go light); moon when in light.
-            return (t === "dark") ? "bi bi-sun-fill" : "bi bi-moon-fill";
-        }
-        """,
-        Output(THEME_TOGGLE_ICON_ID, "className"),
-        Input(THEME_STORE_ID, "data"),
-    )
 
 
 def _wire_sidebar_toggles(app: dash.Dash) -> None:
