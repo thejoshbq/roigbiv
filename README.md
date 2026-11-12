@@ -1,5 +1,7 @@
 # ROIGBIV
 
+*ROI-Guided Boundary Identification and Validation*
+
 **ROI detection, review, and cross-session cell tracking for two-photon calcium imaging.**
 
 [![Version](https://img.shields.io/badge/version-0.1.10-blue)](https://github.com/thejoshbq/roigbiv/releases)

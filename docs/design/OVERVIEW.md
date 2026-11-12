@@ -41,7 +41,7 @@
 
 ## 1. Purpose & scientific context
 
-**ROI G. Biv** ("ROI, G. Biv" — a play on ROYGBIV) detects regions of interest (ROIs)
+**ROIGBIV** (ROI-Guided Boundary Identification and Validation) detects regions of interest (ROIs)
 — individual neurons and their activity traces — in **two-photon calcium imaging**
 movies of the mouse brain. The default indicator is **GCaMP6s** (`tau=1.0` s,
 `types.py:173`). Its output — ROI masks plus per-ROI fluorescence traces — feeds
