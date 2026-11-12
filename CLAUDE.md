@@ -13,10 +13,10 @@ You are a senior software engineer with neuroscience and ML expertise. You are c
 - For any non-trivial change: explore relevant code first, then present 2–3 viable approaches with tradeoffs **before** writing code. Let Josh pick the direction. A single "recommended" option is fine; always surface the alternatives you considered.
 - One-liners, typos, mechanical renames, and obviously-scoped edits may skip the proposal step.
 - Name tradeoffs explicitly when they exist (algorithm choice, library, API shape, refactor scope). Don't silently pick.
-- **Never touch without explicit confirmation:** `inference/`, `diagnostics/regression/`, `models/deployed/`, `models/checkpoints/`, or any `*.db` file. These are data of record.
+- **Never touch without explicit confirmation:** `inference/`, `models/deployed/`, `models/checkpoints/`, or any `*.db` file. These are data of record.
 - Terse prose; no trailing summaries. Use `path/to/file.py:line` citations for code references.
 - Use Explore agents for codebase search >3 queries; use Plan agents for architecture decisions.
-- When editing pipeline stages or the spec, cross-check `docs/roi-pipeline-specification.md` first — the spec is load-bearing.
+- When editing pipeline stages, cross-check `docs/design/OVERVIEW.md` and the ADRs in `docs/adr/` first; defaults come from `PipelineConfig` in `roigbiv/pipeline/types.py`.
 - Auto-memory already tracks Josh's profile and long-lived project state; don't re-ask for facts already in memory.
 - Prefer quality frameworks and programming languages that suite the task rather than what is easiest to start working with.
 
@@ -26,19 +26,15 @@ You are a senior software engineer with neuroscience and ML expertise. You are c
 
 ## Authoritative docs
 
-When in doubt about *behavior*, the spec wins over code comments or this file.
+When in doubt about *behavior*, the code wins. `docs/design/OVERVIEW.md` describes it as built; where a doc and the code disagree, trust the code and fix the doc.
 
 | Intent | Source of truth |
 | --- | --- |
-| Pipeline behavior, gate logic, ROI schema | `docs/roi-pipeline-specification.md` |
-| Algorithm methods (per-stage math, current impl) | `docs/publication/algorithms_v2.md` (authoritative; supersedes `docs/publication/algorithms.md` (v1) and the legacy `docs/pipeline_algorithm_breakdown.md`) |
-| Tunable parameters (all defaults) | `configs/pipeline.yaml` |
+| Pipeline behavior, per-stage algorithms, gate logic, ROI schema | `docs/design/OVERVIEW.md` |
+| Architecture decisions (candidate union, cascade retirement, ROI stamps, tracking edit logs, seeded boundaries) | `docs/adr/0001`…`0005` |
+| Tunable parameters (runtime defaults) | `PipelineConfig` in `roigbiv/pipeline/types.py` (`configs/pipeline.yaml` is documentary; the runtime does not load it) |
 | Dash UI page map + architecture | `roigbiv/ui/app.py` module docstring |
-| Astrocyte / dual-channel extension | `docs/ASTROCYTE_PLAN.md` |
-| Data format for external collaborators | `docs/RESEARCHER_DATA_GUIDE.md` |
-| External-editor (Fiji/ImageJ) handoff | `docs/external-editing.md` |
-| Email notifications on pipeline completion | `docs/email-notifications.md` |
-| Regression investigation audit trail | `diagnostics/regression/0{1..10}_*.md` |
+| Known limitations | `docs/limitations.md` |
 | Version history | `docs/CHANGELOG.md` |
 
 ## Environment
@@ -74,8 +70,7 @@ roigbiv-pipeline --input PATH --fs 7.5 --no-stage-3 --no-stage-4
 # Cross-session FOV registry
 roigbiv-registry {list|show|match|track|backfill|migrate}
 
-# Ingest externally-edited ROI masks (Fiji / ImageJ handoff). See
-# docs/external-editing.md for the full workflow.
+# Ingest externally-edited ROI masks (Fiji / ImageJ handoff)
 roigbiv-reingest --output-dir inference/pipeline/<stem> --new-mask edited.tif
 
 # Tests
@@ -94,7 +89,7 @@ cellpose --pretrained_model models/deployed/current_model
 
 ## Architecture
 
-Sequential subtractive detection — not the older parallel three-branch consensus. Each stage operates on the residual after prior stages subtract their detections.
+Sequential subtractive detection — not the older parallel three-branch consensus. Each stage operates on the residual after prior stages subtract their detections. This is `pipeline_mode="cascade_legacy"`, the default; the non-destructive `candidate_union` modes (ADR-0001) and the criteria for retiring the cascade (ADR-0002) are in `docs/adr/`.
 
 ```
 Foundation  (motion correction + truncated SVD + L+S background + summary images)
@@ -109,14 +104,14 @@ Provenance is tracked per ROI (`source_stage`, `gate_outcome`, `confidence`, per
 
 ### Package layout
 
-- `roigbiv/pipeline/` — sequential pipeline. Entry: `run.py::run_pipeline`. Stages `stage1.py`…`stage4.py` with matching `gate1.py`…`gate4.py`. `foundation.py` does motion correction + SVD + L+S. `subtraction.py` removes detected sources from the residual movie on disk. `batch.py` runs ≥2 FOVs concurrently with a shared GPU lock. `napari_viewer.py` / `hitl.py` handle review.
-- `roigbiv/registry/` — cross-session FOV + cell tracking. `orchestrator.py::register_or_match` returns `hash_match | auto_match | review | new_fov`. Storage: SQLAlchemy store + filesystem blob store. Matching: ROICaT embeddings with calibrated logistic posterior. Alembic migrations in `migrations/versions/`.
-- `roigbiv/ui/` — Dash + Plotly frontend. Entry: `roigbiv-ui`. One page per operation, in order: **Motion correction** (`/motion-correction`), **Centroids** (`/centroids`), **Tracking** (`/tracking` — session order + run + the contact sheet and its edit gestures), **Boundaries** (`/boundaries`). The workspace scanner (`components/workspace_bar.py`) and the run-status panel (`components/run_panel.py`) live outside the routed page container and register their callbacks once in `build_app`; pages coordinate through the `roigbiv-workspace-version` store, never by writing into each other's controls. `pages/review.py` is dormant and unrouted. Reuses `workspace.py`; writes additive HITL corrections under each FOV's `corrections/` subdir without mutating pipeline outputs. Registry browsing/maintenance is CLI-only via `roigbiv-registry`.
+- `roigbiv/pipeline/` — sequential pipeline. Entry: `run.py::run_pipeline`. Stages `stage1.py`…`stage4.py` with matching `gate1.py`…`gate4.py`. `foundation.py` does motion correction + SVD + L+S. `subtraction.py` estimates source traces and subtracts them; the residual is virtual (`residual.py::ResidualView`), never written to disk. `batch.py` runs ≥2 FOVs concurrently with a shared GPU lock. `napari_viewer.py` / `hitl.py` handle review.
+- `roigbiv/registry/` — cross-session FOV + cell tracking. `orchestrator.py::register_or_match` returns `hash_match | auto_match | review | new_fov`. Storage: SQLAlchemy store + filesystem blob store. Matching: ROICaT embeddings with calibrated logistic posterior. Alembic migrations in `roigbiv/registry/migrations/versions/`.
+- `roigbiv/ui/` — Dash + Plotly frontend. Entry: `roigbiv-ui`. One page per operation, in order: **Motion correction** (`/motion-correction`), **Discovery** (`/discovery` — Cellpose calibration, the detection run and seeded-boundary tuning; `/centroids` redirects here), **Tracking** (`/tracking` — session order, cross-session registration, the contact sheet and its edit gestures). The workspace scanner (`components/workspace_bar.py`) and the run-status panel (`components/run_panel.py`) live outside the routed page container and register their callbacks once in `build_app`; pages coordinate through the `roigbiv-workspace-version` store, never by writing into each other's controls. `pages/review.py` is dormant and unrouted. Reuses `workspace.py`; writes additive HITL corrections under each FOV's `corrections/` subdir without mutating pipeline outputs. Registry browsing/maintenance is CLI-only via `roigbiv-registry`.
 - `roigbiv/pipeline/workspace.py` — `resolve_workspace` + `run_with_workspace`: in-input `output/`, `registry.db`, auto-migrate, auto-backfill.
 - `roigbiv/pipeline/corrections.py` — HITL ops (add / delete / merge / split / edit / relabel) as a JSONL append log with idempotent replay.
-- `roigbiv/` top level — CLI entry points (`cli.py`, `cli_registry.py`, `cli_reingest.py`, all wired in `pyproject.toml [project.scripts]`) plus shared utilities used across subpackages: `io.py` (TIF discovery/validation, used by `pipeline/workspace.py` and `ui/components/workspace_bar.py`), `suite2p.py` (Suite2p batch runner, used by `pipeline/foundation.py`), `overlay.py` (report rendering, used by `cli.py`).
+- `roigbiv/` top level — CLI entry points (`cli_registry.py`, `cli_reingest.py`, `cli_benchmark.py`, `cli_export.py`, all wired in `pyproject.toml [project.scripts]`; `roigbiv-pipeline` is `pipeline/run.py::main`) plus shared utilities used across subpackages: `io.py` (TIF discovery/validation, used by `pipeline/workspace.py` and `ui/components/workspace_bar.py`), `suite2p.py` (Suite2p batch runner, used by `pipeline/foundation.py`), `overlay.py` (report rendering, used by `pipeline/run.py` and `ui/services/pipeline_runner.py`).
 - `scripts/` — training, evaluation, HITL ingest, pynapse export, data-prep utilities (not shipped with the package).
-- `configs/pipeline.yaml` — all tunable defaults. CLI flags override.
+- `configs/pipeline.yaml` — documentary copy of the defaults; the runtime does not load it. Runtime defaults are `PipelineConfig` in `types.py`; CLI flags override them.
 - `models/deployed/current_model` — deployed Cellpose checkpoint. `models/checkpoints/` holds training runs.
 
 ### GPU concurrency
