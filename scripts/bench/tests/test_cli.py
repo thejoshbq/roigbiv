@@ -23,13 +23,25 @@ CLI = REPO / "scripts" / "bench" / "cli.py"
 MAX_D = math.sqrt(81 / math.pi)
 
 
-def run_cli(*args, tmp_path):
+def run_raw(*args, tmp_path):
     out = tmp_path / f"out_{args[0]}.json"
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "ROIGBIV_BENCH_ROOT")}
     proc = subprocess.run([sys.executable, str(CLI), *args, "--out", str(out)],
                           cwd=REPO, env=env, capture_output=True, text=True, timeout=120)
+    return proc, (json.loads(out.read_text()) if out.exists() else None)
+
+
+def run_cli(*args, tmp_path):
+    proc, result = run_raw(*args, tmp_path=tmp_path)
     assert proc.returncode == 0, proc.stderr
-    return json.loads(out.read_text())
+    return result
+
+
+def edit_manifest(root, fn):
+    p = root / "manifest.json"
+    m = json.loads(p.read_text())
+    fn(m)
+    p.write_text(json.dumps(m))
 
 
 @pytest.fixture
@@ -67,9 +79,52 @@ def test_score(root, pred_dir, tmp_path):
 def test_score_filters(root, pred_dir, tmp_path):
     (pred_dir / "syn-a2.npy").unlink()
     r = run_cli("score", "--root", str(root), "--pred-dir", str(pred_dir), "--split", "dev",
-                "--include-flagged", tmp_path=tmp_path)
+                "--include-flagged", "--allow-missing", tmp_path=tmp_path)
     assert [f["fov_id"] for f in r["per_fov"]] == ["syn-a1", "syn-a4"]
     assert r["missing_predictions"] == ["syn-a2"]
+    assert r["split"] == "dev" and r["include_flagged"] is True
+
+
+def test_score_records_settings(root, pred_dir, tmp_path):
+    r = run_cli("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert r["split"] is None and r["include_flagged"] is False and r["verified"] is True
+    assert r["annotation_count_mismatches"] == []
+    assert [f["n_rois_manifest"] for f in r["per_fov"]] == [4, 4, 3]
+
+
+def test_missing_prediction_fails_unless_allowed(root, pred_dir, tmp_path):
+    (pred_dir / "syn-a3.npy").unlink()
+    proc, r = run_raw("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert proc.returncode == 1 and "syn-a3" in proc.stderr
+    assert r["missing_predictions"] == ["syn-a3"]
+
+
+def test_bad_prediction_shape(root, pred_dir, tmp_path):
+    np.save(pred_dir / "syn-a1.npy", np.zeros((2, 3), dtype=np.float32))
+    proc, _ = run_raw("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert proc.returncode == 2 and "syn-a1" in proc.stderr
+
+
+def test_empty_prediction_is_allowed(root, pred_dir, tmp_path):
+    np.save(pred_dir / "syn-a1.npy", np.zeros((0, 2), dtype=np.float32))
+    r = run_cli("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert (r["per_fov"][0]["n_pred"], r["per_fov"][0]["n_tp"]) == (0, 0)
+
+
+def test_score_verifies_hashes_by_default(root, pred_dir, tmp_path):
+    zp = root / "fovs/syn-a3/annotation_a.zip"
+    zp.write_bytes(zp.read_bytes() + b"\0")
+    proc, _ = run_raw("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert proc.returncode == 2 and "sha256" in proc.stderr
+    r = run_cli("score", "--root", str(root), "--pred-dir", str(pred_dir), "--no-verify", tmp_path=tmp_path)
+    assert r["verified"] is False
+
+
+def test_annotation_count_mismatch_is_reported(root, pred_dir, tmp_path):
+    edit_manifest(root, lambda m: m["fovs"][0]["annotations"][0].update(n_rois=5))
+    r = run_cli("score", "--root", str(root), "--pred-dir", str(pred_dir), tmp_path=tmp_path)
+    assert r["annotation_count_mismatches"] == [
+        {"fov_id": "syn-a1", "index": 0, "n_rois_manifest": 5, "n_parsed": 4}]
 
 
 def test_audit(root, tmp_path):
@@ -89,6 +144,19 @@ def test_inter_rater(root, tmp_path):
     (pair,) = r["per_fov"]["syn-a2"]["pairs"]
     assert (pair["rater_a"], pair["rater_b"], pair["n_tp"]) == ("r1", "r2", 3)
     assert pair["f1"] == pytest.approx(0.75) and r["ceiling"] == pytest.approx(0.75)
+    assert r["split"] is None and r["include_flagged"] is False and r["verified"] is True
+
+
+def test_inter_rater_filters_like_score(root, tmp_path):
+    r = run_cli("inter-rater", "--root", str(root), "--split", "test", tmp_path=tmp_path)
+    assert r["per_fov"] == {} and r["ceiling"] is None and r["split"] == "test"
+
+
+def test_inter_rater_same_rater_name_kept_apart(root, tmp_path):
+    edit_manifest(root, lambda m: m["fovs"][1]["annotations"][1].update(rater="r1"))
+    r = run_cli("inter-rater", "--root", str(root), "--no-verify", tmp_path=tmp_path)
+    (pair,) = r["per_fov"]["syn-a2"]["pairs"]
+    assert (pair["rater_a"], pair["rater_b"], pair["n_tp"]) == ("r1", "r1#1", 3)
 
 
 def test_bad_root_exits_2(tmp_path):
