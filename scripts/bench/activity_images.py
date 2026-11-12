@@ -11,13 +11,14 @@ Cells that fire rarely stand out against their own local baseline.
 Windows are in seconds, so the frame rate must be known. Memory stays at one
 block of bins plus running sums, so a 27,000-frame movie never loads whole.
 """
-# contract stub: U4 replaces the function bodies below; signatures are frozen.
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
+import tifffile
 
 from bench.schema import ActivityImages
 
@@ -32,7 +33,15 @@ def iter_frames(path: Path, kind: str) -> Iterator[np.ndarray]:
     carry an OME series that would otherwise load the whole recording). Any
     other kind raises ``ValueError``.
     """
-    return iter(())
+    if kind == "tif":
+        with tifffile.TiffFile(str(path)) as tf:
+            for page in tf.pages:
+                yield page.asarray()
+    elif kind == "frame_dir":
+        for f in sorted(Path(path).glob("*.tif")):
+            yield tifffile.imread(str(f), key=0)
+    else:
+        raise ValueError(f"unknown movie kind: {kind!r}")
 
 
 def activity_images(
@@ -62,5 +71,67 @@ def activity_images(
     7. Both images are returned as float32; ``n_frames``, ``n_bins`` and
        ``n_blocks`` report the counts used.
     """
-    empty = np.zeros((0, 0), dtype=np.float32)
-    return ActivityImages(activity_max=empty, temporal_sd=empty, n_frames=0, n_bins=0, n_blocks=0)
+    if not fs > 0 or not bin_s > 0 or not block_s > 0:
+        raise ValueError("fs, bin_s and block_s must be positive")
+
+    frames_per_bin = max(1, round(bin_s * fs))
+    k = max(1, round(block_s / bin_s))
+    stride = max(1, k // 2)
+
+    bins: deque[np.ndarray] = deque(maxlen=k)
+    bin_sum: np.ndarray | None = None
+    in_bin = 0
+    n_frames = 0
+    n_bins = 0
+    n_blocks = 0
+    next_start = 0
+    last_end = 0
+    sum_x: np.ndarray | None = None
+    sum_x2: np.ndarray | None = None
+    act: np.ndarray | None = None
+
+    def emit(block: np.ndarray) -> None:
+        nonlocal act, n_blocks
+        d = block - np.median(block, axis=0)
+        peak = d.max(axis=0)
+        act = peak if act is None else np.maximum(act, peak)
+        n_blocks += 1
+
+    for frame in frames:
+        x = np.asarray(frame, dtype=np.float64)
+        if sum_x is None:
+            sum_x = np.zeros(x.shape)
+            sum_x2 = np.zeros(x.shape)
+            bin_sum = np.zeros(x.shape)
+        sum_x += x
+        sum_x2 += x * x
+        n_frames += 1
+
+        bin_sum += x
+        in_bin += 1
+        if in_bin == frames_per_bin:
+            bins.append(bin_sum / frames_per_bin)
+            bin_sum = np.zeros(x.shape)
+            in_bin = 0
+            n_bins += 1
+            if n_bins == next_start + k:
+                emit(np.stack(bins))
+                last_end = n_bins
+                next_start += stride
+
+    if n_bins == 0:
+        raise ValueError("movie has no complete bin")
+    if n_bins < k or last_end != n_bins:
+        emit(np.stack(bins))
+
+    mean_x = sum_x / n_frames
+    mean_x2 = sum_x2 / n_frames
+    temporal_sd = np.sqrt(np.maximum(mean_x2 - mean_x * mean_x, 0.0))
+
+    return ActivityImages(
+        activity_max=act.astype(np.float32),
+        temporal_sd=temporal_sd.astype(np.float32),
+        n_frames=n_frames,
+        n_bins=n_bins,
+        n_blocks=n_blocks,
+    )
