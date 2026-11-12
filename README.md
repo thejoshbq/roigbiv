@@ -1,9 +1,9 @@
-# ROI G. Biv — Cell Detection Pipeline
+# ROI G. Biv
 
-**Sequential subtractive ROI detection for two-photon calcium imaging, with cross-session cell tracking and a browser-based review interface.**
+**Find, review, and track cells in two-photon calcium imaging recordings.**
 
 [![Version](https://img.shields.io/badge/version-0.1.10-blue)](https://github.com/thejoshbq/roigbiv/releases)
-[![Language](https://img.shields.io/badge/python-3.9+-blue)](https://www.python.org)
+[![Language](https://img.shields.io/badge/python-3.10-blue)](https://www.python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-orange)](docs/CHANGELOG.md)
 [![Phoxel Workbench](https://img.shields.io/badge/Phoxel_Workbench-member-orange)](https://github.com/Otis-Lab-MUSC)
@@ -14,45 +14,59 @@
 
 ---
 
-## Overview
+## What it does
 
-ROI G. Biv turns raw two-photon calcium imaging stacks into curated cell masks and fluorescence traces. Rather than accepting a single detector's output, it applies four detection passes in sequence — Cellpose morphology, Suite2p temporal activity, a GCaMP template sweep, and a tonic-neuron search — each operating on the residual left after the previous pass subtracts what it found, so dim and slow-firing cells are recovered instead of being masked by bright ones. Every ROI carries its own provenance: which stage found it, which quality gate it passed, and a confidence score you can filter on downstream.
+ROI G. Biv takes two-photon calcium imaging movies and turns them into a set of cells (ROIs) with a fluorescence trace for each one. It suggests where the cells are, lets you check and correct those suggestions by eye, and follows the same cells across recording sessions so you can compare them day to day.
 
-Across imaging sessions, the cross-session registry matches the same field of view and the same individual cells over days of recording, so longitudinal analyses follow real cells rather than re-detected approximations. Curation happens in a browser-based interface for motion correction, centroid review, session tracking, and boundary editing, with all human corrections stored additively so pipeline outputs are never overwritten. Results export to [pynapse](https://github.com/Otis-Lab-MUSC/pynapse) for signal analysis and to axplorer for visualization.
+Your corrections are saved alongside the results rather than written over them, so you can always see what the software found and what a person changed.
 
----
+## How it is used
 
-## Getting Started
+Most work happens in a web app that runs on your own machine. Point it at a folder of recordings and work through three pages in order:
 
-Install order matters for Suite2p and Cellpose, so use the provided conda environment:
+1. **Motion correction** — steady each movie and check how well it worked.
+2. **Discovery** — find cell centres with Cellpose, then adjust the cells and their outlines. You can play the movie under the markers to spot cells that only light up now and then.
+3. **Tracking** — put the sessions in order, match the same cells across them, and fix any missed or wrong matches.
+
+Traces can then be exported to an HDF5 file for analysis in [pynapse](https://github.com/Otis-Lab-MUSC/pynapse).
+
+A fully automated detection pipeline is also available from the command line for batch runs.
+
+## Getting started
+
+Requires conda. An NVIDIA GPU is strongly recommended; without one, cell detection runs much slower.
 
 ```bash
 conda env create -f environment.yml
 conda activate roigbiv
+pip install -e ".[ui]"     # adds the web app
+roigbiv-ui                 # then open http://127.0.0.1:8050
 ```
 
-Reference documentation lives in [`docs/`](docs/) — pipeline behavior, tunable parameters (`configs/pipeline.yaml`), and the researcher data guide.
+The web app's `ui` extra currently depends on a local checkout of `phoxel-tokens`, the shared Phoxel Workbench styles, which is not yet published.
 
----
+Command-line tools:
 
-## Architecture & Dependencies
+| Command | Purpose |
+|---|---|
+| `roigbiv-pipeline --input FOLDER --fs HZ` | Run the automated pipeline (use the movie's actual frame rate) |
+| `roigbiv-registry` | Inspect and maintain the cross-session cell registry |
+| `roigbiv-export` | Export traces to HDF5 |
+| `roigbiv-reingest` | Bring back cell masks edited in Fiji/ImageJ |
 
-| Component | Language | Framework / Libraries |
-|---|---|---|
-| Detection pipeline | Python 3.10 | Cellpose (<4.0), Suite2p, PyTorch, NumPy, SciPy, scikit-image, tifffile |
-| Cross-session registry | Python 3.10 | SQLAlchemy 2, Alembic, ROICaT, PyTorch |
-| Web interface | Python 3.10 | Dash, Plotly, dash-bootstrap-components |
-| Desktop viewer (optional) | Python 3.10 | napari |
-| Classification & QC | Python 3.10 | scikit-learn, pandas, PyTables, OpenCV |
+Run any command with `--help` for its options.
 
----
+## Documentation
+
+- [Design overview](docs/design/OVERVIEW.md) — how the pipeline works
+- [Limitations](docs/limitations.md) — what ROI G. Biv does not claim
+- [Decision records](docs/adr/) — why the design is the way it is
+- [Changelog](docs/CHANGELOG.md)
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
 
 ## Contact
 
-Joshua Boquiren — [thejoshbq@proton.me](mailto:thejoshbq@proton.me)
-
-[GitHub: thejoshbq/roigbiv](https://github.com/thejoshbq/roigbiv)
+Joshua Boquiren — [thejoshbq@proton.me](mailto:thejoshbq@proton.me) · [GitHub: thejoshbq/roigbiv](https://github.com/thejoshbq/roigbiv)
