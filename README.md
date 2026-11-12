@@ -1,6 +1,6 @@
-# ROI G. Biv
+# ROIGBIV
 
-**Find, review, and track cells in two-photon calcium imaging recordings.**
+**ROI detection, review, and cross-session cell tracking for two-photon calcium imaging.**
 
 [![Version](https://img.shields.io/badge/version-0.1.10-blue)](https://github.com/thejoshbq/roigbiv/releases)
 [![Language](https://img.shields.io/badge/python-3.10-blue)](https://www.python.org)
@@ -14,53 +14,86 @@
 
 ---
 
-## What it does
+## Overview
 
-ROI G. Biv takes two-photon calcium imaging movies and turns them into a set of cells (ROIs) with a fluorescence trace for each one. It suggests where the cells are, lets you check and correct those suggestions by eye, and follows the same cells across recording sessions so you can compare them day to day.
+ROIGBIV turns two-photon movies into soma ROIs and per-ROI fluorescence traces, and links the same cells across imaging sessions. It has two entry points that share the same motion correction, Cellpose models, registry, and output format:
 
-Your corrections are saved alongside the results rather than written over them, so you can always see what the software found and what a person changed.
+- **Annotation workflow (web app).** Cellpose proposes soma centroids on the anatomical mean image, a person confirms and corrects them, the registry links them across sessions, and boundaries are drawn from the confirmed centroids. This is the lab's day-to-day path.
+- **Automated pipeline (CLI).** A sequential subtractive cascade of four detectors, each with a validation gate, for unattended batch runs.
 
-## How it is used
+Human corrections are stored as append-only JSONL edit logs under each FOV's `corrections/` directory and replayed on read; pipeline outputs are never overwritten.
 
-Most work happens in a web app that runs on your own machine. Point it at a folder of recordings and work through three pages in order:
+## Annotation workflow
 
-1. **Motion correction** — steady each movie and check how well it worked.
-2. **Discovery** — find cell centres with Cellpose, then adjust the cells and their outlines. You can play the movie under the markers to spot cells that only light up now and then.
-3. **Tracking** — put the sessions in order, match the same cells across them, and fix any missed or wrong matches.
+The Dash app (`roigbiv-ui`) has one page per operation, run in order on a workspace folder of TIFF stacks:
 
-Traces can then be exported to an HDF5 file for analysis in [pynapse](https://github.com/Otis-Lab-MUSC/pynapse).
+1. **Motion correction.** Suite2p rigid + non-rigid registration by default, with a live registration preview and per-FOV quality metrics. Writes `{stem}_mc.tif`. GPU row-wise phase correlation and a SIMA HMM backend are opt-in.
+2. **Discovery.** Per-FOV Cellpose calibration, then centroid detection on the mean image (`mean_M`); each centroid records whether a Suite2p candidate corroborates it. Boundaries are seeded from the confirmed centroids: Cellpose's flow field defines cell extent, and a watershed on `-cellprob` with the centroids as markers assigns pixels to cells. Hand-drawn boundaries override the computed ones. A movie player streams the registered movie under the markers for finding transiently active cells. Traces can be extracted here without running Tracking.
+3. **Tracking.** Set session order, stamp centroids as fixed-radius disks (`merged_masks.tif`), and register the sessions through the cross-session registry. A contact sheet shows each cell across sessions, with edits for missed centroids and wrong or missing links.
 
-A fully automated detection pipeline is also available from the command line for batch runs.
+The registry receives disks, not real boundaries (ADR-0003): segmentation shape varies between sessions for the same cell and would leak into the matching embeddings. Real boundaries are written separately to `boundaries.tif` with the same label IDs.
+
+## Automated pipeline
+
+```
+Foundation  motion correction -> truncated-SVD low-rank/sparse split -> summary images
+Stage 1     Cellpose spatial detection    -> Gate 1 morphology        -> subtract
+Stage 2     Suite2p temporal detection    -> Gate 2 cross-validation  -> subtract
+Stage 3     GCaMP template sweep          -> Gate 3 waveform          -> subtract
+Stage 4     tonic-neuron search           -> Gate 4 correlation contrast
+            QC -> trace extraction -> activity classification -> review queue
+```
+
+Each stage detects on the residual left after earlier stages subtract their sources, so dim and sparsely firing cells are not masked by bright ones. The residual is reconstructed on demand from the registered movie and the SVD factors rather than written to disk. Every ROI carries its provenance: `source_stage`, `gate_outcome` (`accept` / `flag` / `reject`), `confidence`, and per-stage scores. Stage 4 candidates always route to review (see [Limitations](docs/limitations.md)).
+
+A directory input runs in workspace mode: outputs go to `<input>/output/<stem>/`, and each session is registered in `<input>/registry.db` as it finishes. `--n-workers 2` processes two FOVs concurrently, with GPU sections serialized by a shared lock.
+
+## Cross-session registry
+
+`roigbiv/registry/` matches FOVs and cells across sessions with ROICaT (RoMa alignment, ROInet embeddings, clustering). A calibrated logistic posterior on embedding similarity classifies each FOV as `hash_match`, `auto_match`, `review`, or `new_fov` (accept at 0.9, review at 0.5). Storage is SQLAlchemy (SQLite by default, Postgres optional) plus a filesystem blob store, with Alembic migrations. Without the `embeddings` extra, matching falls back to phase correlation.
+
+## Outputs
+
+Per FOV: neuropil-corrected traces, dF/F and deconvolved spikes, per-stage ROI masks, summary images (`mean_M`, `std_S`, `vcorr_S`, ...), `roi_metadata.json` with the per-ROI schema, and `registry_match.json`. The `traces/` bundle and `roigbiv-export` (HDF5, one column per cell keyed by global cell ID) feed [pynapse](https://github.com/Otis-Lab-MUSC/pynapse).
 
 ## Getting started
 
-Requires conda. An NVIDIA GPU is strongly recommended; without one, cell detection runs much slower.
+Requires conda. An NVIDIA GPU is strongly recommended: Cellpose, ROICaT, and source subtraction use CUDA and fall back to CPU. Suite2p is CPU-only.
 
 ```bash
 conda env create -f environment.yml
 conda activate roigbiv
-pip install -e ".[ui]"     # adds the web app
-roigbiv-ui                 # then open http://127.0.0.1:8050
+pip install -e ".[ui,embeddings]"     # web app + ROICaT matching
+roigbiv-ui                            # http://127.0.0.1:8050
 ```
 
-The web app's `ui` extra currently depends on a local checkout of `phoxel-tokens`, the shared Phoxel Workbench styles, which is not yet published.
-
-Command-line tools:
+The `ui` extra currently depends on a local checkout of `phoxel-tokens` (shared Phoxel Workbench design tokens), which is not yet published.
 
 | Command | Purpose |
 |---|---|
-| `roigbiv-pipeline --input FOLDER --fs HZ` | Run the automated pipeline (use the movie's actual frame rate) |
-| `roigbiv-registry` | Inspect and maintain the cross-session cell registry |
+| `roigbiv-pipeline --input PATH --fs HZ` | Run the pipeline on a TIFF or a workspace folder |
+| `roigbiv-registry {list,show,match,track,backfill,migrate}` | Inspect and maintain the registry |
 | `roigbiv-export` | Export traces to HDF5 |
-| `roigbiv-reingest` | Bring back cell masks edited in Fiji/ImageJ |
+| `roigbiv-reingest` | Ingest masks edited in Fiji/ImageJ |
+| `roigbiv-benchmark` | Validate a benchmark FOV manifest |
 
-Run any command with `--help` for its options.
+`--fs` must be the effective frame rate of the stack. For frame-averaged stacks, pass the averaged rate and `--frame-averaging N`; a wrong rate miscalibrates the Stage 3 templates, the Stage 4 bandpass, and deconvolution. Stages 2 to 4 can be skipped with `--no-stage-N`.
+
+## Stack
+
+| Component | Libraries |
+|---|---|
+| Detection | Cellpose 3, Suite2p, PyTorch, NumPy, SciPy, scikit-image |
+| Registry | ROICaT, SQLAlchemy 2, Alembic |
+| Web app | Dash, Plotly, dash-bootstrap-components |
+| Desktop viewer (optional) | napari |
+| QC and classification | scikit-learn, pandas, PyTables, OpenCV |
 
 ## Documentation
 
-- [Design overview](docs/design/OVERVIEW.md) — how the pipeline works
-- [Limitations](docs/limitations.md) — what ROI G. Biv does not claim
-- [Decision records](docs/adr/) — why the design is the way it is
+- [Design overview](docs/design/OVERVIEW.md): architecture and per-stage behavior
+- [Limitations](docs/limitations.md): what ROIGBIV does not claim
+- [Decision records](docs/adr/)
 - [Changelog](docs/CHANGELOG.md)
 
 ## License
@@ -69,4 +102,4 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contact
 
-Joshua Boquiren — [thejoshbq@proton.me](mailto:thejoshbq@proton.me) · [GitHub: thejoshbq/roigbiv](https://github.com/thejoshbq/roigbiv)
+Joshua Boquiren ([thejoshbq@proton.me](mailto:thejoshbq@proton.me)) · [GitHub: thejoshbq/roigbiv](https://github.com/thejoshbq/roigbiv)
