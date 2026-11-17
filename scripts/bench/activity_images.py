@@ -135,3 +135,30 @@ def activity_images(
         n_bins=n_bins,
         n_blocks=n_blocks,
     )
+
+
+def binned_max(frames: Iterable[np.ndarray], frames_per_bin: int = 7) -> np.ndarray:
+    """Per-pixel maximum over bin means, streamed one frame at a time.
+
+    Bin ``i`` is the float64 mean of frames ``[i * frames_per_bin, (i + 1) *
+    frames_per_bin)``; trailing frames that do not fill a bin belong to no bin.
+    No baseline is subtracted, so bright resting cells show as well as active
+    ones. ``frames_per_bin`` below 1 or a movie with no complete bin raises
+    ``ValueError``. Returned as float32.
+    """
+    if frames_per_bin < 1:
+        raise ValueError("frames_per_bin must be at least 1")
+    best: np.ndarray | None = None
+    bin_sum: np.ndarray | None = None
+    in_bin = 0
+    for frame in frames:
+        x = np.asarray(frame, dtype=np.float64)
+        bin_sum = x.copy() if in_bin == 0 else bin_sum + x
+        in_bin += 1
+        if in_bin == frames_per_bin:
+            mean = bin_sum / frames_per_bin
+            best = mean if best is None else np.maximum(best, mean)
+            in_bin = 0
+    if best is None:
+        raise ValueError("movie has no complete bin")
+    return best.astype(np.float32)
