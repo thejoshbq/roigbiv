@@ -22,6 +22,8 @@ Decision rules (spec §6):
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 from scipy.ndimage import binary_dilation
 from skimage.feature import peak_local_max
@@ -92,6 +94,7 @@ def evaluate_gate1(
     dog_map: np.ndarray,
     cfg: PipelineConfig,
     starting_label_id: int = 1,
+    detectors: Optional[list[str]] = None,
 ) -> list[ROI]:
     """Apply Gate 1 to a list of candidate Stage 1 masks.
 
@@ -104,6 +107,9 @@ def evaluate_gate1(
     dog_map           : (H, W) float32 — for nuclear shadow score
     cfg               : PipelineConfig
     starting_label_id : int — first ROI label to assign
+    detectors         : optional list of str, same length — the Stage 1
+                        detector of each candidate, recorded as
+                        ``features["stage1_detector"]`` (union backend only)
 
     Returns
     -------
@@ -243,6 +249,8 @@ def evaluate_gate1(
                 "mask_peak_count": n_peaks,
             },
         )
+        if detectors is not None:
+            roi.features["stage1_detector"] = detectors[i]
         rois.append(roi)
         next_label += 1
 

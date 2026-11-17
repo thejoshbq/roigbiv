@@ -399,6 +399,11 @@ def run_centroid_discovery(
     # flow field, so it can produce centroids but never seeded boundaries.
     # Detect anyway and leave the cache empty rather than failing the FOV.
     has_flows = getattr(det_cfg, "stage1_backend", "cellpose3") != "cpsam_sidecar"
+    if getattr(det_cfg, "stage1_backend", "cellpose3") == "cellpose3_cpsam_union":
+        # Seeded boundaries need a flow field and Cellpose-SAM's masks have
+        # none; discovery uses the union's Cellpose 3 half only.
+        print("  WARNING: centroid discovery runs Cellpose 3 only under "
+              "stage1_backend='cellpose3_cpsam_union'", flush=True)
     if has_flows:
         flows = run_cellpose_flows(
             substrate.morph, substrate.ch2, det_cfg, max_S=substrate.max_S)

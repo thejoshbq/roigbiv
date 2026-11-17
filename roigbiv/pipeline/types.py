@@ -26,6 +26,7 @@ _DEFAULT_CELLPOSE_MODEL = str(
 
 PIPELINE_MODES = ("cascade_legacy", "candidate_union", "candidate_union_with_residual_refinement", "benchmark_only")
 DEFAULT_PIPELINE_MODE = "cascade_legacy"
+STAGE1_BACKENDS = ("cellpose3", "cpsam_sidecar", "cellpose3_cpsam_union")
 
 
 @dataclass
@@ -594,10 +595,24 @@ class PipelineConfig:
     #                   / the residual engine are untouched. cpsam is channel-
     #                   invariant and noise-robust → the sidecar drops denoise
     #                   and ignores the channels=(1,2) role convention.
+    # "cellpose3_cpsam_union" : Cellpose 3 as above, plus Cellpose-SAM on the
+    #                   movie's max7 image through the same sidecar, with the
+    #                   cpsam_* settings below and no diameter. Cellpose-SAM
+    #                   masks that duplicate a Cellpose 3 mask are dropped
+    #                   (cpsam_union.keep_secondary); the rest are appended
+    #                   before Gate 1, each ROI recording its detector in
+    #                   features["stage1_detector"].
     stage1_backend: str = "cellpose3"
     # Path to the cp-sam env python. "" → auto-resolve: $ROIGBIV_CPSAM_PYTHON,
     # else the sibling `cp-sam` conda env of the running interpreter.
     cpsam_sidecar_python: str = ""
+    # Union backend only. Defaults are the settings benchmarked on v0/v1
+    # (ROI Suite's discovery recipe): cellprob 0, flow 0.4, 7-frame bins.
+    cpsam_model: str = "cpsam_v2"
+    cpsam_cellprob_threshold: float = 0.0
+    cpsam_flow_threshold: float = 0.4
+    cpsam_union_iou: float = 0.3            # IoU at which a cpsam mask is a duplicate
+    cpsam_frames_per_bin: int = 7           # max7 = max over 7-frame bin means
 
     # ── Foundation denoising (DeepCAD-RT out-of-process sidecar) ───────────
     # Out-of-process DeepCAD-RT denoising (see roigbiv/pipeline/deepcad.py).
