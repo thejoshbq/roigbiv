@@ -233,8 +233,10 @@ def measure_soma_scale(mean_M, dog_map=None, *, n_peaks: int = 40,
     Parameters
     ----------
     mean_M : 2-D array (the foundation ``mean_M`` summary image).
-    dog_map : optional precomputed difference-of-Gaussians map (foundation
-        already computes one); when ``None`` it is computed here.
+    dog_map : optional precomputed bright-blob DoG, ``G(3) - G(15)`` of
+        ``mean_M``; when ``None`` it is computed here. Not the foundation's
+        ``dog_map``: that is the nuclear-shadow map (opposite sign, sigmas 2
+        and 6) and its peaks sit on dark nuclei, which this sizing skips.
 
     Returns a ``SomaScale``. ``ok`` is False (and stats are zero) on any failure
     or when fewer than ``MIN_SCALE_SUPPORT`` somata could be sized — never raises.

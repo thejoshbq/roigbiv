@@ -181,6 +181,25 @@ def test_apply_auto_scale_derives_and_respects_pins():
     assert "max_area" not in cfg.auto_adapt["applied"]
 
 
+def test_apply_auto_scale_ignores_the_foundation_nuclear_shadow_map():
+    """The foundation's ``dog_map`` peaks on dark nuclei (G(6) - G(2)); soma sizing
+    needs bright-soma peaks, so the real foundation map must not break auto-scale."""
+    from types import SimpleNamespace
+
+    from roigbiv.pipeline.foundation import compute_nuclear_shadow_map
+    from roigbiv.pipeline.run import _apply_auto_scale
+    from roigbiv.pipeline.types import PipelineConfig
+
+    mean_M = _planted(n=16, radius=8)
+    fov = SimpleNamespace(mean_M=mean_M, dog_map=compute_nuclear_shadow_map(mean_M))
+    cfg = PipelineConfig(profile="generic", auto_scale=True,
+                         diameter=56, min_area=900, max_area=9000)
+    _apply_auto_scale(cfg, fov)
+    assert cfg.auto_adapt["scale_ok"] is True
+    assert cfg.auto_adapt["n_somata"] >= 9
+    assert cfg.diameter != 56
+
+
 def test_apply_auto_scale_sparse_keeps_fallback():
     from types import SimpleNamespace
 

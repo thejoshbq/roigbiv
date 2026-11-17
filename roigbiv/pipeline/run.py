@@ -1461,7 +1461,10 @@ def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
         scale_plausible,
     )
 
-    scale = measure_soma_scale(fov.mean_M, getattr(fov, "dog_map", None))
+    # The foundation's ``dog_map`` is the nuclear-shadow map (G(6) - G(2), peaks
+    # on dark nuclei); soma sizing needs bright-soma peaks, so let
+    # measure_soma_scale compute its own G(3) - G(15).
+    scale = measure_soma_scale(fov.mean_M)
     pinned = set(cfg.explicit_fields or ())
 
     if scale.ok and scale_plausible(scale, cfg.profile):
