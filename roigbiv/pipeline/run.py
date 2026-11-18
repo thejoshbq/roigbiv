@@ -45,6 +45,7 @@ from roigbiv.pipeline.types import (
     DEFAULT_PIPELINE_MODE,
     FOVData,
     PIPELINE_MODES,
+    SCALE_SOURCES,
     STAGE1_BACKENDS,
     PipelineConfig,
 )
@@ -580,14 +581,20 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
     # ── Optics auto-scale (post-foundation, pre-Stage-1) ──────────────────
     # Derive the numeric gates (areas/diameter/separations/pool radii) from the
     # FOV's own measured soma scale, overriding the profile's hardcoded numbers
-    # but never an explicit user flag (cfg.explicit_fields). Gated to
-    # prism/generic so the validated GRIN path stays byte-identical, and only
+    # but never an explicit user flag (cfg.explicit_fields). Active only when the
+    # profile was auto-resolved (an explicit --profile turns auto_scale off
+    # unless the user opts in), and only
     # when Stage 1 will actually run. Re-derives identically on resume (it reads
     # the on-disk mean_M), which is why these fields are excluded from the resume
-    # fingerprint. Runs before the foundation-only short-circuit so a dry run
-    # still records the measured scale for the user to inspect.
-    if rp.should_run("stage1") and auto_scale_active(cfg):
-        _apply_auto_scale(cfg, fov)
+    # fingerprint; with scale_source "cpsam" the re-derivation is a new
+    # Cellpose-SAM inference, so it matches only as far as that inference is
+    # deterministic. Runs before the foundation-only short-circuit so a dry run
+    # still records the measured scale for the user to inspect (from the DoG
+    # estimate: a dry run makes no Cellpose-SAM call). With scale_source
+    # "cpsam", Cellpose-SAM runs here and Stage 1 reuses its masks.
+    cpsam_pre = None
+    if rp.should_run("stage1"):
+        cpsam_pre = _auto_scale_with_cpsam(cfg, fov, output_dir, gpu_lock)
 
     # ── Foundation-only short-circuit ─────────────────────────────────────
     # Stop before any ROI detection so the motion-corrected FOV + summary
@@ -645,11 +652,11 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # Use mean_M (raw movie mean) as the morphological channel for Cellpose.
         # mean_S ≈ 0 under SVD-based L+S (top components absorb per-pixel mean),
         # so mean_M preserves the morphological contrast Cellpose's training expects.
-        cpsam_image = _stage1_cpsam_image(fov, cfg, output_dir)
+        cpsam_image = None if cpsam_pre is not None else _stage1_cpsam_image(fov, cfg, output_dir)
         with _gpu_section(gpu_lock):
             s1 = run_stage1_candidates(
                 fov.mean_M, fov.vcorr_S, cfg, max_S=fov.max_S,
-                cpsam_image=cpsam_image,
+                cpsam_image=cpsam_image, cpsam_labels=cpsam_pre,
             )
         candidates, probs, cellprob_map = s1.masks, s1.probs, s1.cellprob_map
         stage_timings["stage1_detect_s"] = time.time() - t_start
@@ -1487,7 +1494,35 @@ def _seed_auto_adapt(prior: "OpticsPrior | None") -> dict:
     }}
 
 
-def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
+def _auto_scale_with_cpsam(cfg: PipelineConfig, fov: FOVData, output_dir: Path,
+                           gpu_lock=None):
+    """Post-foundation auto-scale, with Cellpose-SAM first when it is the source.
+
+    Under the union backend with ``scale_source="cpsam"``, Cellpose-SAM runs on
+    the max7 image here, before auto-scale, and its masks size the FOV.
+    Returns its ``(label_image, cellprob)`` for Stage 1 to reuse, so it is
+    still one Cellpose-SAM call per FOV; ``None`` when it did not run here.
+    A foundation-only dry run, and a run a low-confidence optics prior is
+    about to pause, size from the DoG estimate with no GPU call or movie pass;
+    the ``--resume`` run that follows re-derives from Cellpose-SAM.
+    Does nothing when auto-scale is off.
+    """
+    if not auto_scale_active(cfg):
+        return None
+    from roigbiv.pipeline.stage1 import UNION_BACKEND, run_cpsam_labels
+    prior = (cfg.auto_adapt or {}).get("prior") or {}
+    will_pause = prior.get("confidence") == "low" and not getattr(cfg, "assume_optics", False)
+    pre = None
+    if (cfg.scale_source == "cpsam" and not getattr(cfg, "foundation_only", False) and not will_pause
+            and getattr(cfg, "stage1_backend", "cellpose3") == UNION_BACKEND):
+        img = _stage1_cpsam_image(fov, cfg, output_dir)
+        with _gpu_section(gpu_lock):
+            pre = run_cpsam_labels(img, cfg)
+    _apply_auto_scale(cfg, fov, cpsam_labels=None if pre is None else pre[0])
+    return pre
+
+
+def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData, cpsam_labels=None) -> None:
     """Post-foundation: measure the FOV's soma scale and derive its numeric gates.
 
     Mutates *cfg* in place when the measurement is trustworthy, honoring
@@ -1496,19 +1531,27 @@ def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
     measurement leaves the profile fallback untouched and records low confidence
     (Phase 3 turns that into pause-to-confirm).
     """
-    from roigbiv.pipeline.optics import (
-        derive_scale_params,
-        measure_soma_scale,
-        scale_plausible,
-    )
+    from roigbiv.pipeline.optics import derive_scale_params, measure_scale, scale_from_labels
 
     # The foundation's ``dog_map`` is the nuclear-shadow map (G(6) - G(2), peaks
-    # on dark nuclei); soma sizing needs bright-soma peaks, so let
-    # measure_soma_scale compute its own G(3) - G(15).
-    scale = measure_soma_scale(fov.mean_M)
+    # on dark nuclei); soma sizing needs bright-soma peaks, so the DoG estimate
+    # computes its own G(3) - G(15) from mean_M.
+    use_cpsam = cfg.scale_source == "cpsam" and cpsam_labels is not None
+    scale = measure_scale(fov.mean_M, cpsam_labels=cpsam_labels if use_cpsam else None,
+                          cpsam_k=cfg.cpsam_scale_k, profile_name=cfg.profile)
     pinned = set(cfg.explicit_fields or ())
+    source = {"scale_source": scale.source}
+    if scale.source == "cpsam":
+        source["cpsam_scale_k"] = cfg.cpsam_scale_k
+    elif use_cpsam:
+        # Cellpose-SAM was tried and lost: keep what it measured for review.
+        tried = scale_from_labels(cpsam_labels, k=cfg.cpsam_scale_k)
+        source["cpsam_rejected"] = {
+            "n_masks": tried.n_somata,
+            "diameter_med": round(tried.diameter_med, 1) if tried.ok else None,
+        }
 
-    if scale.ok and scale_plausible(scale, cfg.profile):
+    if scale.ok:
         applied: dict = {}
         for k, v in derive_scale_params(scale).items():
             if k in pinned:
@@ -1524,13 +1567,14 @@ def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
         cfg.auto_adapt = {
             **cfg.auto_adapt,
             "scale_ok": True,
+            **source,
             "soma_diameter_med": round(scale.diameter_med, 1),
             "n_somata": scale.n_somata,
             "applied": applied,
             "pinned": sorted(pinned),
         }
         print(fmt.sub_phase(
-            f"Auto-scale: soma d≈{scale.diameter_med:.0f}px (n={scale.n_somata}) "
+            f"Auto-scale ({scale.source}): soma d≈{scale.diameter_med:.0f}px (n={scale.n_somata}) "
             f"→ diameter={cfg.diameter}, area=[{cfg.min_area},{cfg.max_area}]"
             + (f"  (pinned: {sorted(pinned)})" if pinned else "")
         ), flush=True)
@@ -1538,6 +1582,7 @@ def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
         cfg.auto_adapt = {
             **cfg.auto_adapt,
             "scale_ok": False,
+            **source,
             "n_somata": scale.n_somata,
             "reason": "too few/implausible somata to size reliably; kept profile fallback",
         }
@@ -1938,6 +1983,12 @@ def main(argv: "list[str] | None" = None) -> int:
                               "need a Cellpose 4 interpreter: "
                               "$ROIGBIV_CPSAM_PYTHON, cfg.cpsam_sidecar_python, "
                               "or a sibling 'cp-sam' or 'roisuite' conda env."))
+    parser.add_argument("--scale-source", dest="scale_source",
+                        choices=SCALE_SOURCES, default=None,
+                        help=("Auto-scale soma size source. 'cpsam' (default): "
+                              "Cellpose-SAM masks under the union backend, "
+                              "falling back to the DoG estimate, then the profile "
+                              "defaults. 'dog': the DoG estimate only."))
     parser.add_argument("--pipeline-mode", dest="pipeline_mode",
                         choices=PIPELINE_MODES, default=DEFAULT_PIPELINE_MODE,
                         help=("Pipeline execution mode (ADR-0001 migration switch). "
@@ -2305,6 +2356,7 @@ def _run_single(
         "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         **({"stage1_backend": args.stage1_backend} if args.stage1_backend else {}),
+        **({"scale_source": args.scale_source} if args.scale_source else {}),
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.
@@ -2618,6 +2670,7 @@ def _run_workspace(
         "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
         **({"stage1_backend": args.stage1_backend} if args.stage1_backend else {}),
+        **({"scale_source": args.scale_source} if args.scale_source else {}),
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.

@@ -27,6 +27,7 @@ _DEFAULT_CELLPOSE_MODEL = str(
 PIPELINE_MODES = ("cascade_legacy", "candidate_union", "candidate_union_with_residual_refinement", "benchmark_only")
 DEFAULT_PIPELINE_MODE = "cascade_legacy"
 STAGE1_BACKENDS = ("cellpose3", "cpsam_sidecar", "cellpose3_cpsam_union")
+SCALE_SOURCES = ("cpsam", "dog")
 
 
 @dataclass
@@ -617,6 +618,13 @@ class PipelineConfig:
     cpsam_flow_threshold: float = 0.4
     cpsam_union_iou: float = 0.3            # IoU at which a cpsam mask is a duplicate
     cpsam_frames_per_bin: int = 7           # max7 = max over 7-frame bin means
+    # Auto-scale source. "cpsam": under the union backend, Cellpose-SAM runs
+    # before auto-scale and the soma scale comes from its masks (sizes divided
+    # by cpsam_scale_k, the Cellpose-SAM / hand-marked size ratio), falling
+    # back to the DoG estimate, then the profile defaults; Stage 1 reuses the
+    # same masks. "dog": the DoG estimate only (optics.measure_soma_scale).
+    scale_source: str = "cpsam"
+    cpsam_scale_k: float = 1.0
 
     # ── Foundation denoising (DeepCAD-RT out-of-process sidecar) ───────────
     # Out-of-process DeepCAD-RT denoising (see roigbiv/pipeline/deepcad.py).

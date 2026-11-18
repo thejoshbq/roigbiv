@@ -417,29 +417,30 @@ def run_stage1_candidates(
     *,
     max_S: Optional[np.ndarray] = None,
     cpsam_image: Optional[np.ndarray] = None,
+    cpsam_labels: Optional[tuple] = None,
 ) -> Stage1Candidates:
     """Stage 1 proposals for ``cfg.stage1_backend``.
 
     The single-detector backends return exactly what
     :func:`run_cellpose_detection` returns. The union backend runs Cellpose 3
     unchanged, then Cellpose-SAM on ``cpsam_image``, and appends the
-    Cellpose-SAM masks that duplicate no Cellpose 3 mask. ``label_image`` and
-    ``cellprob_map`` stay Cellpose 3's own: the appended masks may overlap
-    them and live only in ``masks``.
+    Cellpose-SAM masks that duplicate no Cellpose 3 mask. ``cpsam_labels``
+    (the ``(label_image, cellprob)`` pair :func:`run_cpsam_labels` returns)
+    reuses masks already computed for auto-scale instead of a second call.
+    ``label_image`` and ``cellprob_map`` stay Cellpose 3's own: the appended
+    masks may overlap them and live only in ``masks``.
     """
     if getattr(cfg, "stage1_backend", "cellpose3") != UNION_BACKEND:
         masks, probs, lab, cp = run_cellpose_detection(mean_S, vcorr_S, cfg, max_S=max_S)
         return Stage1Candidates(masks, probs, lab, cp)
-    if cpsam_image is None:
-        raise ValueError(f"stage1_backend={UNION_BACKEND!r} needs cpsam_image")
+    if cpsam_image is None and cpsam_labels is None:
+        raise ValueError(f"stage1_backend={UNION_BACKEND!r} needs cpsam_image or cpsam_labels")
 
     from roigbiv.pipeline.cpsam_union import keep_secondary
 
     flows = run_cellpose_flows(mean_S, vcorr_S, replace(cfg, stage1_backend="cellpose3"), max_S=max_S)
     masks, probs, lab, cp = _split_labels(flows.label_image, flows.cellprob)
-    t0 = time.time()
-    cp_lab, cp_prob = _run_cpsam_image(cpsam_image, cfg, _resolve_gpu(cfg))
-    print(f"  cpsam inference in {time.time()-t0:.2f}s", flush=True)
+    cp_lab, cp_prob = cpsam_labels if cpsam_labels is not None else run_cpsam_labels(cpsam_image, cfg)
     sam_masks, sam_probs, _, _ = _split_labels(cp_lab, cp_prob)
     keep = keep_secondary(masks, sam_masks, radius=cfg.roi_stamp_radius, iou_min=cfg.cpsam_union_iou)
     name = cfg.cpsam_model
@@ -454,6 +455,14 @@ def run_stage1_candidates(
         detectors=["cellpose3"] * len(masks) + [name] * len(keep),
         counts=counts,
     )
+
+
+def run_cpsam_labels(image: np.ndarray, cfg: PipelineConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Cellpose-SAM ``(label_image, cellprob)`` on ``image`` with the union settings."""
+    t0 = time.time()
+    out = _run_cpsam_image(image, cfg, _resolve_gpu(cfg))
+    print(f"  cpsam inference in {time.time()-t0:.2f}s", flush=True)
+    return out
 
 
 def _resolve_gpu(cfg: PipelineConfig) -> bool:
