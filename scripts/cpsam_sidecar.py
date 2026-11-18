@@ -11,7 +11,8 @@ Contract (single argv: a JSON manifest path):
     "input":            "<path>.npy",   # (H,W) or (H,W,C) float32 stack
     "labels_out":       "<path>.npy",   # written: (H,W) uint16 label image
     "cellprob_out":     "<path>.npy",   # written: (H,W) float32 cellprob map
-    "diameter":         <float>,
+    "diameter":         <float|null>,   # null: no diameter (cpsam sizes cells itself)
+    "model":            "<name|path>",  # optional; omitted = the 4.x default model
     "cellprob_threshold": <float>,
     "flow_threshold":   <float>,
     "gpu":              <bool>,
@@ -34,19 +35,31 @@ def main(manifest_path: str) -> int:
 
     x = np.load(m["input"]).astype(np.float32)
 
+    gpu = bool(m.get("gpu", True))
+    if gpu:
+        # Cellpose falls back to the CPU without saying so when CUDA is
+        # missing; a GPU run that silently becomes a CPU run is refused.
+        import torch
+
+        if not torch.cuda.is_available():
+            print("gpu requested but CUDA is not available", file=sys.stderr)
+            return 3
+
     # Import here so a missing/broken cellpose surfaces as a clean stderr message
     # the parent can relay, not an import-time crash before argv is parsed.
     from cellpose.models import CellposeModel
 
-    model = CellposeModel(gpu=bool(m.get("gpu", True)))   # 4.x default == cpsam
-    print(f"cpsam loaded (gpu={bool(m.get('gpu', True))})", flush=True)
+    model_kwargs = {"pretrained_model": m["model"]} if m.get("model") else {}
+    model = CellposeModel(gpu=gpu, **model_kwargs)   # 4.x default == cpsam
+    print(f"cpsam loaded (gpu={gpu}, model={m.get('model') or 'default'})", flush=True)
 
     eval_kwargs = dict(
-        diameter=float(m["diameter"]),
         cellprob_threshold=float(m["cellprob_threshold"]),
         flow_threshold=float(m["flow_threshold"]),
         normalize=True,
     )
+    if m.get("diameter") is not None:
+        eval_kwargs["diameter"] = float(m["diameter"])
     ch_axis = m.get("channel_axis", None)
     if ch_axis is not None:
         eval_kwargs["channel_axis"] = int(ch_axis)

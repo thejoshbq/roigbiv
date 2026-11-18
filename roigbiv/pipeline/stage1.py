@@ -22,14 +22,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
 from roigbiv.pipeline.device import cuda_compute_capable
-from roigbiv.pipeline.types import PipelineConfig
+from roigbiv.pipeline.types import STAGE1_BACKENDS, PipelineConfig
 
 
 _BASE_DIR: Path = Path(__file__).resolve().parents[2]
@@ -250,7 +250,7 @@ def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
     """Locate the cp-sam (cellpose 4.x) env interpreter.
 
     Order: cfg.cpsam_sidecar_python → $ROIGBIV_CPSAM_PYTHON → sibling `cp-sam`
-    conda env of the running interpreter. Raises if none exists.
+    then `roisuite` conda env of the running interpreter. Raises if none exists.
     """
     candidates: list[str] = []
     spec = getattr(cfg, "cpsam_sidecar_python", "") or ""
@@ -260,13 +260,15 @@ def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
     if env:
         candidates.append(env)
     # sys.prefix == <conda>/envs/roigbiv → sibling env <conda>/envs/cp-sam
-    candidates.append(str(Path(sys.prefix).parent / "cp-sam" / "bin" / "python"))
+    for sibling in ("cp-sam", "roisuite"):
+        candidates.append(str(Path(sys.prefix).parent / sibling / "bin" / "python"))
     for c in candidates:
         if c and Path(c).exists():
             return c
     raise FileNotFoundError(
         "cpsam sidecar interpreter not found. Set cfg.cpsam_sidecar_python or "
-        f"$ROIGBIV_CPSAM_PYTHON. Tried: {', '.join(candidates)}"
+        "$ROIGBIV_CPSAM_PYTHON to a Cellpose 4 env, or run Cellpose 3 alone with "
+        f"--stage1-backend cellpose3. Tried: {', '.join(candidates)}"
     )
 
 
@@ -276,6 +278,38 @@ def _run_cpsam_sidecar(
     """Run Cellpose-SAM out-of-process in the cp-sam env; return
     ``(label_image uint16, cellprob_map float32)``. The denoised/in-process
     cellpose path is unaffected."""
+    return _sidecar(x, {
+        "diameter": float(diameter),
+        "cellprob_threshold": float(cfg.cellprob_threshold),
+        "flow_threshold": float(cfg.flow_threshold),
+        "gpu": bool(gpu),
+        "channel_axis": -1 if x.ndim == 3 else None,
+    }, cfg)
+
+
+def _run_cpsam_image(
+    image: np.ndarray, cfg: PipelineConfig, gpu: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cellpose-SAM on one 2-D image with the union backend's own settings.
+
+    No diameter: Cellpose-SAM sizes cells itself, which is the reason it is
+    in the union at all.
+    """
+    return _sidecar(np.asarray(image, np.float32), {
+        "model": cfg.cpsam_model,
+        "diameter": None,
+        "cellprob_threshold": float(cfg.cpsam_cellprob_threshold),
+        "flow_threshold": float(cfg.cpsam_flow_threshold),
+        "gpu": bool(gpu),
+        "channel_axis": None,
+    }, cfg)
+
+
+def _sidecar(
+    x: np.ndarray, fields: dict, cfg: PipelineConfig
+) -> tuple[np.ndarray, np.ndarray]:
+    """Write ``x`` and a manifest of ``fields``, run ``scripts/cpsam_sidecar.py``
+    under the cp-sam interpreter, and read back labels and cellprob."""
     py = _resolve_cpsam_python(cfg)
     runner = _BASE_DIR / "scripts" / "cpsam_sidecar.py"
     if not runner.exists():
@@ -292,11 +326,7 @@ def _run_cpsam_sidecar(
             "input": str(in_p),
             "labels_out": str(lab_p),
             "cellprob_out": str(cp_p),
-            "diameter": float(diameter),
-            "cellprob_threshold": float(cfg.cellprob_threshold),
-            "flow_threshold": float(cfg.flow_threshold),
-            "gpu": bool(gpu),
-            "channel_axis": -1 if x.ndim == 3 else None,
+            **fields,
         }))
         print(f"  cpsam sidecar: {py} {runner}", flush=True)
         proc = subprocess.run(
@@ -356,6 +386,74 @@ def run_cellpose_detection(
 
     result = run_cellpose_flows(mean_S, vcorr_S, cfg, max_S=max_S)
     return _split_labels(result.label_image, result.cellprob)
+
+
+UNION_BACKEND = STAGE1_BACKENDS[2]   # "cellpose3_cpsam_union"
+
+
+@dataclass
+class Stage1Candidates:
+    """Stage 1 proposals before Gate 1.
+
+    ``detectors`` names the detector of each mask (``"cellpose3"`` or the
+    Cellpose-SAM model name) under the union backend, and is ``None`` for the
+    single-detector backends. ``counts`` holds per-detector proposal counts
+    for the Stage 1 report (``<model>_kept`` = Cellpose-SAM masks left after
+    duplicates are dropped).
+    """
+
+    masks: list
+    probs: list
+    label_image: np.ndarray
+    cellprob_map: np.ndarray
+    detectors: Optional[list] = None
+    counts: Optional[dict] = None
+
+
+def run_stage1_candidates(
+    mean_S: np.ndarray,
+    vcorr_S: np.ndarray,
+    cfg: PipelineConfig,
+    *,
+    max_S: Optional[np.ndarray] = None,
+    cpsam_image: Optional[np.ndarray] = None,
+) -> Stage1Candidates:
+    """Stage 1 proposals for ``cfg.stage1_backend``.
+
+    The single-detector backends return exactly what
+    :func:`run_cellpose_detection` returns. The union backend runs Cellpose 3
+    unchanged, then Cellpose-SAM on ``cpsam_image``, and appends the
+    Cellpose-SAM masks that duplicate no Cellpose 3 mask. ``label_image`` and
+    ``cellprob_map`` stay Cellpose 3's own: the appended masks may overlap
+    them and live only in ``masks``.
+    """
+    if getattr(cfg, "stage1_backend", "cellpose3") != UNION_BACKEND:
+        masks, probs, lab, cp = run_cellpose_detection(mean_S, vcorr_S, cfg, max_S=max_S)
+        return Stage1Candidates(masks, probs, lab, cp)
+    if cpsam_image is None:
+        raise ValueError(f"stage1_backend={UNION_BACKEND!r} needs cpsam_image")
+
+    from roigbiv.pipeline.cpsam_union import keep_secondary
+
+    flows = run_cellpose_flows(mean_S, vcorr_S, replace(cfg, stage1_backend="cellpose3"), max_S=max_S)
+    masks, probs, lab, cp = _split_labels(flows.label_image, flows.cellprob)
+    t0 = time.time()
+    cp_lab, cp_prob = _run_cpsam_image(cpsam_image, cfg, _resolve_gpu(cfg))
+    print(f"  cpsam inference in {time.time()-t0:.2f}s", flush=True)
+    sam_masks, sam_probs, _, _ = _split_labels(cp_lab, cp_prob)
+    keep = keep_secondary(masks, sam_masks, radius=cfg.roi_stamp_radius, iou_min=cfg.cpsam_union_iou)
+    name = cfg.cpsam_model
+    counts = {"cellpose3": len(masks), name: len(sam_masks), f"{name}_kept": len(keep)}
+    print(f"  Stage-1 union: cellpose3 {len(masks)}, {name} {len(sam_masks)} "
+          f"({len(keep)} not duplicates)", flush=True)
+    return Stage1Candidates(
+        masks=masks + [sam_masks[i] for i in keep],
+        probs=probs + [sam_probs[i] for i in keep],
+        label_image=lab,
+        cellprob_map=cp,
+        detectors=["cellpose3"] * len(masks) + [name] * len(keep),
+        counts=counts,
+    )
 
 
 def _resolve_gpu(cfg: PipelineConfig) -> bool:
@@ -429,10 +527,12 @@ def run_cellpose_flows(
             "stage1_backend='cpsam_sidecar' returns no flow field; "
             "seeded boundaries require the 'cellpose3' backend"
         )
-    if backend != "cellpose3":
+    # The union backend's Cellpose 3 half is this inference unchanged, so a
+    # caller that needs flows (centroid discovery) gets Cellpose 3's.
+    if backend not in ("cellpose3", UNION_BACKEND):
         raise ValueError(
             f"unknown stage1_backend {backend!r} "
-            "(expected 'cellpose3' or 'cpsam_sidecar')"
+            f"(expected 'cellpose3', 'cpsam_sidecar' or {UNION_BACKEND!r})"
         )
 
     model_path = _resolve_model_path(cfg.cellpose_model)

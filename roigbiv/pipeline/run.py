@@ -45,6 +45,7 @@ from roigbiv.pipeline.types import (
     DEFAULT_PIPELINE_MODE,
     FOVData,
     PIPELINE_MODES,
+    STAGE1_BACKENDS,
     PipelineConfig,
 )
 
@@ -231,6 +232,40 @@ def _read_subtraction_pass_count(
                if isinstance(v, dict) and v.get("pass"))
 
 
+def _stage1_cpsam_image(fov: FOVData, cfg: PipelineConfig, output_dir: Path):
+    """The image Cellpose-SAM sees under the union backend, else ``None``.
+
+    max7: the per-pixel maximum over ``cfg.cpsam_frames_per_bin``-frame means
+    of the registered movie, one streamed pass over ``data.bin``. Written to
+    ``summary/max7_M.tif`` so a run's Cellpose-SAM input can be inspected.
+    """
+    from roigbiv.pipeline.stage1 import UNION_BACKEND
+    if getattr(cfg, "stage1_backend", "cellpose3") != UNION_BACKEND:
+        return None
+    from roigbiv.pipeline.cpsam_union import binned_max_movie
+    t0 = time.time()
+    img = binned_max_movie(Path(fov.data_bin_path), fov.shape,
+                           frames_per_bin=cfg.cpsam_frames_per_bin)
+    (output_dir / "summary").mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(output_dir / "summary" / "max7_M.tif"), img)
+    print(fmt.sub_phase(
+        f"Cellpose-SAM image: max over {cfg.cpsam_frames_per_bin}-frame means "
+        f"({time.time() - t0:.1f}s)"), flush=True)
+    return img
+
+
+def _stage1_detector_summary(s1, rois) -> dict:
+    """Per-detector Stage 1 counts: proposed, kept after the duplicate check,
+    and each Gate 1 outcome."""
+    out = {name: {"proposed": n} for name, n in s1.counts.items() if not name.endswith("_kept")}
+    for name in out:
+        out[name]["kept"] = s1.counts.get(f"{name}_kept", out[name]["proposed"])
+        for o in ("accept", "flag", "reject"):
+            out[name][o] = sum(1 for r in rois if r.features.get("stage1_detector") == name
+                               and r.gate_outcome == o)
+    return out
+
+
 def _default_output_dir(tif_path: Path) -> Path:
     """Default: inference/pipeline/{stem}/ relative to the current working dir.
 
@@ -387,7 +422,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
     Returns a fully populated FOVData (through Stage 4).
     """
     from roigbiv.pipeline.foundation import run_foundation
-    from roigbiv.pipeline.stage1 import run_cellpose_detection
+    from roigbiv.pipeline.stage1 import run_stage1_candidates
     from roigbiv.pipeline.gate1 import evaluate_gate1
     from roigbiv.pipeline.subtraction import run_source_subtraction, compute_std_map
     from roigbiv.pipeline.stage2 import run_stage2
@@ -610,10 +645,13 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # Use mean_M (raw movie mean) as the morphological channel for Cellpose.
         # mean_S ≈ 0 under SVD-based L+S (top components absorb per-pixel mean),
         # so mean_M preserves the morphological contrast Cellpose's training expects.
+        cpsam_image = _stage1_cpsam_image(fov, cfg, output_dir)
         with _gpu_section(gpu_lock):
-            candidates, probs, label_image, cellprob_map = run_cellpose_detection(
+            s1 = run_stage1_candidates(
                 fov.mean_M, fov.vcorr_S, cfg, max_S=fov.max_S,
+                cpsam_image=cpsam_image,
             )
+        candidates, probs, cellprob_map = s1.masks, s1.probs, s1.cellprob_map
         stage_timings["stage1_detect_s"] = time.time() - t_start
         n_detected = len(candidates)
         print(fmt.sub_phase(
@@ -631,7 +669,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # unstable).
         t_start = time.time()
         rois = evaluate_gate1(candidates, probs, fov.mean_M, fov.vcorr_S,
-                              fov.dog_map, cfg, starting_label_id=1)
+                              fov.dog_map, cfg, starting_label_id=1,
+                              detectors=s1.detectors)
         stage_timings["gate1_s"] = time.time() - t_start
 
         # Canonicalize: replace each accept/flag ROI's raw Cellpose boundary
@@ -672,6 +711,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
             "rejected": n_reject,
             "rois": [r.to_serializable() for r in rois],
         }
+        if s1.detectors is not None:
+            stage1_report["detectors"] = _stage1_detector_summary(s1, rois)
         (output_dir / "stage1" / "stage1_report.json").write_text(
             json.dumps(stage1_report, indent=2)
         )
@@ -1461,7 +1502,10 @@ def _apply_auto_scale(cfg: PipelineConfig, fov: FOVData) -> None:
         scale_plausible,
     )
 
-    scale = measure_soma_scale(fov.mean_M, getattr(fov, "dog_map", None))
+    # The foundation's ``dog_map`` is the nuclear-shadow map (G(6) - G(2), peaks
+    # on dark nuclei); soma sizing needs bright-soma peaks, so let
+    # measure_soma_scale compute its own G(3) - G(15).
+    scale = measure_soma_scale(fov.mean_M)
     pinned = set(cfg.explicit_fields or ())
 
     if scale.ok and scale_plausible(scale, cfg.profile):
@@ -1882,6 +1926,18 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--mc-granularity", dest="mc_granularity", default=None,
                         help=("legacy: SIMA HMM2D granularity, 'row' (non-rigid, "
                               "default) or 'frame' (rigid)."))
+    parser.add_argument("--stage1-backend", dest="stage1_backend",
+                        choices=STAGE1_BACKENDS, default=None,
+                        help=("Stage 1 detector. 'cellpose3_cpsam_union' "
+                              "(default): the deployed Cellpose 3 model plus "
+                              "Cellpose-SAM (cpsam_v2) on the movie's max7 "
+                              "image, duplicates dropped. 'cellpose3': the "
+                              "Cellpose 3 model alone (the default before "
+                              "2026-11-18). 'cpsam_sidecar': Cellpose-SAM "
+                              "instead of Cellpose 3. Both Cellpose-SAM backends "
+                              "need a Cellpose 4 interpreter: "
+                              "$ROIGBIV_CPSAM_PYTHON, cfg.cpsam_sidecar_python, "
+                              "or a sibling 'cp-sam' or 'roisuite' conda env."))
     parser.add_argument("--pipeline-mode", dest="pipeline_mode",
                         choices=PIPELINE_MODES, default=DEFAULT_PIPELINE_MODE,
                         help=("Pipeline execution mode (ADR-0001 migration switch). "
@@ -2248,6 +2304,7 @@ def _run_single(
         "foundation_only": args.foundation_only,
         "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
+        **({"stage1_backend": args.stage1_backend} if args.stage1_backend else {}),
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.
@@ -2560,6 +2617,7 @@ def _run_workspace(
         "foundation_only": args.foundation_only,
         "run_centroids": args.run_centroids,
         "pipeline_mode": args.pipeline_mode,
+        **({"stage1_backend": args.stage1_backend} if args.stage1_backend else {}),
         # Scale derivation pairs with auto-resolution: an explicit --profile keeps
         # its tuned gates unless the user opted in. optics_prior is non-None only
         # when the profile was auto-resolved. --no-auto-scale disables it.

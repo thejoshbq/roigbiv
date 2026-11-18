@@ -17,7 +17,7 @@ from roigbiv.pipeline.types import PipelineConfig
 
 
 def test_default_backend_is_cellpose3():
-    assert PipelineConfig().stage1_backend == "cellpose3"
+    assert PipelineConfig().stage1_backend == "cellpose3_cpsam_union"
 
 
 def test_split_labels_self_consistent():

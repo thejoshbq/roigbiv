@@ -6,6 +6,26 @@ All notable changes to roigbiv are documented here.
 
 ### Changed
 
+- **Stage 1 runs Cellpose-SAM next to Cellpose 3 by default.** `stage1_backend` defaults
+  to `cellpose3_cpsam_union`: the deployed Cellpose 3 model runs unchanged, then
+  Cellpose-SAM (`cpsam_v2`, Cellpose 4) runs out of process on the movie's max7 image (the
+  per-pixel maximum over 7-frame means, saved as `summary/max7_M.tif`) with no diameter,
+  cellprob 0 and flow 0.4. A Cellpose-SAM mask within `roi_stamp_radius` of a Cellpose 3
+  centroid, or at IoU 0.3 or more with a Cellpose 3 mask, is dropped; the rest go through
+  Gate 1 with the others. Each ROI records its detector in `features["stage1_detector"]`,
+  and `stage1/stage1_report.json` gets per-detector counts. Cellpose-SAM has no diameter
+  setting, so it finds the large somata the 12 px Cellpose 3 defaults miss. On the seven
+  benchmark movies, full-pipeline recall went from 0.198 to 0.357 (v1, 485 annotated
+  cells) and from 0.550 to 0.817 (v0, 60 cells); measured precision went from 0.549 to
+  0.634 on v1 and from 0.786 to 0.598 on v0.
+
+  Needs a Cellpose 4 interpreter: `$ROIGBIV_CPSAM_PYTHON`, `cpsam_sidecar_python`, or a
+  sibling `cp-sam` or `roisuite` conda env; without one, Stage 1 stops and names
+  `--stage1-backend cellpose3`, which restores the old behavior. A GPU run without CUDA
+  now exits instead of running Cellpose-SAM on the CPU. Centroid discovery (the UI's
+  Centroids page) still runs Cellpose 3 only, because seeded boundaries need its flow
+  field.
+
 - **One UI page per operation, in the order the operations happen.** The Dash app was
   three pages, one of which (`pages/process.py`, 1412 lines) did four unrelated jobs —
   workspace scanning, motion-correction parameters, a live registration view, and
