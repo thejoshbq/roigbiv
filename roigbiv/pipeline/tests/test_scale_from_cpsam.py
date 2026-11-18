@@ -248,7 +248,7 @@ def test_stage1_runs_cpsam_itself_when_no_masks_are_passed(fakes):
 def test_scale_settings_default_to_cpsam_first():
     cfg = PipelineConfig()
     assert cfg.scale_source == "cpsam"
-    assert cfg.cpsam_scale_k == 1.0
+    assert cfg.cpsam_scale_k == 1.05             # tuned on the dev split (size calibration, 2026-11-18)
 
 
 @pytest.mark.parametrize("field,value", [("scale_source", "dog"), ("cpsam_scale_k", 1.2)])
@@ -322,7 +322,7 @@ def test_a_rejected_cpsam_estimate_is_recorded_next_to_the_winner():
     _apply_auto_scale(cfg, SimpleNamespace(mean_M=_planted(16)), cpsam_labels=_squares(SIDES[:4]))
     assert cfg.auto_adapt["scale_source"] == "dog"
     assert cfg.auto_adapt["cpsam_rejected"] == {"n_masks": 4, "diameter_med": None}
-    cfg = _auto_cfg()
+    cfg = _auto_cfg(cpsam_scale_k=1.0)
     _apply_auto_scale(cfg, SimpleNamespace(mean_M=_planted(16)), cpsam_labels=_squares((50, 52, 54, 56, 58), size=400))
     assert cfg.auto_adapt["cpsam_rejected"] == {"n_masks": 5, "diameter_med": round(_d(54 ** 2), 1)}
     cfg = _auto_cfg()

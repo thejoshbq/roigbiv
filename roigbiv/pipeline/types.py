@@ -612,9 +612,11 @@ class PipelineConfig:
     # interpreter.
     cpsam_sidecar_python: str = ""
     # Union backend only. Defaults are the settings benchmarked on v0/v1
-    # (ROI Suite's discovery recipe): cellprob 0, flow 0.4, 7-frame bins.
+    # (ROI Suite's discovery recipe: flow 0.4, 7-frame bins), with cellprob
+    # tuned to 0.5 on the dev split together with cpsam_scale_k (size
+    # calibration, 2026-11-18; was 0).
     cpsam_model: str = "cpsam_v2"
-    cpsam_cellprob_threshold: float = 0.0
+    cpsam_cellprob_threshold: float = 0.5
     cpsam_flow_threshold: float = 0.4
     cpsam_union_iou: float = 0.3            # IoU at which a cpsam mask is a duplicate
     cpsam_frames_per_bin: int = 7           # max7 = max over 7-frame bin means
@@ -623,8 +625,10 @@ class PipelineConfig:
     # by cpsam_scale_k, the Cellpose-SAM / hand-marked size ratio), falling
     # back to the DoG estimate, then the profile defaults; Stage 1 reuses the
     # same masks. "dog": the DoG estimate only (optics.measure_soma_scale).
+    # cpsam_scale_k 1.05 is the dev-split F1 optimum at cellprob 0.5; F1 is
+    # flat for k in 1.00-1.10 (the size-only fit is 1.15).
     scale_source: str = "cpsam"
-    cpsam_scale_k: float = 1.0
+    cpsam_scale_k: float = 1.05
 
     # ── Foundation denoising (DeepCAD-RT out-of-process sidecar) ───────────
     # Out-of-process DeepCAD-RT denoising (see roigbiv/pipeline/deepcad.py).
