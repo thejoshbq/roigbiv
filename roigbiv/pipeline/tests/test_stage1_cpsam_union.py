@@ -299,7 +299,7 @@ def test_cpsam_settings_default_to_the_benchmarked_values():
     cfg = PipelineConfig()
     assert cfg.stage1_backend == UNION
     assert (cfg.cpsam_model, cfg.cpsam_cellprob_threshold, cfg.cpsam_flow_threshold,
-            cfg.cpsam_union_iou, cfg.cpsam_frames_per_bin) == ("cpsam_v2", 0.0, 0.4, 0.3, 7)
+            cfg.cpsam_union_iou, cfg.cpsam_frames_per_bin) == ("cpsam_v2", 0.5, 0.4, 0.3, 7)
 
 
 @pytest.mark.parametrize("field,value", [

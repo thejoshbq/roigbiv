@@ -6,6 +6,27 @@ All notable changes to roigbiv are documented here.
 
 ### Changed
 
+- **Auto-scale sizes somata from Cellpose-SAM masks by default.** `scale_source` defaults to
+  `cpsam`. Under the union backend, Cellpose-SAM now runs before auto-scale. The soma diameter
+  is the median Cellpose-SAM mask diameter divided by `cpsam_scale_k` (1.05), with the DoG
+  estimate as the fallback and then the profile defaults. Stage 1 reuses the same masks.
+  `cpsam_cellprob_threshold` moves from 0 to 0.5, tuned on the dev split together with
+  `cpsam_scale_k`. The old DoG estimate ran 1.8 to 2.5 times the annotated soma size, and on
+  most v1 FOVs it fell back to 12 px.
+
+  On all 102 benchmark FOVs, the diameter used now lands within 20% of the annotated size on
+  84% of v1 FOVs and 44% of v0 FOVs, up from 44% and 22%. Image-only F1 on the test split went
+  from 0.513 to 0.533 on v1 and from 0.493 to 0.500 on v0 (0.551 to 0.572 on the
+  registration-screened bench v1.1).
+
+  The full pipeline on the five benchmark movies with registered annotations does not improve:
+  recall went from 0.763 to 0.733 and F1 from 0.750 to 0.739 (232 cells). At the correct size,
+  Cellpose 3 proposes more cells and the union keeps fewer Cellpose-SAM masks. v0 sizes still
+  run large on two movies (18 px against 9.7 annotated, 28 against 18.7).
+
+  `--scale-source dog` restores the DoG estimate. The CLI has no flag for the Cellpose-SAM
+  threshold: pass `PipelineConfig(cpsam_cellprob_threshold=0.0)` from Python to restore it.
+
 - **Stage 1 runs Cellpose-SAM next to Cellpose 3 by default.** `stage1_backend` defaults
   to `cellpose3_cpsam_union`: the deployed Cellpose 3 model runs unchanged, then
   Cellpose-SAM (`cpsam_v2`, Cellpose 4) runs out of process on the movie's max7 image (the

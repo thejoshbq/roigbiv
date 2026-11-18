@@ -173,6 +173,9 @@ def _confirm_resume_fields() -> frozenset:
         "max_eccentricity", "mc_strip_height", "diameter_auto",
         "auto_scale", "assume_optics", "auto_adapt", "explicit_fields",
         "resume",
+        # Auto-scale source settings: they only change the Stage 1 sizing, so
+        # a user answering an optics pause may switch them (e.g. to "dog").
+        "scale_source", "cpsam_scale_k",
     }
 
 

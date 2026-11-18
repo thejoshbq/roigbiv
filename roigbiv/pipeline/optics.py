@@ -32,13 +32,15 @@ crash a run.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 __all__ = [
     "OpticsPrior",
     "classify_optics_prior",
     "SomaScale",
     "measure_soma_scale",
+    "measure_scale",
+    "scale_from_labels",
     "derive_scale_params",
     "scale_plausible",
     "auto_scale_active",
@@ -220,6 +222,9 @@ class SomaScale:
     area_p95: float = 0.0
     n_somata: int = 0
     ok: bool = False
+    # Which estimate produced it: "dog" (measure_soma_scale), "cpsam"
+    # (Cellpose-SAM masks), or "profile" (nothing sized the FOV; keep defaults).
+    source: str = "dog"
 
 
 def measure_soma_scale(mean_M, dog_map=None, *, n_peaks: int = 40,
@@ -372,6 +377,58 @@ def derive_scale_params(scale: SomaScale) -> dict:
         "neuropil_inner_buffer":           ann_inner,
         "neuropil_outer_radius":           ann_outer,
     }
+
+
+def scale_from_labels(labels, *, k: float = 1.0) -> SomaScale:
+    """Soma scale from a label image (Cellpose-SAM masks), sizes divided by ``k``.
+
+    ``k`` is the ratio of Cellpose-SAM mask size to hand-marked soma size,
+    fitted on the benchmarks' dev split: diameters are divided by ``k`` and
+    areas by ``k**2``. ``ok`` needs ``MIN_SCALE_SUPPORT`` masks.
+    """
+    import numpy as np
+
+    if not k > 0:
+        # k <= 0 gives infinite or negative areas, which scale_plausible
+        # cannot catch (inf / inf is nan), so refuse it here.
+        raise ValueError(f"cpsam_scale_k must be positive, got {k!r}")
+    lab = np.asarray(labels)
+    _, areas = np.unique(lab[lab > 0], return_counts=True)
+    n = len(areas)
+    if n < MIN_SCALE_SUPPORT:
+        return SomaScale(n_somata=n, ok=False, source="cpsam")
+    a = areas.astype(float) / (k * k)
+    d = 2.0 * np.sqrt(a / np.pi)
+    return SomaScale(
+        diameter_med=float(np.median(d)),
+        diameter_p5=float(np.percentile(d, 5)),
+        diameter_p95=float(np.percentile(d, 95)),
+        area_med=float(np.median(a)),
+        area_p5=float(np.percentile(a, 5)),
+        area_p95=float(np.percentile(a, 95)),
+        n_somata=n,
+        ok=True,
+        source="cpsam",
+    )
+
+
+def measure_scale(image, *, cpsam_labels=None, cpsam_k: float = 1.0,
+                  profile_name: "str | None" = None) -> SomaScale:
+    """Soma scale of one FOV, from the best source that passes ``scale_plausible``.
+
+    Order: Cellpose-SAM masks (``cpsam_labels``, sizes divided by ``cpsam_k``),
+    then the DoG estimate on ``image``, then nothing (``ok=False``,
+    ``source="profile"``: the caller keeps the profile defaults). Needs no
+    pipeline state, so it can be called on any image and label set.
+    """
+    if cpsam_labels is not None:
+        s = scale_from_labels(cpsam_labels, k=cpsam_k)
+        if scale_plausible(s, profile_name):
+            return s
+    s = measure_soma_scale(image)
+    if scale_plausible(s, profile_name):
+        return s
+    return replace(s, ok=False, source="profile")
 
 
 def scale_plausible(scale: SomaScale, profile_name: "str | None" = None) -> bool:
