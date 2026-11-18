@@ -25,38 +25,47 @@ from pathlib import Path
 import numpy as np
 from skimage.measure import regionprops
 
-from roigbiv.pipeline.types import ROI, PipelineConfig
+from roigbiv.pipeline.types import GATE3_WAVEFORM_SOURCES, ROI, PipelineConfig
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Waveform utilities
 # ─────────────────────────────────────────────────────────────────────────
 
+def gate3_window_frames(cfg: PipelineConfig) -> int:
+    """Event waveform window length in frames: ``tau_multiple * tau * fs``, at least 5."""
+    return max(5, int(cfg.gate3_waveform_window_tau_multiple * cfg.tau * cfg.fs))
+
+
+def event_window_bounds(event_frame: int, window_frames: int, n_frames: int) -> tuple[int, int]:
+    """``[lo, hi)`` of the asymmetric window ``[t - window/4, t + 3*window/4]``, clamped to the trace."""
+    pre = window_frames // 4
+    lo = max(0, event_frame - pre)
+    hi = min(n_frames, event_frame + window_frames - pre)
+    return lo, hi
+
+
+def baseline_subtract(segment: np.ndarray) -> np.ndarray:
+    """Subtract the mean of the first 10 % of the window (at least one sample)."""
+    w = np.asarray(segment, dtype=np.float32)
+    if w.size == 0:
+        return w
+    return w - w[: max(1, int(0.1 * len(w)))].mean()
+
+
 def _extract_event_waveform(
     trace: np.ndarray,
     event_frame: int,
     window_frames: int,
 ) -> np.ndarray:
-    """Extract a waveform centered around an event.
+    """Extract a baseline-subtracted waveform around an event.
 
-    Asymmetric window: [t - window/4, t + 3*window/4]. Baseline-subtract
-    using the mean of the first 10 % of the window.
-    Returns a zero-length array if the window falls out-of-bounds.
+    Returns a zero-length array if the window falls outside the trace.
     """
-    pre = window_frames // 4
-    post = window_frames - pre
-    lo = event_frame - pre
-    hi = event_frame + post
-    if lo < 0 or hi > len(trace):
-        # Clamp the window; still extract what we can
-        lo = max(0, lo)
-        hi = min(len(trace), hi)
+    lo, hi = event_window_bounds(event_frame, window_frames, len(trace))
     if hi - lo <= 0:
         return np.zeros(0, dtype=np.float32)
-    w = trace[lo:hi].astype(np.float32)
-    baseline_n = max(1, int(0.1 * len(w)))
-    w = w - w[:baseline_n].mean()
-    return w
+    return baseline_subtract(trace[lo:hi])
 
 
 def _waveform_r2(waveform: np.ndarray, templates: list[np.ndarray]) -> tuple[float, int]:
@@ -112,42 +121,50 @@ def _waveform_r2(waveform: np.ndarray, templates: list[np.ndarray]) -> tuple[flo
     return float(best_r2), int(best_k)
 
 
+def _crossing(w: np.ndarray, i: int, level: float) -> float:
+    """Fractional index where ``w`` crosses ``level`` between samples ``i`` and ``i + 1``."""
+    a, b = float(w[i]), float(w[i + 1])
+    return i + (level - a) / (b - a) if b != a else float(i)
+
+
 def _rise_decay_ratio(waveform: np.ndarray) -> float:
     """Rise time (10→90% of peak) divided by decay time (peak→37% of peak).
 
-    Uses linear interpolation to find exact crossing points. Returns +inf if
-    the crossings can't be resolved.
+    The rise starts at the event onset: the last sample below 10% of the peak
+    before the peak, so baseline noise earlier in the window does not move
+    it. Crossings are linearly interpolated between samples, so a rise inside
+    one frame (a fast indicator at a low frame rate) is a small finite value.
+    Returns +inf if there is no sub-10% sample before the peak or no fall to
+    37% after it.
     """
     if len(waveform) < 5:
         return np.inf
-    peak_idx = int(np.argmax(waveform))
-    peak_val = float(waveform[peak_idx])
-    if peak_val <= 0 or peak_idx <= 0 or peak_idx >= len(waveform) - 1:
+    w = np.asarray(waveform, dtype=np.float64)
+    peak_idx = int(np.argmax(w))
+    peak_val = float(w[peak_idx])
+    if peak_val <= 0 or peak_idx <= 0 or peak_idx >= len(w) - 1:
         return np.inf
 
     thr10 = 0.10 * peak_val
     thr90 = 0.90 * peak_val
     thr37 = 0.37 * peak_val
 
-    # Rise: find first crossings of 10% and 90% before the peak
-    pre = waveform[: peak_idx + 1]
-    try:
-        i10 = int(np.argmax(pre >= thr10))
-        i90 = int(np.argmax(pre >= thr90))
-    except ValueError:
+    below10 = np.where(w[:peak_idx] < thr10)[0]
+    if below10.size == 0:
         return np.inf
-    if i90 <= i10:
-        return np.inf
-    rise = float(i90 - i10)
+    onset = int(below10[-1])
+    t10 = _crossing(w, onset, thr10)
+    i90 = onset + 1 + int(np.argmax(w[onset + 1 : peak_idx + 1] >= thr90))
+    t90 = _crossing(w, i90 - 1, thr90) if w[i90 - 1] < thr90 else float(i90)
+    rise = t90 - t10
     if rise <= 0:
         return np.inf
 
-    # Decay: find first crossing of 37% after the peak
-    post = waveform[peak_idx:]
-    below_37 = np.where(post <= thr37)[0]
-    if below_37.size == 0:
+    below37 = np.where(w[peak_idx:] <= thr37)[0]
+    if below37.size == 0:
         return np.inf
-    decay = float(below_37[0])
+    i37 = peak_idx + int(below37[0])
+    decay = _crossing(w, i37 - 1, thr37) - peak_idx
     if decay <= 0:
         return np.inf
     return rise / decay
@@ -191,10 +208,11 @@ def evaluate_gate3(
     Mutates candidate ROIs in place (gate_outcome, confidence, features,
     gate_reasons, solidity, eccentricity). Returns the same list.
     """
+    if cfg.gate3_waveform_source not in GATE3_WAVEFORM_SOURCES:
+        raise ValueError(f"gate3_waveform_source must be one of {GATE3_WAVEFORM_SOURCES}, "
+                         f"got {cfg.gate3_waveform_source!r}")
     templates = [wf for _, wf in template_bank]
-    window_frames = int(cfg.gate3_waveform_window_tau_multiple * cfg.tau * cfg.fs)
-    if window_frames < 5:
-        window_frames = 5
+    window_frames = gate3_window_frames(cfg)
 
     # Pre-extract prior traces + centroids for anti-correlation check
     prior_centroids = []
@@ -231,11 +249,17 @@ def evaluate_gate3(
         best_event_waveform: np.ndarray = np.zeros(0, dtype=np.float32)
         best_r2 = 0.0
         best_k = 0
-        if roi.trace is not None:
-            for ev in event_list:
-                wf = _extract_event_waveform(roi.trace, int(ev["frame"]), window_frames)
-                if wf.size == 0:
-                    continue
+        if cfg.gate3_waveform_source == "event_patch" and roi.event_waveforms is not None:
+            waveforms = list(roi.event_waveforms)
+            roi.features["gate3_waveform_source"] = "event_patch"
+        elif roi.trace is not None:
+            waveforms = [_extract_event_waveform(roi.trace, int(ev["frame"]), window_frames)
+                         for ev in event_list]
+            roi.features["gate3_waveform_source"] = "roi_trace"
+        else:
+            waveforms = []
+        for wf in waveforms:
+            if wf.size:
                 r2, k = _waveform_r2(wf, templates)
                 per_event_r2.append(r2)
                 if r2 > best_r2:

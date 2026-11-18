@@ -6,6 +6,14 @@ All notable changes to roigbiv are documented here.
 
 ### Changed
 
+- **Gate 3 measures rise from the event onset.** The 10% crossing is now taken after the last
+  sub-10% sample before the peak, not from baseline noise earlier in the window, and crossings
+  are interpolated between frames. A rise inside one frame (GCaMP6s at 7.5 Hz) is a small
+  finite ratio and passes; before, the pipeline's own template failed the ≤ 0.5 rise/decay gate.
+- **Gate 3 judges each event on a 3×3 patch at the event's pixel.** `gate3_waveform_source`
+  defaults to `event_patch`. The candidate's pooled disk stays its footprint and trace, but
+  the disk also averages in neighbouring tissue, which blurred the transient the pixel
+  detector found. `gate3_waveform_source="roi_trace"` restores the disk-mean judgement.
 - **Auto-scale sizes somata from Cellpose-SAM masks by default.** `scale_source` defaults to
   `cpsam`. Under the union backend, Cellpose-SAM now runs before auto-scale. The soma diameter
   is the median Cellpose-SAM mask diameter divided by `cpsam_scale_k` (1.05), with the DoG

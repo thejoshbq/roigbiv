@@ -28,6 +28,7 @@ PIPELINE_MODES = ("cascade_legacy", "candidate_union", "candidate_union_with_res
 DEFAULT_PIPELINE_MODE = "cascade_legacy"
 STAGE1_BACKENDS = ("cellpose3", "cpsam_sidecar", "cellpose3_cpsam_union")
 SCALE_SOURCES = ("cpsam", "dog")
+GATE3_WAVEFORM_SOURCES = ("event_patch", "roi_trace")
 
 
 @dataclass
@@ -70,6 +71,10 @@ class ROI:
     trace: Optional[np.ndarray] = None              # (T,) raw fluorescence
     trace_corrected: Optional[np.ndarray] = None    # (T,) neuropil-corrected
     activity_type: Optional[str] = None             # "phasic"|"sparse"|"tonic"|"silent"|"ambiguous"
+    # Stage 3: one baseline-subtracted waveform per event Gate 3 checks (the
+    # entries of features["picked_events"], else features["events"]), cut from
+    # the 3x3 patch at the event's own pixel. Not serialized.
+    event_waveforms: Optional[list] = None
 
     # Per-gate feature bucket for anything not promoted to a field
     features: dict = field(default_factory=dict)
@@ -771,6 +776,10 @@ class PipelineConfig:
     gate3_anticorr_threshold: float = -0.5
     gate3_min_solidity: float = 0.5
     gate3_waveform_window_tau_multiple: float = 5.0  # window = 5 * tau * fs
+    # Trace Gate 3 cuts event waveforms from. "event_patch": the 3x3 mean at
+    # each event's own pixel, so neighbouring tissue inside the pooling disk
+    # does not blur the transient. "roi_trace": the candidate's disk-mean trace.
+    gate3_waveform_source: str = "event_patch"
 
     # ── Stage 4 (Tonic Neuron Search) — spec §11, §18.8 ───────────────────
     bandpass_windows: list = field(default_factory=lambda: [

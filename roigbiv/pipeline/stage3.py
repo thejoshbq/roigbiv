@@ -45,7 +45,9 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from scipy import sparse
 
+from roigbiv.pipeline.gate3 import baseline_subtract, event_window_bounds, gate3_window_frames
 from roigbiv.pipeline.stage2 import extract_traces_from_residual
 from roigbiv.pipeline.device import cuda_compute_capable
 from roigbiv.pipeline.roi_stamp import disk_mask as _disk_mask
@@ -273,6 +275,70 @@ def _count_temporally_independent(
     return len(picked), picked
 
 
+def _event_patch_waveforms(
+    residual_view,
+    events_per_candidate: list[list[dict]],
+    window_frames: int,
+    chunk: int = 500,
+) -> list[list[np.ndarray]]:
+    """Baseline-subtracted event waveforms from the 3x3 mean at each event's pixel.
+
+    One temporal pass over the residual: each chunk is reconstructed once and
+    only the patch pixels are read from it. Windows follow Gate 3's own bounds
+    (``event_window_bounds``), clamped at the trace ends.
+    """
+    T, H, W = residual_view.shape
+    centers: dict[tuple[int, int], int] = {}
+    for evs in events_per_candidate:
+        for ev in evs:
+            centers.setdefault((int(ev["y"]), int(ev["x"])), len(centers))
+    if not centers:
+        return [[] for _ in events_per_candidate]
+
+    pix: dict[int, int] = {}
+    rows, cols = [], []
+    for (y, x), c in centers.items():
+        ys = np.clip(np.arange(y - 1, y + 2), 0, H - 1)
+        xs = np.clip(np.arange(x - 1, x + 2), 0, W - 1)
+        flat = np.unique((ys[:, None] * W + xs[None, :]).ravel())
+        for f in flat.tolist():
+            rows.append(c)
+            cols.append(pix.setdefault(f, len(pix)))
+    flat_idx = np.fromiter(pix.keys(), dtype=np.int64, count=len(pix))
+    counts = np.bincount(np.asarray(rows), minlength=len(centers)).astype(np.float32)
+    avg = sparse.csr_matrix(
+        (1.0 / counts[np.asarray(rows)], (np.asarray(rows), np.asarray(cols))),
+        shape=(len(centers), len(pix)), dtype=np.float32,
+    )
+
+    jobs = []  # (candidate, slot, center, lo, hi)
+    out: list[list] = []
+    for ci, evs in enumerate(events_per_candidate):
+        out.append([None] * len(evs))
+        for k, ev in enumerate(evs):
+            lo, hi = event_window_bounds(int(ev["frame"]), window_frames, T)
+            jobs.append((ci, k, centers[(int(ev["y"]), int(ev["x"]))], lo, hi))
+    segs = [np.zeros(max(0, hi - lo), np.float32) for *_, lo, hi in jobs]
+    los = np.array([j[3] for j in jobs])
+    his = np.array([j[4] for j in jobs])
+
+    for t0 in range(0, T, chunk):
+        t1 = min(t0 + chunk, T)
+        live = np.nonzero((los < t1) & (his > t0))[0]
+        if live.size == 0:
+            continue
+        block = residual_view.read_chunk(t0, t1).reshape(t1 - t0, H * W)[:, flat_idx]
+        center_traces = np.asarray(avg @ block.T)  # (n_centers, t1 - t0)
+        for j in live.tolist():
+            _, _, c, lo, hi = jobs[j]
+            a, b = max(lo, t0), min(hi, t1)
+            segs[j][a - lo:b - lo] = center_traces[c, a - t0:b - t0]
+
+    for (ci, k, *_), seg in zip(jobs, segs):
+        out[ci][k] = baseline_subtract(seg)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────
@@ -493,11 +559,22 @@ def run_stage3(
     )
     print(f"  extracted {len(disk_masks)} candidate traces "
           f"in {time.time()-t0:.2f}s", flush=True)
+    event_waveforms = None
+    if cfg.gate3_waveform_source == "event_patch":
+        t0 = time.time()
+        event_waveforms = _event_patch_waveforms(
+            residual_view,
+            [c["picked_events"] or c["events"] for c in candidate_info],
+            gate3_window_frames(cfg),
+            chunk=cfg.reconstruct_chunk,
+        )
+        print(f"  extracted {sum(len(w) for w in event_waveforms)} event-pixel "
+              f"waveforms in {time.time()-t0:.2f}s", flush=True)
 
     # ── Package as ROI objects ────────────────────────────────────────────
     rois: list[ROI] = []
     next_label = starting_label_id
-    for info, mask, trace in zip(candidate_info, disk_masks, traces):
+    for i, (info, mask, trace) in enumerate(zip(candidate_info, disk_masks, traces)):
         area = int(mask.sum())
         if area == 0:
             continue
@@ -514,6 +591,7 @@ def run_stage3(
             soma_surround_contrast=0.0,
             event_count=info["event_count"],
             trace=trace,
+            event_waveforms=None if event_waveforms is None else event_waveforms[i],
             features={
                 "centroid_y": info["centroid_y"],
                 "centroid_x": info["centroid_x"],
