@@ -250,7 +250,7 @@ def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
     """Locate the cp-sam (cellpose 4.x) env interpreter.
 
     Order: cfg.cpsam_sidecar_python → $ROIGBIV_CPSAM_PYTHON → sibling `cp-sam`
-    conda env of the running interpreter. Raises if none exists.
+    then `roisuite` conda env of the running interpreter. Raises if none exists.
     """
     candidates: list[str] = []
     spec = getattr(cfg, "cpsam_sidecar_python", "") or ""
@@ -260,13 +260,15 @@ def _resolve_cpsam_python(cfg: PipelineConfig) -> str:
     if env:
         candidates.append(env)
     # sys.prefix == <conda>/envs/roigbiv → sibling env <conda>/envs/cp-sam
-    candidates.append(str(Path(sys.prefix).parent / "cp-sam" / "bin" / "python"))
+    for sibling in ("cp-sam", "roisuite"):
+        candidates.append(str(Path(sys.prefix).parent / sibling / "bin" / "python"))
     for c in candidates:
         if c and Path(c).exists():
             return c
     raise FileNotFoundError(
         "cpsam sidecar interpreter not found. Set cfg.cpsam_sidecar_python or "
-        f"$ROIGBIV_CPSAM_PYTHON. Tried: {', '.join(candidates)}"
+        "$ROIGBIV_CPSAM_PYTHON to a Cellpose 4 env, or run Cellpose 3 alone with "
+        f"--stage1-backend cellpose3. Tried: {', '.join(candidates)}"
     )
 
 

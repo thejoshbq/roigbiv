@@ -584,9 +584,9 @@ class PipelineConfig:
     tile_norm_blocksize: int = 128
     use_denoise: bool = True                # Cellpose3 denoise_cyto3
 
-    # ── Stage 1 backend (Phase M; OFF default — cellpose3 path unchanged) ──
+    # ── Stage 1 backend ──
     # "cellpose3"     : in-process cellpose 3.x (deployed CP3 checkpoint / cyto3
-    #                   etc.) — the current, default behavior.
+    #                   etc.) alone — the default until 2026-11-18.
     # "cpsam_sidecar" : Cellpose-SAM (cellpose 4.x) run OUT-OF-PROCESS in the
     #                   `cp-sam` conda env. 4.x needs numpy 2.x and cannot share
     #                   this interpreter; the deployed CP3 checkpoint cannot load
@@ -601,10 +601,14 @@ class PipelineConfig:
     #                   masks that duplicate a Cellpose 3 mask are dropped
     #                   (cpsam_union.keep_secondary); the rest are appended
     #                   before Gate 1, each ROI recording its detector in
-    #                   features["stage1_detector"].
-    stage1_backend: str = "cellpose3"
+    #                   features["stage1_detector"]. DEFAULT since 2026-11-18:
+    #                   full-pipeline recall on the seven benchmark movies
+    #                   v1 0.198 -> 0.357, v0 0.550 -> 0.817 (docs/CHANGELOG.md).
+    #                   Centroid discovery still runs Cellpose 3 only.
+    stage1_backend: str = "cellpose3_cpsam_union"
     # Path to the cp-sam env python. "" → auto-resolve: $ROIGBIV_CPSAM_PYTHON,
-    # else the sibling `cp-sam` conda env of the running interpreter.
+    # else the sibling `cp-sam`, then `roisuite`, conda env of the running
+    # interpreter.
     cpsam_sidecar_python: str = ""
     # Union backend only. Defaults are the settings benchmarked on v0/v1
     # (ROI Suite's discovery recipe): cellprob 0, flow 0.4, 7-frame bins.

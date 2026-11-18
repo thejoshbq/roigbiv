@@ -187,12 +187,13 @@ def test_union_without_an_image_raises(union_fakes):
         stage1.run_stage1_candidates(z, z, _union_cfg())
 
 
-def test_default_backend_has_no_detector_provenance(monkeypatch):
+def test_cellpose3_backend_has_no_detector_provenance(monkeypatch):
     c3 = np.zeros((H, W), np.uint16)
     c3[10:14, 10:14] = 1
     monkeypatch.setattr(stage1, "run_cellpose_flows", lambda *a, **k: _flows(c3))
     monkeypatch.setattr(stage1, "_sidecar", lambda *a, **k: pytest.fail("sidecar called"))
     cfg = PipelineConfig()
+    cfg.stage1_backend = "cellpose3"
     cfg.force_cpu = True
     z = np.zeros((H, W), np.float32)
     out = stage1.run_stage1_candidates(z, z, cfg)
@@ -296,13 +297,13 @@ def test_sidecar_refuses_gpu_without_cuda(tmp_path, fake_cellpose, monkeypatch):
 
 def test_cpsam_settings_default_to_the_benchmarked_values():
     cfg = PipelineConfig()
-    assert cfg.stage1_backend == "cellpose3"
+    assert cfg.stage1_backend == UNION
     assert (cfg.cpsam_model, cfg.cpsam_cellprob_threshold, cfg.cpsam_flow_threshold,
             cfg.cpsam_union_iou, cfg.cpsam_frames_per_bin) == ("cpsam_v2", 0.0, 0.4, 0.3, 7)
 
 
 @pytest.mark.parametrize("field,value", [
-    ("stage1_backend", UNION), ("cpsam_model", "cpsam"), ("cpsam_cellprob_threshold", 1.0),
+    ("stage1_backend", "cellpose3"), ("cpsam_model", "cpsam"), ("cpsam_cellprob_threshold", 1.0),
     ("cpsam_flow_threshold", 0.6), ("cpsam_union_iou", 0.5), ("cpsam_frames_per_bin", 5),
 ])
 def test_each_cpsam_setting_changes_the_resume_fingerprint(tmp_path, field, value):
@@ -335,7 +336,8 @@ def test_cli_stage1_backend_flag_reaches_the_config(tmp_path):
         return rp.call_args[0][1]
 
     assert cfg_for(["--stage1-backend", UNION], "o").stage1_backend == UNION
-    assert cfg_for([], "o2").stage1_backend == "cellpose3"
+    assert cfg_for([], "o2").stage1_backend == UNION
+    assert cfg_for(["--stage1-backend", "cellpose3"], "o3").stage1_backend == "cellpose3"
 
 
 # ── run.py helpers ────────────────────────────────────────────────────────
@@ -347,7 +349,9 @@ def test_stage1_cpsam_image_is_max7_of_the_registered_movie_under_union_only(tmp
     from roigbiv.pipeline.types import FOVData
     p, data = _movie(tmp_path, T=21)
     fov = FOVData(raw_path=tmp_path / "f.tif", output_dir=tmp_path, data_bin_path=p, shape=data.shape)
-    assert run._stage1_cpsam_image(fov, PipelineConfig(), tmp_path) is None
+    c3 = PipelineConfig()
+    c3.stage1_backend = "cellpose3"
+    assert run._stage1_cpsam_image(fov, c3, tmp_path) is None
     assert not (tmp_path / "summary").exists()
     img = run._stage1_cpsam_image(fov, _union_cfg(), tmp_path)
     want = data.astype(np.float64).reshape(3, 7, 5, 6).mean(1).max(0).astype(np.float32)
@@ -371,3 +375,17 @@ def test_detector_summary_counts_proposals_and_gate1_outcomes_per_detector():
         "cellpose3": {"proposed": 3, "kept": 3, "accept": 2, "flag": 0, "reject": 1},
         "cpsam_v2": {"proposed": 5, "kept": 2, "accept": 1, "flag": 1, "reject": 0},
     }
+
+
+def test_cpsam_python_falls_back_to_a_sibling_roisuite_env(tmp_path, monkeypatch):
+    envs = tmp_path / "envs"
+    (envs / "roigbiv").mkdir(parents=True)
+    py = envs / "roisuite" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    monkeypatch.setattr(sys, "prefix", str(envs / "roigbiv"))
+    monkeypatch.delenv("ROIGBIV_CPSAM_PYTHON", raising=False)
+    assert stage1._resolve_cpsam_python(PipelineConfig()) == str(py)
+    py.unlink()
+    with pytest.raises(FileNotFoundError, match="--stage1-backend cellpose3"):
+        stage1._resolve_cpsam_python(PipelineConfig())

@@ -1928,14 +1928,16 @@ def main(argv: "list[str] | None" = None) -> int:
                               "default) or 'frame' (rigid)."))
     parser.add_argument("--stage1-backend", dest="stage1_backend",
                         choices=STAGE1_BACKENDS, default=None,
-                        help=("Stage 1 detector. 'cellpose3' (default): the "
-                              "deployed in-process Cellpose 3 model. "
-                              "'cpsam_sidecar': Cellpose-SAM instead of it, out "
-                              "of process. 'cellpose3_cpsam_union': Cellpose 3 "
-                              "plus Cellpose-SAM (cpsam_v2) on the movie's max7 "
-                              "image, duplicates dropped. Both Cellpose-SAM "
-                              "backends need a Cellpose 4 interpreter: "
-                              "$ROIGBIV_CPSAM_PYTHON or cfg.cpsam_sidecar_python."))
+                        help=("Stage 1 detector. 'cellpose3_cpsam_union' "
+                              "(default): the deployed Cellpose 3 model plus "
+                              "Cellpose-SAM (cpsam_v2) on the movie's max7 "
+                              "image, duplicates dropped. 'cellpose3': the "
+                              "Cellpose 3 model alone (the default before "
+                              "2026-11-18). 'cpsam_sidecar': Cellpose-SAM "
+                              "instead of Cellpose 3. Both Cellpose-SAM backends "
+                              "need a Cellpose 4 interpreter: "
+                              "$ROIGBIV_CPSAM_PYTHON, cfg.cpsam_sidecar_python, "
+                              "or a sibling 'cp-sam' or 'roisuite' conda env."))
     parser.add_argument("--pipeline-mode", dest="pipeline_mode",
                         choices=PIPELINE_MODES, default=DEFAULT_PIPELINE_MODE,
                         help=("Pipeline execution mode (ADR-0001 migration switch). "
