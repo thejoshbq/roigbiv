@@ -43,8 +43,8 @@ def test_snr20_template_passes_most_draws_at_7_5_hz():
 
 
 def test_baseline_noise_does_not_set_the_onset():
-    """A noisy baseline before a sharp event used to put the 10% crossing at the window start, making the rise
-    the distance from window start to peak. Rise must be measured from the onset."""
+    """With a noisy baseline before a sharp event, the first sample above 10% can sit at the window start, which
+    would make the rise the distance from window start to peak. Rise must be measured from the onset."""
     rng = np.random.default_rng(1)
     rd = np.array([_rise_decay_ratio(_event_window(7.5, 1.0, 1 / 8, rng)) for _ in range(200)])
     finite = rd[np.isfinite(rd)]

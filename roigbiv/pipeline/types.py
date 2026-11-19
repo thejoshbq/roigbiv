@@ -724,6 +724,10 @@ class PipelineConfig:
 
     # ── Stage 2 (Suite2p) ─────────────────────────────────────────────────
     threshold_scaling: float = 1.0          # Suite2p detection sensitivity (unused when re-reading)
+    # Spatial scale Suite2p uses when its own estimate fails (its fallback is
+    # 1, which halves the detection threshold of scale 2, the scale the lab's
+    # movies with a working estimate get). None keeps Suite2p's fallback.
+    suite2p_failed_estimate_scale: Optional[int] = 2
     iscell_threshold: float = 0.3           # cell-classifier cutoff on iscell[:,1]
 
     # ── Gate 2 (Temporal cross-validation) ────────────────────────────────
@@ -780,6 +784,14 @@ class PipelineConfig:
     # each event's own pixel, so neighbouring tissue inside the pooling disk
     # does not blur the transient. "roi_trace": the candidate's disk-mean trace.
     gate3_waveform_source: str = "event_patch"
+    # Noise checks. Calcium transients only go up, so of the trace samples more
+    # than gate3_excursion_z robust SDs from the median, at most
+    # gate3_max_negative_excursion_share may lie below it. The candidate must
+    # also be brighter in std_S than its annulus by gate3_min_activity_contrast
+    # annulus SDs.
+    gate3_excursion_z: float = 5.0
+    gate3_max_negative_excursion_share: float = 0.2
+    gate3_min_activity_contrast: float = 0.5
 
     # ── Stage 4 (Tonic Neuron Search) — spec §11, §18.8 ───────────────────
     bandpass_windows: list = field(default_factory=lambda: [

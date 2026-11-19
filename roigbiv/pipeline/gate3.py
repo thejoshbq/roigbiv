@@ -25,7 +25,12 @@ from pathlib import Path
 import numpy as np
 from skimage.measure import regionprops
 
+from roigbiv.pipeline.dff import compute_sliding_baseline
+from roigbiv.pipeline.gate1 import compute_annulus
 from roigbiv.pipeline.types import GATE3_WAVEFORM_SOURCES, ROI, PipelineConfig
+
+# Scales a median absolute deviation to a standard deviation for Gaussian noise.
+MAD_TO_SD = 1.4826
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -170,6 +175,88 @@ def _rise_decay_ratio(waveform: np.ndarray) -> float:
     return rise / decay
 
 
+def compute_negative_excursion_share(trace: np.ndarray, excursion_z: float) -> float:
+    """Share of a trace's large excursions that fall below its median.
+
+    A large excursion is a sample more than ``excursion_z`` robust SDs (from
+    the median absolute deviation) away from the median. Calcium transients
+    only go up, so for a real cell this share is near 0; noise bursts swing
+    both ways and give about 0.5. A trace with no large excursion gives 0; a
+    trace with a non-finite sample gives NaN, which the gate treats as a fail.
+    """
+    values = np.asarray(trace, dtype=np.float64)
+    if not np.isfinite(values).all():
+        return float("nan")
+    median = float(np.median(values))
+    robust_sd = float(np.median(np.abs(values - median))) * MAD_TO_SD
+    if robust_sd == 0.0:
+        return 0.0
+    z_scores = (values - median) / robust_sd
+    large = np.abs(z_scores) > excursion_z
+    if not large.any():
+        return 0.0
+    return float(np.mean(z_scores[large] < 0))
+
+
+def compute_activity_contrast(
+    activity_image: np.ndarray,
+    mask: np.ndarray,
+    cfg: PipelineConfig,
+    other_masks_union: np.ndarray | None = None,
+) -> float:
+    """How much brighter the mask is than its annulus in an activity image, in annulus SDs.
+
+    The annulus is Gate 1's (``annulus_inner_buffer`` to
+    ``annulus_outer_radius``), minus the pixels of other ROIs, so a
+    neighbouring cell does not count as surround. Returns 0 when the mask or
+    the annulus is empty or the annulus is flat.
+    """
+    if other_masks_union is None:
+        other_masks_union = np.zeros_like(mask, dtype=bool)
+    annulus = compute_annulus(mask, other_masks_union, cfg.annulus_inner_buffer, cfg.annulus_outer_radius)
+    if not mask.any() or not annulus.any():
+        return 0.0
+    surround_sd = float(activity_image[annulus].std())
+    if surround_sd == 0.0:
+        return 0.0
+    difference = float(activity_image[mask].mean()) - float(activity_image[annulus].mean())
+    return difference / surround_sd
+
+
+def _subtract_sliding_baseline(trace: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+    """The trace minus the same sliding-percentile baseline dF/F uses, so slow drift is not read as an excursion."""
+    window_frames = max(2, int(round(cfg.baseline_window_s * cfg.fs)))
+    values = np.asarray(trace, dtype=np.float32)
+    return values - compute_sliding_baseline(values, window_frames, cfg.baseline_percentile)
+
+
+def _noise_check_failures(
+    roi: ROI,
+    activity_image: np.ndarray | None,
+    prior_masks_union: np.ndarray,
+    cfg: PipelineConfig,
+) -> list[str]:
+    """Run the sign and activity-contrast checks on one candidate and record both measures.
+
+    The contrast check is skipped (measure recorded as None) when no activity
+    image is given. A measure that is NaN fails its check.
+    """
+    failures: list[str] = []
+    share = 0.0
+    if roi.trace is not None:
+        share = compute_negative_excursion_share(_subtract_sliding_baseline(roi.trace, cfg), cfg.gate3_excursion_z)
+    if not share <= cfg.gate3_max_negative_excursion_share:
+        failures.append(f"negative_excursions:{share:.2f}")
+    contrast = None
+    if activity_image is not None:
+        contrast = compute_activity_contrast(activity_image, roi.mask, cfg, prior_masks_union)
+        if not contrast >= cfg.gate3_min_activity_contrast:
+            failures.append(f"activity_contrast:{contrast:.2f}")
+    roi.features["gate3_negative_excursion_share"] = share
+    roi.features["gate3_activity_contrast"] = contrast
+    return failures
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Prior-ROI anti-correlation (cascade defense)
 # ─────────────────────────────────────────────────────────────────────────
@@ -202,15 +289,20 @@ def evaluate_gate3(
     prior_rois: list[ROI],
     template_bank: list[tuple[str, np.ndarray]],
     cfg: PipelineConfig,
+    activity_image: np.ndarray | None = None,
 ) -> list[ROI]:
     """Apply Gate 3 decision rules to Stage 3 candidates.
 
     Mutates candidate ROIs in place (gate_outcome, confidence, features,
     gate_reasons, solidity, eccentricity). Returns the same list.
+    ``activity_image`` (the run passes ``std_S``) feeds the activity-contrast
+    check; without it that check is skipped.
     """
     if cfg.gate3_waveform_source not in GATE3_WAVEFORM_SOURCES:
         raise ValueError(f"gate3_waveform_source must be one of {GATE3_WAVEFORM_SOURCES}, "
                          f"got {cfg.gate3_waveform_source!r}")
+    if not candidates:
+        return candidates
     templates = [wf for _, wf in template_bank]
     window_frames = gate3_window_frames(cfg)
 
@@ -229,6 +321,9 @@ def evaluate_gate3(
     else:
         prior_traces = None
         prior_centroids_arr = np.empty((0, 2), dtype=np.float32)
+    prior_masks_union = np.zeros(candidates[0].mask.shape, dtype=bool)
+    for prior in prior_rois:
+        prior_masks_union |= prior.mask
 
     for roi in candidates:
         failures: list[str] = []
@@ -291,6 +386,8 @@ def evaluate_gate3(
                 min_corr = float(r.min())
                 if min_corr <= cfg.gate3_anticorr_threshold:
                     failures.append(f"anticorr:{min_corr:.3f}")
+
+        failures.extend(_noise_check_failures(roi, activity_image, prior_masks_union, cfg))
 
         # ── Confidence grading by event count ────────────────────────────
         if event_count >= 6:

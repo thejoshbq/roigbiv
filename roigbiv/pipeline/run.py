@@ -1000,6 +1000,7 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
                            if r.gate_outcome in ("accept", "flag")]
         stage3_rois = evaluate_gate3(
             stage3_candidates, prior_for_gate3, template_bank, cfg,
+            activity_image=fov.std_S,
         )
         stage_timings["stage3_detect_s"] = time.time() - t_start
 
