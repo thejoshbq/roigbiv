@@ -120,6 +120,8 @@ def detect_events(
     Peaks closer than ``min_separation_s`` keep the higher one.
     """
     x = np.asarray(trace, dtype=np.float64)
+    if not np.isfinite(x).all():
+        raise ValueError("trace has a non-finite sample")
     w = max(2, min(x.size, int(round(baseline_window_s * fs))))
     d = x - percentile_filter(x, percentile=baseline_percentile, size=w, mode="nearest")
     d = d - np.median(d)
@@ -147,8 +149,8 @@ def event_amplitudes(trace: np.ndarray, peaks: Sequence[int], fs: float) -> np.n
     pre0, pre1 = (int(round(s * fs)) for s in PRE_WINDOW_S)
     out = np.full(len(peaks), np.nan)
     for i, p in enumerate(peaks):
-        b0, b1 = p - pre0, p - pre1
-        e0, e1 = p - PEAK_HALF_FRAMES, p + PEAK_HALF_FRAMES + 1
+        b0, e0, e1 = p - pre0, p - PEAK_HALF_FRAMES, p + PEAK_HALF_FRAMES + 1
+        b1 = min(p - pre1, e0)  # at low frame rates the pre-window would reach into the peak window
         if b0 < 0 or e1 > x.size or b1 <= b0:
             continue
         out[i] = x[e0:e1].mean() - x[b0:b1].mean()

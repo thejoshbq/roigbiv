@@ -118,6 +118,21 @@ def test_detect_events_on_pure_noise_finds_none_at_a_high_threshold():
     assert len(at.detect_events(trace, FS, z=6.0).peaks) == 0
 
 
+def test_detect_events_refuses_a_trace_with_nan_rather_than_reporting_no_events():
+    trace = transient(500, [200]) + np.random.default_rng(11).normal(0, 1, 500)
+    trace[10] = np.nan
+    with pytest.raises(ValueError):
+        at.detect_events(trace, FS)
+
+
+def test_event_amplitudes_are_nan_when_the_pre_window_would_overlap_the_peak_window():
+    trace = np.zeros(100)
+    trace[50:] = 4.0
+    # at 1 Hz the pre-window [p-1, p) lies inside the peak window: no clean baseline, so no amplitude (not 0)
+    assert np.isnan(at.event_amplitudes(trace, [51], fs=1.0)[0])
+    assert at.event_amplitudes(trace, [51], fs=2.0)[0] == pytest.approx(4.0)
+
+
 def test_event_amplitudes_measure_the_step_from_the_pre_event_window():
     n = 200
     trace = np.zeros(n)
