@@ -4,8 +4,8 @@ For each stage, two pools are matched against the annotations: every candidate t
 included) and the ones it kept (accept or flag). The cumulative pools pool all stages. Each annotated cell gets
 a fate from centroid localization: ``found`` (a kept candidate was assigned to it), ``shared`` (a kept candidate
 is within reach but the one-to-one assignment gave it to a neighbour), ``rejected`` (only rejected candidates were
-within reach; for each stage, the nearest in-reach reject and its reason codes are listed, reach not assignment), ``chance_only`` (the only candidates in reach come from
-chance-level pools) or ``never_proposed``.
+within reach; for each stage, the nearest in-reach reject and its reason codes are listed, reach not
+assignment), ``chance_only`` (the only candidates in reach come from chance-level pools) or ``never_proposed``.
 
 A pool is readable only when its own chance baselines (both measures, both transforms) are at most
 ``STOP_BASELINE`` (phase T stop rule, applied per pool: Josh, 19 Nov). A rejection found through a chance-level
