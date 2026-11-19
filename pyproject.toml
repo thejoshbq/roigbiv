@@ -50,6 +50,8 @@ ui = [
 viewer = ["napari[all]>=0.4.19"]
 dev = ["build", "pytest"]
 postgres = ["psycopg[binary]>=3.1"]
+# `workbench` writes the per-run candidate tables (roigbiv/workbench, candidates.parquet).
+workbench = ["pyarrow>=14"]
 # `embeddings` pulls in ROICaT's ROInet (SimCLR-trained ConvNeXt) for the
 # cross-session FOV/cell matcher. Optional because the pipeline degrades to
 # the legacy phase-correlation path when roicat is missing.
