@@ -21,6 +21,7 @@ Confidence grading by event count:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 from skimage.measure import regionprops
@@ -284,6 +285,166 @@ def _pearson_row(a: np.ndarray, B: np.ndarray) -> np.ndarray:
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────
 
+class _PriorContext(NamedTuple):
+    """Prior Stage 1+2 ROIs in the form the per-candidate checks read."""
+
+    traces: np.ndarray | None  # (n, T) prior traces cut to a shared length, or None
+    centroids: np.ndarray  # (n, 2) centroids of the ROIs with a trace
+    masks_union: np.ndarray  # union of every prior mask, traced or not
+
+
+def _prior_context(prior_rois: list[ROI], mask_shape: tuple[int, ...]) -> _PriorContext:
+    """Stack the prior ROIs' traces and centroids for the anti-correlation check, and union their masks."""
+    prior_centroids = []
+    prior_traces_list = []
+    for r in prior_rois:
+        if r.trace is None:
+            continue
+        prior_centroids.append(_centroid(r.mask))
+        prior_traces_list.append(r.trace)
+    if prior_traces_list:
+        shared_len = min(len(t) for t in prior_traces_list)
+        prior_traces = np.stack([t[:shared_len] for t in prior_traces_list])
+        prior_centroids_arr = np.array(prior_centroids, dtype=np.float32)
+    else:
+        prior_traces = None
+        prior_centroids_arr = np.empty((0, 2), dtype=np.float32)
+    prior_masks_union = np.zeros(mask_shape, dtype=bool)
+    for prior in prior_rois:
+        prior_masks_union |= prior.mask
+    return _PriorContext(prior_traces, prior_centroids_arr, prior_masks_union)
+
+
+def _morphology_failures(roi: ROI, cfg: PipelineConfig) -> list[str]:
+    """Record the candidate's solidity and eccentricity, and fail it if solidity is below the gate."""
+    rp = regionprops(roi.mask.astype(np.uint8))
+    if rp:
+        roi.solidity = float(rp[0].solidity or 0.0)
+        roi.eccentricity = float(rp[0].eccentricity or 0.0)
+    if roi.solidity < cfg.gate3_min_solidity:
+        return [f"solidity:{roi.solidity:.3f}"]
+    return []
+
+
+def _event_waveforms(roi: ROI, window_frames: int, cfg: PipelineConfig) -> list[np.ndarray]:
+    """The candidate's event waveforms from the configured source, recording which source was used.
+
+    ``event_patch`` uses the waveforms Stage 3 cut at each event's pixel when
+    it stored them; otherwise the waveforms are cut from the ROI trace around
+    each picked event. A candidate with neither gives no waveforms.
+    """
+    if cfg.gate3_waveform_source == "event_patch" and roi.event_waveforms is not None:
+        roi.features["gate3_waveform_source"] = "event_patch"
+        return list(roi.event_waveforms)
+    if roi.trace is not None:
+        event_list = roi.features.get("picked_events") or roi.features.get("events") or []
+        roi.features["gate3_waveform_source"] = "roi_trace"
+        return [_extract_event_waveform(roi.trace, int(ev["frame"]), window_frames) for ev in event_list]
+    return []
+
+
+def _best_template_fit(
+    waveforms: list[np.ndarray],
+    templates: list[np.ndarray],
+) -> tuple[float, int, list[float], np.ndarray]:
+    """Fit each non-empty waveform to the template bank.
+
+    Returns the best R², its template index, the R² of every waveform, and
+    the best-fitting waveform. When no waveform has a positive R², the best
+    R² and the index are 0 and the waveform is empty.
+    """
+    per_event_r2: list[float] = []
+    best_event_waveform: np.ndarray = np.zeros(0, dtype=np.float32)
+    best_r2 = 0.0
+    best_k = 0
+    for wf in waveforms:
+        if wf.size:
+            r2, k = _waveform_r2(wf, templates)
+            per_event_r2.append(r2)
+            if r2 > best_r2:
+                best_r2 = r2
+                best_k = k
+                best_event_waveform = wf
+    return best_r2, best_k, per_event_r2, best_event_waveform
+
+
+def _min_prior_correlation(roi: ROI, prior: _PriorContext, cfg: PipelineConfig) -> float | None:
+    """Lowest Pearson r between the candidate's trace and the prior traces within Gate 2's radius.
+
+    None when there is nothing to compare: no candidate trace, no prior
+    trace, or no prior ROI within the radius.
+    """
+    if prior.traces is None or roi.trace is None:
+        return None
+    cy, cx = _centroid(roi.mask)
+    dists = np.linalg.norm(prior.centroids - np.array([cy, cx], np.float32), axis=1)
+    nearby = dists <= cfg.gate2_spatial_radius  # same 20px radius as Gate 2
+    if not nearby.any():
+        return None
+    # Align trace length with the stored prior traces
+    candtrace = roi.trace[: prior.traces.shape[1]]
+    return float(_pearson_row(candtrace, prior.traces[nearby]).min())
+
+
+def _confidence_for_event_count(event_count: int) -> str:
+    """Confidence grade from the event count: 6+ high, 2-5 moderate, otherwise low."""
+    if event_count >= 6:
+        return "high"
+    if event_count >= 2:
+        return "moderate"
+    return "low"
+
+
+def _evaluate_candidate(
+    roi: ROI,
+    prior: _PriorContext,
+    templates: list[np.ndarray],
+    window_frames: int,
+    activity_image: np.ndarray | None,
+    cfg: PipelineConfig,
+) -> None:
+    """Run every Gate 3 check on one candidate and write its outcome, confidence, reasons and features."""
+    failures = _morphology_failures(roi, cfg)
+
+    event_count = int(roi.event_count or 0)
+    waveforms = _event_waveforms(roi, window_frames, cfg)
+    best_r2, best_k, per_event_r2, best_event_waveform = _best_template_fit(waveforms, templates)
+    min_r2 = cfg.gate3_min_waveform_r2_single_event if event_count == 1 else cfg.gate3_min_waveform_r2
+    if not per_event_r2 or best_r2 < min_r2:
+        failures.append(f"waveform_r2:{best_r2:.3f}<{min_r2}")
+
+    rise_decay = _rise_decay_ratio(best_event_waveform) if best_event_waveform.size else np.inf
+    if rise_decay >= cfg.gate3_max_rise_decay_ratio:
+        failures.append(f"rise_decay:{rise_decay:.3f}")
+
+    min_corr = _min_prior_correlation(roi, prior, cfg)
+    if min_corr is not None and min_corr <= cfg.gate3_anticorr_threshold:
+        failures.append(f"anticorr:{min_corr:.3f}")
+
+    failures.extend(_noise_check_failures(roi, activity_image, prior.masks_union, cfg))
+
+    confidence = _confidence_for_event_count(event_count)
+    if failures:
+        roi.gate_outcome = "reject"
+        roi.confidence = "requires_review"
+    elif best_r2 < (min_r2 + 0.1):
+        # Marginal R² (just above threshold) → flag for review
+        roi.gate_outcome = "flag"
+        roi.confidence = confidence
+    else:
+        roi.gate_outcome = "accept"
+        roi.confidence = confidence
+
+    roi.gate_reasons = failures
+    roi.features.update({
+        "gate3_best_r2": best_r2,
+        "gate3_best_template_idx": best_k,
+        "gate3_rise_decay_ratio": float(rise_decay) if np.isfinite(rise_decay) else None,
+        "gate3_min_corr": 0.0 if min_corr is None else min_corr,
+        "gate3_event_r2_values": per_event_r2,
+    })
+
+
 def evaluate_gate3(
     candidates: list[ROI],
     prior_rois: list[ROI],
@@ -305,117 +466,7 @@ def evaluate_gate3(
         return candidates
     templates = [wf for _, wf in template_bank]
     window_frames = gate3_window_frames(cfg)
-
-    # Pre-extract prior traces + centroids for anti-correlation check
-    prior_centroids = []
-    prior_traces_list = []
-    for r in prior_rois:
-        if r.trace is None:
-            continue
-        prior_centroids.append(_centroid(r.mask))
-        prior_traces_list.append(r.trace)
-    if prior_traces_list:
-        shared_len = min(len(t) for t in prior_traces_list)
-        prior_traces = np.stack([t[:shared_len] for t in prior_traces_list])
-        prior_centroids_arr = np.array(prior_centroids, dtype=np.float32)
-    else:
-        prior_traces = None
-        prior_centroids_arr = np.empty((0, 2), dtype=np.float32)
-    prior_masks_union = np.zeros(candidates[0].mask.shape, dtype=bool)
-    for prior in prior_rois:
-        prior_masks_union |= prior.mask
-
+    prior = _prior_context(prior_rois, candidates[0].mask.shape)
     for roi in candidates:
-        failures: list[str] = []
-
-        # ── Morphology: solidity + compute eccentricity ──────────────────
-        lbl = roi.mask.astype(np.uint8)
-        rp = regionprops(lbl)
-        if rp:
-            roi.solidity = float(rp[0].solidity or 0.0)
-            roi.eccentricity = float(rp[0].eccentricity or 0.0)
-        if roi.solidity < cfg.gate3_min_solidity:
-            failures.append(f"solidity:{roi.solidity:.3f}")
-
-        # ── Waveform R² per event, take max ──────────────────────────────
-        event_list = roi.features.get("picked_events") or roi.features.get("events") or []
-        event_count = int(roi.event_count or 0)
-        per_event_r2: list[float] = []
-        best_event_waveform: np.ndarray = np.zeros(0, dtype=np.float32)
-        best_r2 = 0.0
-        best_k = 0
-        if cfg.gate3_waveform_source == "event_patch" and roi.event_waveforms is not None:
-            waveforms = list(roi.event_waveforms)
-            roi.features["gate3_waveform_source"] = "event_patch"
-        elif roi.trace is not None:
-            waveforms = [_extract_event_waveform(roi.trace, int(ev["frame"]), window_frames)
-                         for ev in event_list]
-            roi.features["gate3_waveform_source"] = "roi_trace"
-        else:
-            waveforms = []
-        for wf in waveforms:
-            if wf.size:
-                r2, k = _waveform_r2(wf, templates)
-                per_event_r2.append(r2)
-                if r2 > best_r2:
-                    best_r2 = r2
-                    best_k = k
-                    best_event_waveform = wf
-
-        min_r2 = (cfg.gate3_min_waveform_r2_single_event
-                  if event_count == 1 else cfg.gate3_min_waveform_r2)
-        if not per_event_r2 or best_r2 < min_r2:
-            failures.append(f"waveform_r2:{best_r2:.3f}<{min_r2}")
-
-        # ── Rise/decay asymmetry on best event ───────────────────────────
-        rise_decay = _rise_decay_ratio(best_event_waveform) if best_event_waveform.size else np.inf
-        if rise_decay >= cfg.gate3_max_rise_decay_ratio:
-            failures.append(f"rise_decay:{rise_decay:.3f}")
-
-        # ── Anti-correlation against prior ROIs within gate3 radius ──────
-        min_corr = 0.0
-        if prior_traces is not None and roi.trace is not None:
-            cy, cx = _centroid(roi.mask)
-            dists = np.linalg.norm(prior_centroids_arr - np.array([cy, cx], np.float32),
-                                   axis=1)
-            nearby = dists <= cfg.gate2_spatial_radius  # same 20px radius as Gate 2
-            if nearby.any():
-                # Align trace length with the stored prior traces
-                candtrace = roi.trace[: prior_traces.shape[1]]
-                r = _pearson_row(candtrace, prior_traces[nearby])
-                min_corr = float(r.min())
-                if min_corr <= cfg.gate3_anticorr_threshold:
-                    failures.append(f"anticorr:{min_corr:.3f}")
-
-        failures.extend(_noise_check_failures(roi, activity_image, prior_masks_union, cfg))
-
-        # ── Confidence grading by event count ────────────────────────────
-        if event_count >= 6:
-            confidence = "high"
-        elif event_count >= 2:
-            confidence = "moderate"
-        else:
-            confidence = "low"
-
-        # ── Decision ──────────────────────────────────────────────────────
-        if failures:
-            roi.gate_outcome = "reject"
-            roi.confidence = "requires_review"
-        elif best_r2 < (min_r2 + 0.1):
-            # Marginal R² (just above threshold) → flag for review
-            roi.gate_outcome = "flag"
-            roi.confidence = confidence
-        else:
-            roi.gate_outcome = "accept"
-            roi.confidence = confidence
-
-        roi.gate_reasons = failures
-        roi.features.update({
-            "gate3_best_r2": best_r2,
-            "gate3_best_template_idx": best_k,
-            "gate3_rise_decay_ratio": float(rise_decay) if np.isfinite(rise_decay) else None,
-            "gate3_min_corr": min_corr,
-            "gate3_event_r2_values": per_event_r2,
-        })
-
+        _evaluate_candidate(roi, prior, templates, window_frames, activity_image, cfg)
     return candidates
