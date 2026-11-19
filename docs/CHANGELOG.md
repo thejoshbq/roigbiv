@@ -6,6 +6,25 @@ All notable changes to roigbiv are documented here.
 
 ### Changed
 
+- **Gate 3 measures rise from the event onset.** The 10% crossing is now taken after the last
+  sub-10% sample before the peak, not from baseline noise earlier in the window, and crossings
+  are interpolated between frames. A rise inside one frame (GCaMP6s at 7.5 Hz) is a small
+  finite ratio and passes; before, the pipeline's own template failed the ≤ 0.5 rise/decay gate.
+- **Gate 3 judges each event on a 3×3 patch at the event's pixel.** `gate3_waveform_source`
+  defaults to `event_patch`. The candidate's pooled disk stays its footprint and trace, but
+  the disk also averages in neighbouring tissue, which blurred the transient the pixel
+  detector found. `gate3_waveform_source="roi_trace"` restores the disk-mean judgement.
+- **Gate 3 rejects noise that the waveform checks let through.** Two checks join the waveform
+  checks. Sign: of a candidate's trace samples more than `gate3_excursion_z` (5) robust SDs
+  from the sliding dF/F baseline, at most `gate3_max_negative_excursion_share` (0.2) may be
+  negative; calcium transients only go up, and noise bursts swing both ways. Activity
+  contrast: the candidate must be brighter in `std_S` than its Gate 1 annulus (prior ROIs
+  left out) by `gate3_min_activity_contrast` (0.5) annulus SDs. Both measures are saved as
+  `gate3_negative_excursion_share` and `gate3_activity_contrast`.
+- **Stage 2 falls back to Suite2p scale 2 when Suite2p cannot estimate the spatial scale.**
+  Suite2p's own fallback is scale 1, which halves its detection threshold and fills the
+  5,000-ROI cap with fragments. `suite2p_failed_estimate_scale` (default 2, `None` for
+  Suite2p's fallback) sets the value; a working estimate and a forced scale are unchanged.
 - **Auto-scale sizes somata from Cellpose-SAM masks by default.** `scale_source` defaults to
   `cpsam`. Under the union backend, Cellpose-SAM now runs before auto-scale. The soma diameter
   is the median Cellpose-SAM mask diameter divided by `cpsam_scale_k` (1.05), with the DoG

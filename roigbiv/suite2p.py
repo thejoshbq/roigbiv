@@ -20,7 +20,45 @@ import os
 import shutil
 import time
 import warnings
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Iterator, Optional
+
+# Suite2p's accept threshold per unit of spatial scale, at threshold_scaling 1.
+SUITE2P_THRESHOLD_PER_SCALE = 5
+
+
+@contextmanager
+def failed_scale_estimate_fallback(fallback_scale: int) -> Iterator[None]:
+    """While active, a failed Suite2p spatial-scale estimate uses ``fallback_scale`` instead of 1.
+
+    Suite2p's scale sets its detection threshold (``threshold_scaling * 5 *
+    scale``). When its estimate fails it uses scale 1, half the threshold a
+    movie with a working estimate usually gets, and the detector then fills
+    its ROI cap with fragments. A working estimate and a forced scale are left
+    alone. Suite2p calls ``find_best_scale`` by module-global name inside
+    ``sparsery``, so replacing the module attribute is enough.
+    """
+    from suite2p.detection import sparsedetect
+
+    suite2p_find_best_scale = sparsedetect.find_best_scale
+
+    def find_best_scale_with_fallback(I, spatial_scale):  # noqa: E741 - Suite2p's parameter name
+        """Suite2p's choice, except that a failed estimate becomes ``fallback_scale``."""
+        scale, mode = suite2p_find_best_scale(I=I, spatial_scale=spatial_scale)
+        estimate_failed = spatial_scale <= 0 and mode is sparsedetect.EstimateMode.Forced
+        if not estimate_failed:
+            return scale, mode
+        threshold = SUITE2P_THRESHOLD_PER_SCALE * fallback_scale
+        print(f"  Suite2p spatial-scale estimate failed; using scale {fallback_scale} "
+              f"(threshold {threshold} at threshold_scaling 1) instead of {scale}", flush=True)
+        return fallback_scale, mode
+
+    sparsedetect.find_best_scale = find_best_scale_with_fallback
+    try:
+        yield
+    finally:
+        sparsedetect.find_best_scale = suite2p_find_best_scale
 
 
 def _build_ops(input_dir, fs: float, tau: float = 1.0,
@@ -109,7 +147,8 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                     do_registration: bool = False, cfg: dict = None,
                     spatial_scale: int = None,
                     threshold_scaling: float = None,
-                    preview=None, resume: bool = True) -> bool:
+                    preview=None, resume: bool = True,
+                    failed_estimate_scale: Optional[int] = None) -> bool:
     """
     Run Suite2p on a single TIF file.
 
@@ -152,6 +191,9 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                       Diagnostic only — Suite2p's behavior is unchanged.
     resume          : bool      — whether an existing stat.npy short-circuits
                       this call (see Resumability above).
+    failed_estimate_scale : int — spatial scale used when Suite2p's own
+                      estimate fails (see failed_scale_estimate_fallback).
+                      None keeps Suite2p's fallback of 1.
 
     Returns
     -------
@@ -203,7 +245,9 @@ def run_suite2p_fov(tif_path, output_dir, fs: float,
                          spatial_scale=spatial_scale, threshold_scaling=threshold_scaling)
         ops["save_path0"] = str(output_dir / stem)
         ops["tiff_list"] = [str(local_tif)]
-        with suite2p_preview_hooks(preview), warnings.catch_warnings():
+        scale_fallback = (failed_scale_estimate_fallback(failed_estimate_scale)
+                          if failed_estimate_scale is not None else nullcontext())
+        with suite2p_preview_hooks(preview), warnings.catch_warnings(), scale_fallback:
             # Prairie View acquisitions write a malformed UIC2tag (Z-distance
             # calibration with a 0/0 denominator); tifffile's tag parser warns
             # on every internal read Suite2p does. Cosmetic — see roigbiv.io's
