@@ -21,7 +21,7 @@ EXPERIMENTAL = True
 OUTCOMES = ("accept", "flag", "reject")
 STAGES = (1, 2, 3, 4)
 # Where a row's footprint comes from:
-#   detected      the gate-time mask, written by the pipeline's own table writer
+#   detected      the gate-time mask, from the run's stage{N}_gate_masks.npz (roigbiv.pipeline.gate_masks)
 #   suite2p_stat  Stage 2: ypix/xpix of the Suite2p stat entry the candidate came from (its gate-time mask)
 #   pool_disk     Stage 3: the spatial_pool_radius disk at the centroid, which is the gate-time mask
 #   stamp         the persisted canonical disk (roi_stamp_radius) of an accept or flag; not the detected shape

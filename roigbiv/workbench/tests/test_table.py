@@ -279,3 +279,128 @@ def test_stage3_rows_without_a_pool_radius_are_a_problem(tmp_path):
     t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
     assert "stage 3: spatial_pool_radius not in pipeline_log config; Stage 3 footprints not rebuilt" in t.problems
     assert _by_id(t)["fovA/s3/6"].footprint == "not_recorded"
+
+
+def _bar(y0, y1, x0, x1):
+    m = np.zeros((H, W), bool)
+    m[y0:y1, x0:x1] = True
+    return m
+
+
+def _gate_masks(fov, stage, masks, shape=(H, W)):
+    from roigbiv.pipeline.gate_masks import save_gate_masks
+    from roigbiv.pipeline.types import ROI
+
+    rois = []
+    for label, m in masks.items():
+        rois.append(ROI(mask=m, label_id=label, source_stage=stage, confidence="moderate", gate_outcome="accept"))
+    save_gate_masks(fov, stage, rois, shape=shape)
+
+
+def _set_area(fov, stage, label, area):
+    p = fov / f"stage{stage}" / f"stage{stage}_report.json"
+    rep = json.loads(p.read_text())
+    for r in rep["rois"]:
+        if r["label_id"] == label:
+            r["area"] = area
+    p.write_text(json.dumps(rep))
+
+
+def test_gate_mask_sidecars_give_every_row_its_detected_footprint_rejects_included(tmp_path):
+    fov = make_fov(tmp_path)
+    shapes = {
+        1: {1: _bar(5, 15, 8, 13), 2: _bar(8, 12, 25, 35), 3: _bar(30, 32, 40, 45)},
+        4: {8: _bar(18, 23, 38, 43), 9: _bar(0, 4, 0, 4)},
+    }
+    for stage, masks in shapes.items():
+        for label, m in masks.items():
+            _set_area(fov, stage, label, int(m.sum()))
+        _gate_masks(fov, stage, masks)
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert t.problems == []
+    rows = _by_id(t)
+    for stage, masks in shapes.items():
+        for label, m in masks.items():
+            cid = f"fovA/s{stage}/{label}"
+            assert rows[cid].footprint == "detected"
+            np.testing.assert_array_equal(t.footprint(cid), m)
+    rej = rows["fovA/s1/3"]  # a reject with no report centroid takes the mask's
+    assert (rej.centroid_y, rej.centroid_x) == pytest.approx((30.5, 42.0))
+    assert rows["fovA/s4/9"].centroid_y == 2.0  # a report centroid is kept
+    assert rows["fovA/s2/4"].footprint == "suite2p_stat"  # stages without a sidecar keep their old source
+    assert rows["fovA/s3/6"].footprint == "pool_disk"
+
+
+def test_a_report_label_missing_from_the_sidecar_is_a_problem_and_keeps_its_old_source(tmp_path):
+    fov = make_fov(tmp_path)
+    _gate_masks(fov, 2, {5: _bar(29, 32, 10, 11)})
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("label 4" in p and "gate masks" in p for p in t.problems)
+    rows = _by_id(t)
+    assert rows["fovA/s2/5"].footprint == "detected"
+    assert rows["fovA/s2/4"].footprint == "suite2p_stat"
+
+
+def test_a_sidecar_label_absent_from_the_report_is_a_problem(tmp_path):
+    fov = make_fov(tmp_path)
+    _gate_masks(fov, 2, {4: _bar(5, 6, 40, 42), 5: _bar(29, 32, 10, 11), 99: _bar(0, 1, 0, 1)})
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("label 99" in p for p in t.problems)
+
+
+def test_a_sidecar_of_another_shape_is_a_problem_and_is_not_used(tmp_path):
+    fov = make_fov(tmp_path)
+    _gate_masks(fov, 2, {4: np.ones((H + 1, W), bool), 5: np.ones((H + 1, W), bool)}, shape=(H + 1, W))
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("shape" in p for p in t.problems)
+    assert _by_id(t)["fovA/s2/5"].footprint == "suite2p_stat"
+
+
+def test_a_detected_mask_whose_size_differs_from_the_gate_area_is_a_problem(tmp_path):
+    fov = make_fov(tmp_path)
+    _gate_masks(fov, 2, {4: _bar(5, 6, 40, 42), 5: _bar(29, 33, 10, 11)})  # label 5: 4 px, gate area 3
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("label 5" in p and "4 px" in p for p in t.problems)
+
+
+def test_a_corrupt_sidecar_is_a_problem_not_a_crash(tmp_path):
+    fov = make_fov(tmp_path)
+    (fov / "stage2" / "stage2_gate_masks.npz").write_bytes(b"not a zip")
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("stage 2" in p and "unreadable" in p for p in t.problems)
+    assert _by_id(t)["fovA/s2/5"].footprint == "suite2p_stat"
+
+
+def test_a_sidecar_mask_far_from_the_report_centroid_is_a_problem(tmp_path):
+    fov = make_fov(tmp_path, pool=4)
+    pool_area = int(_disk(20, 20, 4).sum())
+    # label 6 is reported at (20, 20); a stale disk elsewhere has the same area
+    _gate_masks(fov, 3, {6: _disk(5, 40, 4), 7: _disk(30, 30, 4)})
+    assert _disk(5, 40, 4).sum() == pool_area
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert any("label 6" in p and "from the gate mask" in p for p in t.problems)
+    assert not any("label 7" in p for p in t.problems)
+
+
+def test_an_edge_clipped_disk_is_not_flagged_for_its_shifted_centroid(tmp_path):
+    fov = make_fov(tmp_path, pool=4)
+    p = fov / "stage3" / "stage3_report.json"
+    rep = json.loads(p.read_text())
+    clipped = _disk(0, 20, 8)  # radius 8 clipped to its lower half: centroid ~3.4 px from the centre
+    for r in rep["rois"]:
+        if r["label_id"] == 6:
+            r["features"]["centroid_y"], r["area"] = 0.0, int(clipped.sum())
+    p.write_text(json.dumps(rep))
+    _gate_masks(fov, 3, {6: clipped, 7: _disk(30, 30, 4)})
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert t.problems == []
+
+
+def test_a_report_centroid_between_two_parts_of_its_mask_is_not_a_problem(tmp_path):
+    fov = make_fov(tmp_path)
+    two_bars = _bar(19, 20, 36, 45) | _bar(21, 22, 36, 45)  # Stage 4 label 8 reports centroid (20, 40): 1 px off both
+    _set_area(fov, 4, 8, int(two_bars.sum()))
+    _set_area(fov, 4, 9, 4)
+    _gate_masks(fov, 4, {8: two_bars, 9: _bar(1, 3, 1, 3)})
+    t = tb.build_fov_table(fov, run_id="run", fov_id="fovA")
+    assert t.problems == []

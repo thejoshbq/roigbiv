@@ -40,6 +40,7 @@ from roigbiv.pipeline.profiles import (
     list_profiles,
     merged_overrides,
 )
+from roigbiv.pipeline.gate_masks import save_gate_masks
 from roigbiv.pipeline.roi_stamp import canonicalize, resolve_crowding
 from roigbiv.pipeline.types import (
     DEFAULT_PIPELINE_MODE,
@@ -685,6 +686,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # already ran on the real geometry above; only what subtraction/
         # traces/HITL/registry consume from here on changes. Reject-outcome
         # ROIs keep their real mask (audit trail only, never subtracted).
+        # Gate-time masks, rejects included, before the stamp replaces kept ones (workbench record).
+        save_gate_masks(output_dir, 1, rois, shape=fov.mean_M.shape)
         for r in rois:
             if r.gate_outcome in ("accept", "flag"):
                 canonicalize(r, cfg.roi_stamp_radius, fov.mean_M.shape)
@@ -839,6 +842,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # Canonicalize: gate 2 already validated real Suite2p footprint
         # geometry above; from here on, accept/flag ROIs persist as a
         # fixed-radius disk at their own centroid (roi_stamp.py).
+        # Gate-time masks, rejects included, before the stamp replaces kept ones (workbench record).
+        save_gate_masks(output_dir, 2, stage2_rois, shape=fov.shape[1:])
         for r in stage2_rois:
             if r.gate_outcome in ("accept", "flag"):
                 canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])
@@ -1010,6 +1015,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # so the persisted stamp matches Stages 1/2/4 exactly. Gate 3 already
         # ran above (on the spatial_pool_radius disk); this only changes what
         # subtraction/traces/HITL/registry consume from here on.
+        # Gate-time masks, rejects included, before the stamp replaces kept ones (workbench record).
+        save_gate_masks(output_dir, 3, stage3_rois, shape=fov.shape[1:])
         for r in stage3_rois:
             if r.gate_outcome in ("accept", "flag"):
                 canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])
@@ -1161,6 +1168,8 @@ def run_pipeline(tif_path: Path, cfg: PipelineConfig, gpu_lock=None,
         # geometry above; Stage 4 is terminal (no subtraction follows), but
         # traces/HITL/registry still consume this mask, so persist the same
         # fixed-radius disk as the other three stages.
+        # Gate-time masks, rejects included, before the stamp replaces kept ones (workbench record).
+        save_gate_masks(output_dir, 4, stage4_rois, shape=fov.shape[1:])
         for r in stage4_rois:
             if r.gate_outcome in ("accept", "flag"):
                 canonicalize(r, cfg.roi_stamp_radius, fov.shape[1:])

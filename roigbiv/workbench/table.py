@@ -1,7 +1,8 @@
 """Candidate table for one FOV of a saved run: every Stage 1 to 4 candidate, rejects included.
 
 Rows come from the ``stage{N}_report.json`` files; footprints come from the best source the saved run holds
-(see ``models.FOOTPRINTS``). The builder reads a run directory and never writes to it. ``write_fov_table``
+(see ``models.FOOTPRINTS``): the gate-time masks a run saved (``stage{N}_gate_masks.npz``) when present, per
+stage, otherwise what older runs left. The builder reads a run directory and never writes to it. ``write_fov_table``
 puts ``candidates.parquet`` (one row per candidate, gate quantities as ``gate.<name>`` columns) and
 ``footprints.npz`` (flat pixel indices per candidate, CSR layout) in a separate directory.
 """
@@ -16,12 +17,16 @@ from pathlib import Path
 
 import numpy as np
 
+from roigbiv.pipeline.gate_masks import gate_masks_path, load_gate_masks
 from roigbiv.workbench.models import SCHEMA_VERSION, CandidateRow, check_outcome_counts, row_from_report_roi
 
 STAGES = (1, 2, 3, 4)
 TABLE_FILE = "candidates.parquet"
 FOOTPRINT_FILE = "footprints.npz"
 META_FILE = "table_meta.json"
+# A report centroid this far from every pixel of its gate mask means the mask is not that candidate's (a stale
+# sidecar). Distance to the mask, not between centroids: a disk clipped at the frame edge still contains its centre.
+CENTROID_TOLERANCE_PX = 2.0
 
 
 @dataclass
@@ -103,9 +108,16 @@ class _Builder:
             return
         report = json.loads(rp.read_text())
         self.reports[n] = report
+        gate = self._gate_masks(n, report)
         labels = None
         for roi in report["rois"]:
             row = row_from_report_roi(roi, run_id=self.run_id, fov_id=self.fov_id, stage=n)
+            if gate is not None and row.label_id in gate:
+                row = self._from_gate(row, gate[row.label_id])
+                self.rows.append(row)
+                continue
+            if gate is not None:
+                self.problems.append(f"stage {n} label {row.label_id}: not in the gate masks")
             if n == 3 or (n == 2 and self.stat()):
                 row = self._detected(row, roi)
             elif row.outcome != "reject":
@@ -113,6 +125,40 @@ class _Builder:
                     labels = self._imread(self.dir / f"stage{n}" / f"stage{n}_masks.tif").ravel()
                 row = self._stamp(row, labels)
             self.rows.append(row)
+
+    def _gate_masks(self, n: int, report: dict) -> dict | None:
+        path = gate_masks_path(self.dir, n)
+        if not path.exists():
+            return None
+        try:
+            shape, masks = load_gate_masks(path)
+        except Exception as e:  # noqa: BLE001  (a bad sidecar is a problem to list, not a reason to stop)
+            self.problems.append(f"stage {n}: gate masks unreadable ({type(e).__name__}); not used")
+            return None
+        if shape != self.shape:
+            self.problems.append(f"stage {n}: gate masks have shape {shape}, table shape {self.shape}; not used")
+            return None
+        in_report = {int(r["label_id"]) for r in report["rois"]}
+        for label in sorted(set(masks) - in_report):
+            self.problems.append(f"stage {n}: gate masks hold label {label}, absent from the report")
+        return masks
+
+    def _from_gate(self, row: CandidateRow, flat: np.ndarray) -> CandidateRow:
+        if flat.size == 0:
+            self.problems.append(f"stage {row.stage} label {row.label_id}: empty gate mask")
+            return row
+        self.footprints[row.candidate_id] = flat
+        self._check_area(row, "detected", flat)
+        if row.centroid_y is not None:
+            ys, xs = np.unravel_index(flat, self.shape)
+            gap = float(np.min(np.hypot(ys - row.centroid_y, xs - row.centroid_x)))
+            if gap > CENTROID_TOLERANCE_PX:
+                self.problems.append(
+                    f"stage {row.stage} label {row.label_id}: report centroid ({row.centroid_y:.1f}, "
+                    f"{row.centroid_x:.1f}) is {gap:.1f} px from the gate mask"
+                )
+        cy, cx = (row.centroid_y, row.centroid_x) if row.centroid_y is not None else _centroid(flat, self.shape)
+        return dataclasses.replace(row, footprint="detected", centroid_y=cy, centroid_x=cx)
 
     def _stamp(self, row: CandidateRow, labels: np.ndarray) -> CandidateRow:
         flat = np.flatnonzero(labels == row.label_id)
