@@ -18,7 +18,25 @@ All notable changes to roigbiv are documented here.
     annotations rotated 180 degrees and shifted.
   - A miss ledger gives each stage's localization and recovery, and each annotated cell's fate.
     A pool is read only when its own chance baseline is at most 0.3.
+  - `regate` re-applies each gate's own rule, with changed thresholds, to a saved candidate table
+    and replays crowding stage by stage. With a run's own config it reproduces every saved
+    outcome. Results are labelled "frozen pool, non-causal downstream"; settings that change how
+    a quantity is measured are refused.
+  - Attenuation: each cell's event amplitude in the movie, the low-rank background, the residual
+    and Stage 3's input, as per-event ratios. Replaces the rank-30 "variance share".
+  - Validity mask: which pixels the rigid registration shift filled with content wrapped from the
+    opposite edge (Suite2p shifts with `np.roll`), and Suite2p's own crop rebuilt from
+    `motion_trace.npz`.
+  - The table uses a stage's gate-time masks (footprint `detected`) when the run saved them, and
+    lists a sidecar that disagrees with its report as a problem.
+  - Guide: `docs/workbench.md`.
   - Install with the `workbench` extra (`pyarrow`).
+
+- **Every candidate's gate-time mask is saved (`stageN/stageN_gate_masks.npz`).** Kept masks
+  are replaced by the fixed stamp right after each gate, so the detected shape was lost. The
+  sidecar holds every candidate's mask as its gate judged it, rejects included. It does not
+  change the ROIs, masks, traces or resume fingerprint (checked byte for byte on a real run),
+  and a failed write only prints a warning.
 
 ### Changed
 

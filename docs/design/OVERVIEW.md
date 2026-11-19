@@ -588,6 +588,11 @@ pre-gate keyed on `spatial_pool_radius` (its own trace-extraction pooling radius
 re-centered at `roi_stamp_radius` post-gate like the other three stages. `reject`-outcome
 ROIs keep their real mask (audit trail only — never subtracted).
 
+The masks as each gate judged them, rejects included, are saved just before this runs
+(`gate_masks.py::save_gate_masks`, `stageN/stageN_gate_masks.npz`). It is a diagnostic record
+for the workbench (`docs/workbench.md`): it never changes the ROIs, nothing in the pipeline
+reads it back, and a failed write only prints a warning.
+
 `roi_stamp.py::resolve_crowding` runs after canonicalization (cumulative across stages, so
 a later stage's stamp is checked against earlier stages' already-persisted ones): two
 centroids closer than one stamp radius apart demote the weaker ROI `accept → flag` — the
@@ -741,6 +746,7 @@ roi_metadata.json                   per-ROI schema: activity_type, gate_outcome,
                                      confidence, provenance scores, review_priority
 pipeline_log.json                   full cfg.summary_for_log() + stage/activity/review counts
 stage1/ … stage4/                   mask TIFFs + probability/contrast maps + stageN_report.json
+                                    + stageN_gate_masks.npz (gate-time masks, all candidates)
 summary/                            mean_M, mean_S, max_S, std_S, vcorr_S, dog_map
 traces/                             traces.npy (PRIMARY, neuropil-corrected), traces_raw.npy,
                                     traces_neuropil.npy, traces_meta.json   ← pynapse bundle
