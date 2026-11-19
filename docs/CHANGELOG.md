@@ -4,6 +4,22 @@ All notable changes to roigbiv are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Engineering workbench (`roigbiv/workbench`, experimental).** Reads saved runs and never writes
+  to them; nothing in the pipeline depends on it.
+  - A candidate table per FOV (`candidates.parquet`, `footprints.npz`) holds every Stage 1 to 4
+    candidate, rejects included, with each gate quantity as a number and the source of its
+    footprint. Stage 2 shapes come from Suite2p's `stat.npy` and Stage 3 shapes from the pooling
+    disk, both checked against the gate area. Kept Stage 1 and 4 candidates carry their stamp.
+    Rejects that saved no geometry read "not recorded".
+  - A run manifest (`run_manifest.json`) records input hashes, commit and the effective config.
+  - A matcher links annotated cells to candidates one-to-one, with a chance baseline from the
+    annotations rotated 180 degrees and shifted.
+  - A miss ledger gives each stage's localization and recovery, and each annotated cell's fate.
+    A pool is read only when its own chance baseline is at most 0.3.
+  - Install with the `workbench` extra (`pyarrow`).
+
 ### Changed
 
 - **Gate 3 measures rise from the event onset.** The 10% crossing is now taken after the last
